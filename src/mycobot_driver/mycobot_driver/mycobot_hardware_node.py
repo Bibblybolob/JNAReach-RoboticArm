@@ -186,18 +186,18 @@ class MyCobotHardwareNode(Node):
             flat = [v for _ in range(6) for v in (-160.0, 160.0)]
         self._joint_limits_deg = [(flat[i], flat[i + 1]) for i in range(0, 12, 2)]
 
-        self.get_logger().info(f'Connecting to myCobot at {ip}:{port}')
-        self._mc = MyCobot280Socket(ip, port)
-        time.sleep(0.5)
-
-        try:
-            if self._mc.get_fresh_mode() != 1:
-                self._mc.set_fresh_mode(1)
-                self.get_logger().info('Set fresh mode (responsive movement)')
-        except Exception as e:
-            self.get_logger().warn(f'Could not set fresh mode: {e}')
-
+        self._ip, self._port = ip, port
         self._lock = threading.Lock()
+
+        # The connection is attempted here but NOT allowed to kill the node.
+        # Previously MyCobot280Socket() was constructed inline, so an
+        # unreachable arm raised straight out of __init__ and the node died
+        # before advertising anything. Every client then waited forever on
+        # services that would never exist -- with no clue that the real fault
+        # was one unreachable IP. Coming up disconnected and retrying makes the
+        # failure visible and recoverable without a restart.
+        self._mc = None
+        self._connect()
 
         # Joint state publisher
         self._js_pub = self.create_publisher(JointState, 'joint_states', 10)
@@ -239,14 +239,72 @@ class MyCobotHardwareNode(Node):
             callback_group=service_cb_group,
         )
 
-        self.get_logger().info(
-            'myCobot hardware node ready (arm trajectory + homing service)'
+        # Reconnect in the background if the arm was unreachable at startup or
+        # drops out later, so a power cycle of the Pi does not require
+        # restarting the whole stack.
+        self._reconnect_timer = self.create_timer(
+            5.0, self._retry_connect, callback_group=service_cb_group,
         )
+
+        if self._mc is None:
+            self.get_logger().warn(
+                'myCobot hardware node ready but NOT CONNECTED. Services and '
+                'topics are advertised (so clients will not hang waiting for '
+                'them), and it will keep retrying the arm every 5s.'
+            )
+        else:
+            self.get_logger().info(
+                'myCobot hardware node ready (arm trajectory + homing + jog)'
+            )
+
+    # ---- Connection ----
+
+    def _connect(self) -> bool:
+        """Try to open the socket to the arm. Never raises."""
+        try:
+            self.get_logger().info(
+                f'Connecting to myCobot at {self._ip}:{self._port} ...')
+            mc = MyCobot280Socket(self._ip, self._port)
+            time.sleep(0.5)
+            # Prove the link works rather than trusting that constructing the
+            # socket succeeded; a dead server can still accept a connection.
+            angles = mc.get_angles()
+            if not isinstance(angles, list) or len(angles) != 6:
+                raise RuntimeError(
+                    f'connected but get_angles() returned {angles!r}')
+            self._mc = mc
+            self.get_logger().info(f'Connected. Joint angles: '
+                                   f'{[round(a, 1) for a in angles]}')
+            try:
+                if self._mc.get_fresh_mode() != 1:
+                    self._mc.set_fresh_mode(1)
+                    self.get_logger().info('Set fresh mode (responsive movement)')
+            except Exception as e:
+                self.get_logger().warn(f'Could not set fresh mode: {e}')
+            return True
+        except Exception as e:
+            self._mc = None
+            self.get_logger().error(
+                f'Cannot reach the arm at {self._ip}:{self._port} -- {e}\n'
+                '  The node is running but every command will be refused '
+                'until this is fixed. Check that:\n'
+                f'    - the Pi is powered and on the network (ping {self._ip})\n'
+                '    - server.py is running on it (port 9000)\n'
+                '    - nothing else holds the connection; Server.py accepts '
+                'ONE client, so a stray script or a second driver locks it out'
+            )
+            return False
+
+    def _retry_connect(self) -> None:
+        if self._mc is None:
+            self._connect()
 
     # ---- Joint State Publisher ----
 
     def _read_angles_rad(self):
         """Read current joint angles from the robot, returns radians or None."""
+        if self._mc is None:
+            return None
         try:
             with self._lock:
                 angles_deg = self._mc.get_angles()
@@ -340,6 +398,12 @@ class MyCobotHardwareNode(Node):
                 throttle_duration_sec=2.0)
             return
 
+        if self._mc is None:
+            self.get_logger().warn(
+                'Ignoring jog: not connected to the arm.',
+                throttle_duration_sec=5.0)
+            return
+
         base = self._last_angles_rad
         if base is None:
             # No successful joint-state read yet, so there is no starting pose
@@ -414,6 +478,10 @@ class MyCobotHardwareNode(Node):
     # ---- FollowJointTrajectory Action ----
 
     def _goal_callback(self, goal_request):
+        if self._mc is None:
+            self.get_logger().error(
+                'Rejecting trajectory: not connected to the arm.')
+            return GoalResponse.REJECT
         self.get_logger().info('Received trajectory goal')
         return GoalResponse.ACCEPT
 
@@ -429,6 +497,8 @@ class MyCobotHardwareNode(Node):
         second round-trip on the link (hardware reads in the joint-state timer
         are suppressed while _in_motion is set).
         """
+        if self._mc is None:
+            return False
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -653,6 +723,12 @@ class MyCobotHardwareNode(Node):
         the arm's encoders are already trustworthy. If the arm has lost its
         reference, this will confidently drive to the wrong place.
         """
+        if self._mc is None:
+            response.success = False
+            response.message = 'Not connected to the arm; cannot home.'
+            self.get_logger().error(response.message)
+            return response
+
         target = list(self._home_angles)
         self.get_logger().info(f'Homing to {target} at speed {self._home_speed}')
 

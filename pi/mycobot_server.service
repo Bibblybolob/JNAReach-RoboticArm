@@ -1,13 +1,27 @@
 [Unit]
 Description=pymycobot TCP Socket Server for myCobot 280 Pi
-After=network.target
+# network-online.target, not network.target: the latter fires before an address
+# is assigned. That mattered when the server derived its bind address from
+# wlan0 -- it raised at boot, burned through the restart limit while WiFi was
+# still associating, and then stayed dead permanently. The server now binds
+# 0.0.0.0 so it no longer needs an address to start, but waiting still avoids a
+# pointless restart loop on every boot.
+After=network-online.target
+Wants=network-online.target
+# Disable the start rate limit. The default (5 starts in 10s) is easy to
+# exhaust while the network settles or the serial port is briefly busy, and
+# once exhausted systemd gives up for good. The service is then simply gone
+# with no obvious reason, which presents as "connection refused" forever.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=er
 WorkingDirectory=/home/er
 ExecStart=/usr/bin/python3 /home/er/Documents/robotics_club/mycobot_setup/server.py
-Restart=on-failure
+# always, not on-failure: a clean exit still leaves the arm unreachable, so
+# there is no case where staying stopped is what we want.
+Restart=always
 RestartSec=5
 
 [Install]

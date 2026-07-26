@@ -49,6 +49,12 @@ echo "Copying pi/ scripts..."
 scp -q "${REPO_DIR}/pi/server.py" "${REPO_DIR}/pi/camera_stream.py" \
     "${PI_USER}@${PI_IP}:${PI_DIR}/"
 
+echo "Installing systemd units..."
+scp -q "${REPO_DIR}/pi/mycobot_server.service" "${REPO_DIR}/pi/mjpg_streamer.service" \
+    "${PI_USER}@${PI_IP}:/tmp/"
+ssh "${PI_USER}@${PI_IP}" \
+    'sudo mv /tmp/mycobot_server.service /tmp/mjpg_streamer.service /etc/systemd/system/ && sudo systemctl daemon-reload'
+
 echo "Restarting services..."
 # Stop both first: a stale process holding port 9000 or 8080 will make the new
 # one fail to bind, which looks identical to the lockout being unfixed.
@@ -76,6 +82,9 @@ echo "  listening ports:"
 ss -tlnp 2>/dev/null | grep -E ':(9000|8080)' || echo "    NONE -- services are not listening, check: journalctl -u mycobot_server -n 30"
 REMOTE
 
+echo
+echo "If a service is not active, the reason is in its log:"
+echo "    ssh ${PI_USER}@${PI_IP} 'journalctl -u mycobot_server -n 30 --no-pager'"
 echo
 echo "Done. Verify from here:"
 echo "    curl -s -m 3 -o /dev/null -w 'camera HTTP %{http_code}\\n' 'http://${PI_IP}:8080/?action=snapshot'"

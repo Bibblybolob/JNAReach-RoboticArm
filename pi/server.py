@@ -239,16 +239,60 @@ class MycobotServer:
         return datas
 
 
-if __name__ == "__main__":
-    ifname = "wlan0"
+def iface_address(ifname):
+    """IPv4 address of a named interface, or None if it has none."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    HOST = socket.inet_ntoa(
-        fcntl.ioctl(
-            s.fileno(),
-            0x8915,
-            struct.pack("256s", bytes(ifname, encoding="utf8")),
-        )[20:24]
-    )
+    try:
+        return socket.inet_ntoa(
+            fcntl.ioctl(
+                s.fileno(),
+                0x8915,  # SIOCGIFADDR
+                struct.pack("256s", bytes(ifname[:15], encoding="utf8")),
+            )[20:24]
+        )
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+if __name__ == "__main__":
+    import sys
+
+    # Bind to every interface by default.
+    #
+    # This used to derive the bind address from wlan0 specifically, which broke
+    # in two ways. If the Pi was on Ethernet, or the interface had another name,
+    # the ioctl raised and the server died at startup -- the port was never
+    # opened and clients saw "connection refused" with no clue why. And even
+    # when it worked, binding to one interface's address meant the arm was
+    # unreachable from any other network path.
+    #
+    # 0.0.0.0 accepts on all interfaces, which is what this always wanted.
+    HOST = "0.0.0.0"
     PORT = 9000
-    print("ip: {} port: {}".format(HOST, PORT))
+
+    args = sys.argv[1:]
+    if args:
+        # Optional explicit host, or "--iface wlan0" to keep the old behaviour.
+        if args[0] == "--iface" and len(args) > 1:
+            addr = iface_address(args[1])
+            if addr is None:
+                print("ERROR: interface {} has no IPv4 address. "
+                      "Available addresses:".format(args[1]))
+                for name in ("wlan0", "eth0", "end0", "enp1s0"):
+                    a = iface_address(name)
+                    if a:
+                        print("    {}: {}".format(name, a))
+                sys.exit(1)
+            HOST = addr
+        else:
+            HOST = args[0]
+
+    print("binding {}:{}".format(HOST, PORT))
+    for name in ("wlan0", "eth0", "end0"):
+        a = iface_address(name)
+        if a:
+            print("  reachable at {}:{} via {}".format(a, PORT, name))
+
     MycobotServer(HOST, PORT, SERIAL_PORT, SERIAL_BAUD)

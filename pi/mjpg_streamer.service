@@ -1,12 +1,19 @@
 [Unit]
 Description=MJPEG Camera Stream for myCobot 280 Pi
-After=network.target
+After=network-online.target
+Wants=network-online.target
+# See mycobot_server.service: the default start rate limit is easy to exhaust
+# at boot, and once it is, systemd stops trying permanently.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=er
-ExecStart=/usr/bin/python3 /home/er/Documents/robotics_club/mycobot_setup/camera_stream.py --port 8080 --device 0 --width 640 --height 480
-Restart=on-failure
+# --fps 10 keeps the previous frame rate. camera_stream.py now defaults to 30,
+# so this is explicit rather than implied -- redeploying should not silently
+# change the rate. Raise it here if you want the faster stream.
+ExecStart=/usr/bin/python3 /home/er/Documents/robotics_club/mycobot_setup/camera_stream.py --port 8080 --device 0 --width 640 --height 480 --fps 10
+Restart=always
 RestartSec=5
 
 [Install]

@@ -1,0 +1,13 @@
+[Unit]
+Description=MJPEG Camera Stream for myCobot 280 Pi
+After=network.target
+
+[Service]
+Type=simple
+User=er
+ExecStart=/usr/bin/python3 /home/er/Documents/robotics_club/mycobot_setup/camera_stream.py --port 8080 --device 0 --width 640 --height 480
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

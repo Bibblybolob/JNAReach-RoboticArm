@@ -18,6 +18,7 @@ setup(
     entry_points={
         'console_scripts': [
             'food_detector_node = mycobot_perception.food_detector_node:main',
+            'hand_tracker_node = mycobot_perception.hand_tracker_node:main',
         ],
     },
 )

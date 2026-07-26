@@ -13,6 +13,7 @@
   <exec_depend>mycobot_driver</exec_depend>
   <exec_depend>mycobot_camera</exec_depend>
   <exec_depend>mycobot_moveit_config</exec_depend>
+  <exec_depend>mycobot_perception</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

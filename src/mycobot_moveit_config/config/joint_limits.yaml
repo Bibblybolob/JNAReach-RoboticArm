@@ -1,52 +1,63 @@
 # Joint limits for myCobot 280 Pi.
 #
-# THESE NUMBERS DIRECTLY CONTROL MOTION SMOOTHNESS. ompl_planning.yaml runs
-# AddTimeOptimalParameterization, which uses the values below to decide how
-# long each trajectory should take. The driver streams commands paced to that
-# schedule, so if these limits claim the arm is faster than it really is,
-# MoveIt hands us a schedule the hardware cannot track: the arm falls behind,
-# the streamer keeps aiming further ahead, and the motion degrades back into a
-# sprint toward the endpoint.
+# SCOPE: these values affect MoveIt PLANNING ONLY. Visual servoing does not go
+# through MoveIt -- it jogs joints directly from image error -- so nothing here
+# changes finger tracking. For that, see jog_speed and max_jog_deg in
+# mycobot_hardware_node, and gain/deadband in visual_servo_node.
 #
-# The previous values (3.14 rad/s = 180 deg/s, 5.0 rad/s^2) were inherited as
-# "conservative estimates" but are optimistic for this hobby-grade arm, which
-# is part of why motion looked rushed and steppy.
+# WHAT THEY DO: ompl_planning.yaml runs AddTimeOptimalParameterization, which
+# uses these to decide how long each trajectory should take. The driver streams
+# commands paced to that schedule. Claim the arm is faster than it is and MoveIt
+# hands us a schedule the hardware cannot track: the arm falls behind, the
+# streamer keeps aiming further ahead, and motion degrades into a sprint toward
+# the endpoint.
 #
-# The values below are a deliberately cautious starting point, NOT measured
-# truth. Tune them empirically:
-#   1. Command a large single-joint move and time it.
-#   2. max_velocity ~= (travelled radians) / (elapsed seconds), minus ~20%.
-#   3. Raise until motion is as quick as you want while still tracking well.
-# If the arm consistently *beats* the planned duration, these are too low and
-# you are leaving speed on the table.
+# HISTORY OF THIS FILE, so the numbers are not mistaken for measurements:
+#   3.14 rad/s  inherited "conservative estimate", optimistic for this arm
+#   1.50 rad/s  my guess, erred low; motion felt sluggish
+#   5.00 rad/s  raised to 286 deg/s, well beyond the hardware -- this made the
+#               driver's per-step speed calculation saturate at 100 on every
+#               command, so the arm sprinted at full speed and the smoothing
+#               was effectively disabled
+#   1.75 rad/s  current: ~100 deg/s, a realistic working figure for a myCobot
+#               280 (whose joints top out around 110-120 deg/s), with headroom
+#               so the plan stays trackable
+#
+# STILL NOT MEASURED. scripts/measure_arm.py sweeps a joint, times it, and
+# prints the exact value to use here (it suggests 80% of what the arm actually
+# achieves). Five minutes, and it replaces every guess above with a fact.
+#
+# Acceleration governs how sharply each move ramps up. Too high reads as a
+# jolt at the start and end of every motion; too low makes short moves feel
+# mushy. 2.5 rad/s^2 is a middle setting -- lower it if starts feel abrupt.
 joint_limits:
   joint1:
     has_velocity_limits: true
-    max_velocity: 5.0
+    max_velocity: 1.75
     has_acceleration_limits: true
-    max_acceleration: 2.0
+    max_acceleration: 2.5
   joint2:
     has_velocity_limits: true
-    max_velocity: 5.0
+    max_velocity: 1.75
     has_acceleration_limits: true
-    max_acceleration: 2.0
+    max_acceleration: 2.5
   joint3:
     has_velocity_limits: true
-    max_velocity: 5.0
+    max_velocity: 1.75
     has_acceleration_limits: true
-    max_acceleration: 2.0
+    max_acceleration: 2.5
   joint4:
     has_velocity_limits: true
-    max_velocity: 5.0
+    max_velocity: 1.75
     has_acceleration_limits: true
-    max_acceleration: 2.0
+    max_acceleration: 2.5
   joint5:
     has_velocity_limits: true
-    max_velocity: 5.0
+    max_velocity: 1.75
     has_acceleration_limits: true
-    max_acceleration: 2.0
+    max_acceleration: 2.5
   joint6:
     has_velocity_limits: true
-    max_velocity: 5.0
+    max_velocity: 1.75
     has_acceleration_limits: true
-    max_acceleration: 2.0
+    max_acceleration: 2.5

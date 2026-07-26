@@ -70,16 +70,37 @@ class VisualServoNode(Node):
         self.declare_parameter('horizontal_joint', 'joint1')
         self.declare_parameter('vertical_joint', 'joint5')
 
-        # Proportional gain, in degrees of joint motion per unit of normalised
-        # image error (error is in units of half-frames, so 1.0 = target at the
-        # frame edge). Low by default: servo loops are much easier to tune down
-        # from stable than up from oscillating.
-        self.declare_parameter('gain', 2.5)
+        # --- PID gains ---
+        # Error is normalised to half-frames: 1.0 means the target sits at the
+        # frame edge. Gains are in degrees of joint motion per unit of error.
+        #
+        # Proportional alone cannot centre the target. It produces motion in
+        # proportion to error, so as error shrinks so does the correction, and
+        # it stalls wherever the remaining push is too small to overcome
+        # stiction, gravity sag, or the deadband. That standing offset is why
+        # the hand ends up near the centre rather than at it.
+        self.declare_parameter('gain', 3.0)
+        # Integral accumulates the error that proportional leaves behind and
+        # keeps pushing until it is actually gone. This is the term that
+        # centres the target. Too high and it overshoots and oscillates.
+        self.declare_parameter('ki', 1.2)
+        # Derivative damps the approach, which buys room to raise the other two
+        # without ringing. Computed on the error signal, which is already
+        # smoothed upstream in the tracker.
+        self.declare_parameter('kd', 0.35)
+        # Anti-windup. Without a cap the integral keeps growing whenever the
+        # arm cannot reduce the error -- target out of reach, joint at a limit,
+        # jogging disabled -- and then unloads all at once as a lurch when
+        # motion resumes.
+        self.declare_parameter('integral_limit', 0.8)
         # Ignore errors smaller than this (normalised). MediaPipe jitter and
-        # your own hand tremor are both a few pixels; without a deadband the
-        # arm hunts continuously and buzzes.
-        self.declare_parameter('deadband', 0.04)
-        self.declare_parameter('rate', 10.0)
+        # hand tremor are both a few pixels; without a deadband the arm hunts
+        # continuously and buzzes. Tighter than before now that the integral
+        # term can actually close the remaining gap.
+        self.declare_parameter('deadband', 0.015)
+        # Loop rate. The driver rate-limits jogs to its command_interval
+        # (0.06s, ~16Hz), so going much above that just discards commands.
+        self.declare_parameter('rate', 15.0)
         # Stop if the target has not been seen for this long. Without it, the
         # arm keeps acting on a stale position after the hand leaves frame.
         self.declare_parameter('target_timeout', 0.5)
@@ -95,7 +116,15 @@ class VisualServoNode(Node):
         self._h_joint = self.get_parameter('horizontal_joint').value
         self._v_joint = self.get_parameter('vertical_joint').value
         self._gain = float(self.get_parameter('gain').value)
+        self._ki = float(self.get_parameter('ki').value)
+        self._kd = float(self.get_parameter('kd').value)
+        self._integral_limit = float(self.get_parameter('integral_limit').value)
         self._deadband = float(self.get_parameter('deadband').value)
+
+        # PID state, in normalised image-error units.
+        self._integral = np.zeros(2, dtype=float)
+        self._prev_error: np.ndarray | None = None
+        self._prev_time: float | None = None
         self._rate = float(self.get_parameter('rate').value)
         self._timeout = float(self.get_parameter('target_timeout').value)
         self._max_step = float(self.get_parameter('max_step_deg').value)
@@ -180,6 +209,11 @@ class VisualServoNode(Node):
                 response.message = f'Probe failed: {detail}'
                 self.get_logger().error(f'Probe failed: {detail}')
                 return response
+
+        # Start from clean PID state either way: on enable so a stale integral
+        # from a previous run cannot lurch the arm, on disable so it does not
+        # sit accumulating.
+        self._reset_pid()
 
         self._enabled = want
         response.success = True
@@ -347,6 +381,17 @@ class VisualServoNode(Node):
 
     # ---- Control loop ----
 
+    def _reset_pid(self) -> None:
+        """Drop accumulated PID state.
+
+        Called whenever the loop stops acting on a continuous error signal --
+        target lost, servo disabled, probe run. Keeping the integral across a
+        gap means unloading a correction for an error that may no longer exist.
+        """
+        self._integral[:] = 0.0
+        self._prev_error = None
+        self._prev_time = None
+
     def _servo_step(self) -> None:
         if self._probing:
             return
@@ -373,6 +418,10 @@ class VisualServoNode(Node):
                           f'{self._timeout}s timeout')
             self.get_logger().warn(
                 f'Not servoing: {reason}', throttle_duration_sec=3.0)
+            # Losing sight of the target invalidates the accumulated history:
+            # the integral describes an error we can no longer verify, and the
+            # derivative would see a spurious jump when tracking resumes.
+            self._reset_pid()
             return
         ex, ey = err
 
@@ -381,13 +430,38 @@ class VisualServoNode(Node):
             # to a dead loop from outside, so say so.
             self.get_logger().info(
                 f'On target (error {math.hypot(ex, ey):.3f} < deadband '
-                f'{self._deadband}); holding. Move the target off-centre to '
-                'see motion.',
+                f'{self._deadband}); holding.',
                 throttle_duration_sec=5.0)
+            # Bleed the integral off while on target so it does not carry a
+            # stale push into the next correction.
+            self._integral *= 0.9
             return
 
-        # Drive the error to zero: joint delta = -Jinv @ error.
-        delta = self._jinv @ np.array([ex, ey], dtype=float) * -self._gain
+        now = time.monotonic()
+        error = np.array([ex, ey], dtype=float)
+        dt = (now - self._prev_time) if self._prev_time else (1.0 / self._rate)
+        # Guard against a stalled loop producing a huge dt, which would make
+        # the integral jump and the derivative explode.
+        dt = max(1e-3, min(dt, 0.5))
+
+        self._integral += error * dt
+        # Clamp per-axis so one saturated axis cannot poison the other.
+        np.clip(self._integral, -self._integral_limit, self._integral_limit,
+                out=self._integral)
+
+        derivative = np.zeros(2, dtype=float)
+        if self._prev_error is not None:
+            derivative = (error - self._prev_error) / dt
+
+        self._prev_error = error
+        self._prev_time = now
+
+        # PID in image space, then map through the inverse Jacobian to joints.
+        # Negated because we drive the error toward zero.
+        control = (self._gain * error
+                   + self._ki * self._integral
+                   + self._kd * derivative)
+        delta = self._jinv @ control * -1.0
         dh, dv = float(delta[0]), float(delta[1])
 
         dh = max(-self._max_step, min(self._max_step, dh))

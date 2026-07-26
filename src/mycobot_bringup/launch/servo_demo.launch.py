@@ -56,10 +56,17 @@ def generate_launch_description():
     robot_port_arg = DeclareLaunchArgument('robot_port', default_value='9000')
     camera_port_arg = DeclareLaunchArgument('camera_port', default_value='8080')
     gain_arg = DeclareLaunchArgument(
-        'gain', default_value='2.5',
+        'gain', default_value='3.0',
         description='Servo proportional gain; halve it if the arm oscillates')
+    ki_arg = DeclareLaunchArgument(
+        'ki', default_value='1.2',
+        description='Integral gain; this is the term that actually centres '
+                    'the target. Lower it if the arm overshoots and hunts')
+    kd_arg = DeclareLaunchArgument(
+        'kd', default_value='0.35',
+        description='Derivative gain; damps the approach')
     deadband_arg = DeclareLaunchArgument(
-        'deadband', default_value='0.04',
+        'deadband', default_value='0.015',
         description='Image error below which the arm holds still')
     show_window_arg = DeclareLaunchArgument(
         'show_window', default_value='false',
@@ -98,6 +105,8 @@ def generate_launch_description():
         name='visual_servo_node',
         parameters=[{
             'gain': LaunchConfiguration('gain'),
+            'ki': LaunchConfiguration('ki'),
+            'kd': LaunchConfiguration('kd'),
             'deadband': LaunchConfiguration('deadband'),
         }],
         output='screen',
@@ -128,6 +137,8 @@ def generate_launch_description():
         robot_port_arg,
         camera_port_arg,
         gain_arg,
+        ki_arg,
+        kd_arg,
         deadband_arg,
         show_window_arg,
         auto_enable_arg,

@@ -281,6 +281,17 @@ class MyCobotHardwareNode(Node):
             self._js_pub.publish(msg)
             return
 
+        # While jogging is armed, back the polling off for the same reason it
+        # backs off during a trajectory: _read_angles_rad blocks up to 100ms
+        # holding _lock, and at a 100ms timer period that keeps the lock busy
+        # nearly all the time. Jog callbacks then block on the lock and, with a
+        # queue depth of 1, get dropped -- the arm sits still while the servo
+        # loop happily publishes commands nobody executes.
+        if self._jog_enabled:
+            stride = max(1, int(round(self._rate / max(self._motion_rate, 0.1))))
+            if self._js_cycle % stride:
+                return
+
         angles = self._read_angles_rad()
         if angles is None:
             return
@@ -685,7 +696,14 @@ class MyCobotHardwareNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MyCobotHardwareNode()
-    executor = rclpy.executors.MultiThreadedExecutor()
+    # Thread count is set explicitly. MultiThreadedExecutor() defaults to
+    # multiprocessing.cpu_count(), and this often runs on a VM with one or two
+    # vCPUs. This node has a timer that blocks on TCP reads for up to 100ms at
+    # a time; with only one thread that timer monopolises the executor and the
+    # jog subscription, action server and services are starved -- the arm
+    # simply stops responding to anything while appearing healthy.
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=4)
+    node.get_logger().info('Executor: 4 threads')
     executor.add_node(node)
     try:
         executor.spin()

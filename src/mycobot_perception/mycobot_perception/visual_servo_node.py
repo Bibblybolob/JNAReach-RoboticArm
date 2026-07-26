@@ -410,7 +410,13 @@ class VisualServoNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = VisualServoNode()
-    executor = rclpy.executors.MultiThreadedExecutor()
+    # Explicit thread count: the orientation probe blocks inside a service
+    # callback (it sleeps while waiting to see where the target moved), and the
+    # point subscription must keep running on another thread throughout or the
+    # probe can never observe anything and always reports "target lost".
+    # MultiThreadedExecutor() defaults to cpu_count(), which is 1 on some VMs.
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=4)
+    node.get_logger().info('Executor: 4 threads')
     executor.add_node(node)
     try:
         executor.spin()

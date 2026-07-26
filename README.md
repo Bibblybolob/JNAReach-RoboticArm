@@ -69,7 +69,7 @@ mycobot_project/               # <-- this is the ROS 2 workspace root
 ### myCobot 280 Pi
 - Factory image (Ubuntu 20.04) -- no changes required
 - Connected to the same network as the Desktop
-- Default IP: `192.168.1.169`, user: `er`, password: `elephant`
+- Default IP: `192.168.1.46`, user: `er`, password: `elephant`
 
 ## Quick Start
 
@@ -77,18 +77,18 @@ mycobot_project/               # <-- this is the ROS 2 workspace root
 
 ```bash
 # From the Desktop, copy setup scripts to the Pi and run them
-scp -r pi/ er@192.168.1.169:~/Documents/robotics_club/mycobot_setup/
-ssh er@192.168.1.169 'bash ~/Documents/robotics_club/mycobot_setup/setup_pi.sh'
+scp -r pi/ er@192.168.1.46:~/Documents/robotics_club/mycobot_setup/
+ssh er@192.168.1.46 'bash ~/Documents/robotics_club/mycobot_setup/setup_pi.sh'
 ```
 
 ### 2. Start Pi services
 
 ```bash
-ssh er@192.168.1.169 'bash ~/Documents/robotics_club/mycobot_setup/start_services.sh'
-# Verify camera: open http://192.168.1.169:8080/?action=stream in a browser
+ssh er@192.168.1.46 'bash ~/Documents/robotics_club/mycobot_setup/start_services.sh'
+# Verify camera: open http://192.168.1.46:8080/?action=stream in a browser
 
 # to stop the service
-ssh er@192.168.1.169 'sudo systemctl stop mycobot_server.service'
+ssh er@192.168.1.46 'sudo systemctl stop mycobot_server.service'
 ```
 
 ### 3. Build and run (Desktop)
@@ -325,7 +325,7 @@ the wording of your vocabulary matters:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `robot_ip` | `192.168.1.169` | Pi IP address |
+| `robot_ip` | `192.168.1.46` | Pi IP address |
 | `robot_port` | `9000` | pymycobot TCP port |
 | `publish_rate` | `20.0` | Joint state publish rate (Hz) |
 | `default_speed` | `80` | Arm movement speed (0-100) |
@@ -337,7 +337,7 @@ the wording of your vocabulary matters:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `camera_url` | `http://192.168.1.169:8080/?action=stream` | MJPEG stream URL |
+| `camera_url` | `http://192.168.1.46:8080/?action=stream` | MJPEG stream URL |
 | `frame_rate` | `30.0` | Capture rate (Hz) |
 | `frame_id` | `camera_link` | TF frame for camera images |
 

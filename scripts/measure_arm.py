@@ -5,7 +5,7 @@ Measure the two numbers the motion tuning is currently guessing at.
 Run this with the ROS 2 driver STOPPED — Server.py on the Pi accepts one
 client, so this script and the driver cannot both be connected.
 
-    python3 scripts/measure_arm.py --ip 192.168.1.169
+    python3 scripts/measure_arm.py --ip 192.168.1.46
 
 It reports:
 
@@ -108,7 +108,7 @@ def measure_joint_speed(mc, start, sweep_deg, speed, settle=3.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ip', default='192.168.1.169')
+    ap.add_argument('--ip', default='192.168.1.46')
     ap.add_argument('--port', type=int, default=9000)
     ap.add_argument('--sweep', type=float, default=40.0,
                     help='degrees to sweep joint1 (default 40)')

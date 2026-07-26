@@ -10,7 +10,7 @@ Launches:
 
 Usage:
   ros2 launch mycobot_bringup moveit_bringup.launch.py
-  ros2 launch mycobot_bringup moveit_bringup.launch.py robot_ip:=192.168.1.169
+  ros2 launch mycobot_bringup moveit_bringup.launch.py robot_ip:=192.168.1.46
 """
 
 import os
@@ -30,7 +30,7 @@ def load_yaml(package_name, file_path):
 
 
 def generate_launch_description():
-    robot_ip_arg = DeclareLaunchArgument('robot_ip', default_value='192.168.1.169')
+    robot_ip_arg = DeclareLaunchArgument('robot_ip', default_value='192.168.1.46')
     robot_port_arg = DeclareLaunchArgument('robot_port', default_value='9000')
     camera_port_arg = DeclareLaunchArgument('camera_port', default_value='8080')
     robot_ip = LaunchConfiguration('robot_ip')

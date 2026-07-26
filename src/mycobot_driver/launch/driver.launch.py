@@ -7,7 +7,7 @@ removed for the elevator-button task.
 
 Usage:
   ros2 launch mycobot_driver driver.launch.py
-  ros2 launch mycobot_driver driver.launch.py robot_ip:=192.168.1.169 robot_port:=9000
+  ros2 launch mycobot_driver driver.launch.py robot_ip:=192.168.1.46 robot_port:=9000
 """
 
 from launch import LaunchDescription
@@ -18,7 +18,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     robot_ip_arg = DeclareLaunchArgument(
-        'robot_ip', default_value='192.168.1.169',
+        'robot_ip', default_value='192.168.1.46',
         description='IP address of the myCobot 280 Pi',
     )
     robot_port_arg = DeclareLaunchArgument(

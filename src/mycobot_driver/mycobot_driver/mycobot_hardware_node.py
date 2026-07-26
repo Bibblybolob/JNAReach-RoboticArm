@@ -40,7 +40,7 @@ class MyCobotHardwareNode(Node):
     def __init__(self):
         super().__init__('mycobot_hardware_node')
 
-        self.declare_parameter('robot_ip', '192.168.1.169')
+        self.declare_parameter('robot_ip', '192.168.1.46')
         self.declare_parameter('robot_port', 9000)
         # NOTE ON LINK BUDGET: Server.py on the Pi accepts a single client and
         # blocks up to 100ms (its read() wait_time) on any command in its

@@ -309,6 +309,27 @@ class MyCobotHardwareNode(Node):
         if self._mc is None:
             self._connect()
 
+    def _handle_link_error(self, exc: Exception, context: str) -> None:
+        """Mark the arm disconnected after a socket-level failure.
+
+        pymycobot resurfaces raw socket exceptions (BrokenPipeError,
+        ConnectionResetError, ...) from its own send()/recv(). Once one of
+        those fires, the underlying socket is unusable for anything else --
+        retrying on the same object just reproduces the identical error on
+        every subsequent call. Without this, that meant every jog and every
+        joint-state poll (10-16Hz) re-failing identically forever, flooding
+        the log and never actually recovering. Treat it as a full disconnect
+        instead: this stops calling into the dead socket, and the existing
+        5s reconnect timer opens a fresh one.
+        """
+        was_connected = self._mc is not None
+        self._mc = None
+        if was_connected:
+            self.get_logger().error(
+                f'Lost connection to the arm during {context}: {exc}. '
+                'Will retry every 5s.'
+            )
+
     # ---- Joint State Publisher ----
 
     def _read_angles_rad(self):
@@ -321,7 +342,8 @@ class MyCobotHardwareNode(Node):
             if not isinstance(angles_deg, list) or len(angles_deg) != 6:
                 return None
             return [math.radians(a) for a in angles_deg]
-        except Exception:
+        except Exception as e:
+            self._handle_link_error(e, 'joint-state read')
             return None
 
     def _publish_joint_states(self):
@@ -474,7 +496,7 @@ class MyCobotHardwareNode(Node):
             # each one being applied to a stale reading.
             self._last_angles_rad = [math.radians(d) for d in target_deg]
         except Exception as e:
-            self.get_logger().warn(f'jog send_angles failed: {e}')
+            self._handle_link_error(e, 'jog')
 
     def _jog_enable_callback(self, request, response):
         """Deadman for jogging. Servoing does nothing until this is enabled."""
@@ -519,8 +541,9 @@ class MyCobotHardwareNode(Node):
                     max_err = max(abs(c - t) for c, t in zip(current, target_deg))
                     if max_err < tolerance_deg:
                         return True
-            except Exception:
-                pass
+            except Exception as e:
+                self._handle_link_error(e, 'position poll')
+                return False
             time.sleep(0.1)
         return False
 
@@ -659,9 +682,14 @@ class MyCobotHardwareNode(Node):
                     with self._lock:
                         self._mc.send_angles(target_deg, speed)
                 except Exception as e:
-                    # A dropped command is recoverable: the next one is only
-                    # command_interval away and supersedes it anyway.
-                    self.get_logger().warn(f'send_angles failed mid-stream: {e}')
+                    # A dropped command on an otherwise-live link is
+                    # recoverable: the next one is only command_interval away
+                    # and supersedes it anyway. A socket-level failure is not
+                    # -- without marking it, every remaining step of this
+                    # trajectory would re-fail identically on the same dead
+                    # socket instead of the 5s reconnect timer ever getting a
+                    # chance to open a new one.
+                    self._handle_link_error(e, 'trajectory streaming')
 
                 # Feeds /joint_states while hardware reads are suppressed.
                 self._cmd_positions = list(target_rad)
@@ -686,7 +714,7 @@ class MyCobotHardwareNode(Node):
                         self._step_speed(prev_deg, final_deg, self._cmd_interval),
                     )
             except Exception as e:
-                self.get_logger().error(f'Failed to send final angles: {e}')
+                self._handle_link_error(e, 'trajectory final position')
 
             reached = self._wait_until_reached(
                 final_deg,
@@ -758,6 +786,7 @@ class MyCobotHardwareNode(Node):
                 timeout=self._home_timeout,
             )
         except Exception as e:
+            self._handle_link_error(e, 'homing')
             response.success = False
             response.message = f'Homing failed: {e}'
             self.get_logger().error(response.message)

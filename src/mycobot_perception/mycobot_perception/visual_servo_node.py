@@ -110,6 +110,11 @@ class VisualServoNode(Node):
 
         self._last_point: tuple[float, float] | None = None
         self._last_point_time = 0.0
+        # Distinguishes "the tracker has never said anything" (wrong topic, node
+        # not running, MediaPipe not detecting) from "the hand is momentarily
+        # out of frame". These need completely different fixes, and reporting
+        # both as "hold your hand in view" sends you hunting for the wrong one.
+        self._ever_received_point = False
 
         # Inverse image Jacobian: maps normalised image error to joint deltas.
         # None until probing succeeds; servoing refuses to run without it.
@@ -119,11 +124,14 @@ class VisualServoNode(Node):
 
         cb = ReentrantCallbackGroup()
 
+        self._point_topic = self.get_parameter('point_topic').value
+        self._image_topic_name = self.get_parameter('image_topic').value
+
         self._point_sub = self.create_subscription(
-            PointStamped, self.get_parameter('point_topic').value,
+            PointStamped, self._point_topic,
             self._point_cb, 1, callback_group=cb)
         self._image_sub = self.create_subscription(
-            Image, self.get_parameter('image_topic').value,
+            Image, self._image_topic_name,
             self._image_cb, 1, callback_group=cb)
         self._jog_pub = self.create_publisher(
             JointJog, self.get_parameter('jog_topic').value, 1)
@@ -149,6 +157,10 @@ class VisualServoNode(Node):
             self.get_logger().info(f'Frame size: {msg.width}x{msg.height}')
 
     def _point_cb(self, msg: PointStamped) -> None:
+        if not self._ever_received_point:
+            self.get_logger().info(
+                f'First target sighting on {self._point_topic} -- tracking is live.')
+            self._ever_received_point = True
         self._last_point = (msg.point.x, msg.point.y)
         self._last_point_time = time.monotonic()
 
@@ -240,10 +252,50 @@ class VisualServoNode(Node):
         """
         if self._probing:
             return False, 'already probing'
+
         if self._width is None:
-            return False, 'no image received yet'
+            n = self.count_publishers(self._image_topic_name)
+            return False, (
+                f'no image received on {self._image_topic_name} '
+                f'({n} publisher(s) detected). '
+                + ('Is camera_node running?' if n == 0 else
+                   'A publisher exists but no frames arrived -- check '
+                   f'`ros2 topic hz {self._image_topic_name}`.')
+            )
+
+        # Give the tracker a moment before giving up. Enabling the servo the
+        # instant a hand enters frame is a normal thing to do, and failing on
+        # the first missing message would be needlessly brittle.
+        if self._last_point is None:
+            self._wait_for_fresh_point(timeout=3.0)
+
+        if not self._ever_received_point:
+            n = self.count_publishers(self._point_topic)
+            if n == 0:
+                return False, (
+                    f'nothing is publishing {self._point_topic}. '
+                    'hand_tracker_node is probably not running (or is using a '
+                    'different topic). Start it with: '
+                    'ros2 run mycobot_perception hand_tracker_node'
+                )
+            return False, (
+                f'{self._point_topic} has {n} publisher(s) but has never sent a '
+                'message, so MediaPipe is not detecting a hand. View '
+                '/hand/annotated to see what the camera sees -- usually this is '
+                'lighting, the hand being too close to fill the frame, or the '
+                'camera pointing somewhere other than you expect.'
+            )
+
         if self._last_point is None:
             return False, 'no target visible -- hold your hand in view'
+
+        age = time.monotonic() - self._last_point_time
+        if age > self._timeout:
+            return False, (
+                f'target last seen {age:.1f}s ago (timeout {self._timeout}s). '
+                'Tracking is working but the hand is not currently visible -- '
+                'hold it in view and re-enable.'
+            )
 
         self._probing = True
         try:

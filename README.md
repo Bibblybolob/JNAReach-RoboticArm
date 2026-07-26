@@ -121,7 +121,7 @@ saves repeating this.
 One-time, if the Pi has never been configured:
 
 ```bash
-scp -r pi/ er@$MYCOBOT_IP:~/Documents/robotics_club/mycobot_setup/ && ssh er@$MYCOBOT_IP 'bash ~/Documents/robotics_club/mycobot_setup/setup_pi.sh'
+ssh er@$MYCOBOT_IP 'mkdir -p ~/JON/mycobot_project/pi' && scp -r pi/* er@$MYCOBOT_IP:~/JON/mycobot_project/pi/ && ssh er@$MYCOBOT_IP 'bash ~/JON/mycobot_project/pi/setup_pi.sh'
 ```
 
 Afterwards, and whenever anything in `pi/` changes, this deploys the scripts,

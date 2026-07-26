@@ -18,7 +18,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=er
 WorkingDirectory=/home/er
-ExecStart=/usr/bin/python3 /home/er/Documents/robotics_club/mycobot_setup/server.py
+ExecStart=/usr/bin/python3 /home/er/JON/mycobot_project/pi/server.py
 # always, not on-failure: a clean exit still leaves the arm unreachable, so
 # there is no case where staying stopped is what we want.
 Restart=always

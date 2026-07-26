@@ -25,8 +25,10 @@
 
 set -euo pipefail
 
-PI_IP="${1:--e}"
+PI_IP="${1:-${MYCOBOT_IP:-192.168.0.15}}"
 PI_USER="${MYCOBOT_PI_USER:-er}"
+# Home-relative on purpose. Note this is expanded by the REMOTE shell, not
+# locally, so it resolves against the Pi user's home.
 PI_DIR="${MYCOBOT_PI_DIR:-~/JON/mycobot_project/pi}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -46,6 +48,9 @@ fi
 echo "Pi is reachable."
 
 echo "Copying pi/ scripts..."
+# Create the target if it does not exist yet. No sudo and no quoting around
+# the path: it is home-relative, and the remote shell has to expand the ~.
+ssh "${PI_USER}@${PI_IP}" "mkdir -p ${PI_DIR}"
 scp -q "${REPO_DIR}/pi/server.py" "${REPO_DIR}/pi/camera_stream.py" \
     "${PI_USER}@${PI_IP}:${PI_DIR}/"
 

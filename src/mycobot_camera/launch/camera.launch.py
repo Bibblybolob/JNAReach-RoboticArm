@@ -8,16 +8,24 @@ Usage:
   ros2 launch mycobot_camera camera.launch.py camera_url:=http://192.168.1.46:8080/?action=stream
 """
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+# Robot address, overridable without editing anything:
+#   export MYCOBOT_IP=192.168.0.50      (whole shell session)
+#   ros2 launch ... robot_ip:=1.2.3.4   (one run, wins over the env var)
+DEFAULT_ROBOT_IP = os.environ.get('MYCOBOT_IP', '192.168.1.46')
+
+
 def generate_launch_description():
     camera_url_arg = DeclareLaunchArgument(
         'camera_url',
-        default_value='http://192.168.1.46:8080/?action=stream',
+        default_value=f'http://{DEFAULT_ROBOT_IP}:8080/?action=stream',
         description='MJPEG stream URL from camera_stream.py on the Pi',
     )
 

@@ -33,6 +33,19 @@ except ImportError:
 SERIAL_PORT = "/dev/ttyAMA0"
 SERIAL_BAUD = 1000000
 
+# Seconds of complete silence before assuming the client is gone.
+#
+# This server accepts ONE client (listen(1)), and conn.recv() blocks with no
+# timeout by default. If a client dies without closing the socket -- a killed
+# ROS node, a crashed script, a laptop that went to sleep -- the server sits in
+# recv() forever and never returns to accept(), so nothing can ever connect
+# again. The arm appears dead and only a service restart clears it.
+#
+# Any real client talks constantly (the ROS driver polls joint states several
+# times a second), so prolonged total silence means the peer is gone. This is
+# generous enough never to drop a working client.
+CLIENT_IDLE_TIMEOUT = 20.0
+
 has_return = [
     0x01, 0x02, 0x03, 0x04, 0x09, 0x12, 0x14, 0x15, 0x17, 0x1B,
     0x20, 0x23, 0x27, 0x2A, 0x2B, 0x2D, 0x2E, 0x3B, 0x3D,
@@ -90,14 +103,35 @@ class MycobotServer:
 
     def serve_forever(self):
         while True:
+            conn = None
             try:
                 print("waiting connect!------------------")
                 conn, addr = self.s.accept()
                 self.logger.info("Client connected from {}".format(addr))
 
+                # Without this the server can be locked out permanently by a
+                # client that died without closing: recv() blocks forever, so
+                # accept() is never reached again.
+                conn.settimeout(CLIENT_IDLE_TIMEOUT)
+                # Detect half-open connections (peer powered off or dropped off
+                # the network) rather than waiting for the idle timeout.
+                try:
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                except Exception:
+                    pass
+
                 while True:
                     try:
-                        data = conn.recv(1024)
+                        try:
+                            data = conn.recv(1024)
+                        except socket.timeout:
+                            self.logger.warning(
+                                "no data for %.0fs; assuming the client is gone "
+                                "and freeing the port for a new connection",
+                                CLIENT_IDLE_TIMEOUT,
+                            )
+                            break
+
                         command = list(data)
 
                         if not command:
@@ -145,11 +179,18 @@ class MycobotServer:
 
             except Exception:
                 self.logger.error(traceback.format_exc())
-                try:
-                    conn.close()
-                except Exception:
-                    pass
                 self.mc.close()
+            finally:
+                # Always release the socket before looping back to accept().
+                # The old code only closed it on an outer exception, so a
+                # normal disconnect leaked the descriptor every time and the
+                # server slowly ran out of them.
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    self.logger.info("client socket closed; ready for a new one")
 
     def write(self, command):
         self.mc.write(command)

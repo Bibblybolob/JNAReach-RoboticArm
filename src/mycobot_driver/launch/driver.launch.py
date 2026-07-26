@@ -10,15 +10,23 @@ Usage:
   ros2 launch mycobot_driver driver.launch.py robot_ip:=192.168.1.46 robot_port:=9000
 """
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+# Robot address, overridable without editing anything:
+#   export MYCOBOT_IP=192.168.0.50      (whole shell session)
+#   ros2 launch ... robot_ip:=1.2.3.4   (one run, wins over the env var)
+DEFAULT_ROBOT_IP = os.environ.get('MYCOBOT_IP', '192.168.1.46')
+
+
 def generate_launch_description():
     robot_ip_arg = DeclareLaunchArgument(
-        'robot_ip', default_value='192.168.1.46',
+        'robot_ip', default_value=DEFAULT_ROBOT_IP,
         description='IP address of the myCobot 280 Pi',
     )
     robot_port_arg = DeclareLaunchArgument(

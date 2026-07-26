@@ -21,9 +21,15 @@ from launch.substitutions import Command
 from ament_index_python.packages import get_package_share_directory
 
 
+# Robot address, overridable without editing anything:
+#   export MYCOBOT_IP=192.168.0.50      (whole shell session)
+#   ros2 launch ... robot_ip:=1.2.3.4   (one run, wins over the env var)
+DEFAULT_ROBOT_IP = os.environ.get('MYCOBOT_IP', '192.168.1.46')
+
+
 def generate_launch_description():
     robot_ip_arg = DeclareLaunchArgument(
-        'robot_ip', default_value='192.168.1.46',
+        'robot_ip', default_value=DEFAULT_ROBOT_IP,
     )
     robot_port_arg = DeclareLaunchArgument(
         'robot_port', default_value='9000',

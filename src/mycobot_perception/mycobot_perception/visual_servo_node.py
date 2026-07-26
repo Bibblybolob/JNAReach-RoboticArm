@@ -1,5 +1,5 @@
 """
-Image-based visual servoing: drive the arm so a tracked point stays centred.
+Image-based visual servoing: find a hand, centre it, and approach it.
 
 This is the eye-in-hand demo that needs NO calibration. It never computes a 3D
 position. It only knows "the target is 40 pixels left of centre" and turns that
@@ -9,11 +9,41 @@ the end effector, image error maps directly to joint motion.
 That means no camera intrinsics, no hand-eye transform, no depth estimate --
 none of which exist yet. Those unlock better things later; this works today.
 
-    ros2 run mycobot_perception hand_tracker_node
-    ros2 run mycobot_perception visual_servo_node
-    ros2 service call /arm/jog_enable std_srvs/srv/SetBool "{data: true}"
 
-Nothing moves until that last call. Set data:false to stop.
+BEHAVIOUR
+
+The arm is idle at home until you ask for it:
+
+    ros2 service call /servo/search std_srvs/srv/Trigger
+
+Then it runs a state machine:
+
+    IDLE      sitting at home, doing nothing
+    SEARCHING sweeping slowly to bring a hand into view
+    TRACKING  centring the hand and closing in on it
+    HOMING    returning to the home pose, then back to IDLE
+
+If the hand goes out of view for lost_timeout seconds (default 15) it gives up
+and homes. Call /servo/search again to restart, or /servo/enable false to stop
+immediately at any point.
+
+Jogging is armed automatically at startup -- the node calls /arm/jog_enable
+itself -- so no manual service calls are needed beyond the search trigger.
+
+
+APPROACHING WITHOUT DEPTH
+
+Centring alone leaves the arm at whatever distance it started. To close in
+without a depth sensor, the loop uses apparent size: the tracker reports palm
+width in pixels, and a hand that grows in frame is a hand getting nearer. The
+approach joint is driven until the palm reaches target_size_fraction of the
+frame width.
+
+The limits of this are worth knowing. Apparent size is not distance -- a large
+hand and a close hand look identical -- so this closes in on a consistent
+*framing*, not a measured standoff. And approach naturally ends by breaking
+itself: once the hand fills the frame MediaPipe can no longer see the whole
+hand, tracking drops, and the lost-target timeout takes over.
 
 
 WHY IT CALIBRATES ITSELF FIRST
@@ -32,6 +62,9 @@ motion to image motion. Inverting that gives the control law. This is standard
 visual-servo Jacobian estimation, it takes a few seconds, and it is correct for
 whatever orientation you actually mounted the camera in.
 
+The approach axis is probed the same way: nudge the approach joint, see whether
+the palm grew or shrank, and keep the sign.
+
 If probing fails (no hand visible, arm blocked), the node refuses to servo
 rather than falling back to a guess.
 """
@@ -40,7 +73,6 @@ from __future__ import annotations
 
 import math
 import time
-from collections import deque
 
 import numpy as np
 
@@ -51,7 +83,14 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from control_msgs.msg import JointJog
 from geometry_msgs.msg import PointStamped
 from sensor_msgs.msg import Image
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
+
+
+# State machine states.
+IDLE = 'IDLE'
+SEARCHING = 'SEARCHING'
+TRACKING = 'TRACKING'
+HOMING = 'HOMING'
 
 
 class VisualServoNode(Node):
@@ -109,9 +148,38 @@ class VisualServoNode(Node):
         # Probe settings. probe_deg is how far each joint is nudged to measure
         # its effect; big enough to produce clear image motion, small enough to
         # be a twitch.
-        self.declare_parameter('auto_probe', True)
         self.declare_parameter('probe_deg', 4.0)
         self.declare_parameter('probe_settle', 1.2)
+
+        # --- Approach ---
+        # Joint driven to close distance. joint3 (elbow) extends and retracts
+        # the arm, which moves the flange-mounted camera along its view more
+        # than the other joints do. Whichever joint is chosen, the probe
+        # measures its actual effect on apparent size, so a poor choice shows
+        # up as a failed probe rather than as wrong motion.
+        self.declare_parameter('approach_joint', 'joint3')
+        self.declare_parameter('approach_enabled', True)
+        # Stop closing in when palm width reaches this fraction of frame width.
+        # Higher gets closer; too high and MediaPipe loses the hand because it
+        # no longer fits in frame, which ends the approach abruptly.
+        self.declare_parameter('target_size_fraction', 0.45)
+        self.declare_parameter('approach_gain', 6.0)
+        self.declare_parameter('approach_deadband', 0.03)
+        self.declare_parameter('max_approach_step_deg', 1.5)
+
+        # --- Search / idle behaviour ---
+        # Seconds without a sighting before giving up and homing.
+        self.declare_parameter('lost_timeout', 15.0)
+        # Sweep the base joint while looking for a hand.
+        self.declare_parameter('search_joint', 'joint1')
+        self.declare_parameter('search_step_deg', 1.2)
+        self.declare_parameter('search_range_deg', 60.0)
+        # Begin searching as soon as the node starts, instead of waiting for
+        # the trigger. Off by default: launching a file should not set the arm
+        # hunting around the room.
+        self.declare_parameter('search_on_start', False)
+        # Arm the driver's jog gate automatically at startup.
+        self.declare_parameter('auto_arm_jog', True)
 
         self._h_joint = self.get_parameter('horizontal_joint').value
         self._v_joint = self.get_parameter('vertical_joint').value
@@ -128,9 +196,36 @@ class VisualServoNode(Node):
         self._rate = float(self.get_parameter('rate').value)
         self._timeout = float(self.get_parameter('target_timeout').value)
         self._max_step = float(self.get_parameter('max_step_deg').value)
-        self._auto_probe = bool(self.get_parameter('auto_probe').value)
         self._probe_deg = float(self.get_parameter('probe_deg').value)
         self._probe_settle = float(self.get_parameter('probe_settle').value)
+
+        self._approach_joint = self.get_parameter('approach_joint').value
+        self._approach_enabled = bool(self.get_parameter('approach_enabled').value)
+        self._target_size = float(self.get_parameter('target_size_fraction').value)
+        self._approach_gain = float(self.get_parameter('approach_gain').value)
+        self._approach_deadband = float(self.get_parameter('approach_deadband').value)
+        self._max_approach_step = float(
+            self.get_parameter('max_approach_step_deg').value)
+
+        self._lost_timeout = float(self.get_parameter('lost_timeout').value)
+        self._search_joint = self.get_parameter('search_joint').value
+        self._search_step = float(self.get_parameter('search_step_deg').value)
+        self._search_range = float(self.get_parameter('search_range_deg').value)
+
+        # Sign of d(palm size)/d(approach joint), learned by the probe. Without
+        # it we would not know whether extending the joint moves the camera
+        # toward the hand or away from it.
+        self._approach_sign = 0.0
+
+        # Latest palm width in pixels, from point.z.
+        self._last_size_px: float | None = None
+
+        # State machine.
+        self._state = IDLE
+        self._state_since = time.monotonic()
+        # Sweep direction and accumulated travel while SEARCHING.
+        self._search_dir = 1.0
+        self._search_travel = 0.0
 
         # Frame size, learned from the first image. Needed to normalise pixel
         # error; we do not assume 640x480.
@@ -165,18 +260,91 @@ class VisualServoNode(Node):
         self._jog_pub = self.create_publisher(
             JointJog, self.get_parameter('jog_topic').value, 1)
 
-        self._enabled = False
+        # Servoing is armed by default now; the search trigger is what actually
+        # sets the arm moving, so a second gate here served no purpose.
+        self._enabled = True
         self._enable_srv = self.create_service(
             SetBool, 'servo/enable', self._enable_cb, callback_group=cb)
+        self._search_srv = self.create_service(
+            Trigger, 'servo/search', self._search_cb, callback_group=cb)
+
+        # Clients for the driver's gate and homing service.
+        self._jog_enable_cli = self.create_client(
+            SetBool, '/arm/jog_enable', callback_group=cb)
+        self._home_cli = self.create_client(
+            SetBool, '/arm/home', callback_group=cb)
 
         self._timer = self.create_timer(
             1.0 / self._rate, self._servo_step, callback_group=cb)
 
+        if bool(self.get_parameter('auto_arm_jog').value):
+            # Deferred: the driver may not be up yet at construction time.
+            self._arm_timer = self.create_timer(
+                2.0, self._arm_jog_once, callback_group=cb)
+
+        if bool(self.get_parameter('search_on_start').value):
+            self._set_state(SEARCHING)
+
         self.get_logger().info(
-            'Visual servo ready. It will probe the camera orientation on the '
-            'first enable. Nothing moves until BOTH /servo/enable and '
-            '/arm/jog_enable are true.'
+            'Visual servo ready, idle at home. Start it with:\n'
+            '    ros2 service call /servo/search std_srvs/srv/Trigger\n'
+            f'It will home again after {self._lost_timeout:.0f}s without a '
+            'sighting.'
         )
+
+    # ---- Driver gate ----
+
+    def _arm_jog_once(self) -> None:
+        """Enable the driver's jog gate, retrying until the driver appears."""
+        if not self._jog_enable_cli.service_is_ready():
+            self.get_logger().info(
+                'Waiting for /arm/jog_enable (is the driver running?)...',
+                throttle_duration_sec=5.0)
+            return
+        req = SetBool.Request()
+        req.data = True
+        self._jog_enable_cli.call_async(req)
+        self.get_logger().info('Armed the driver jog gate (/arm/jog_enable).')
+        self._arm_timer.cancel()
+
+    # ---- State machine ----
+
+    def _set_state(self, state: str) -> None:
+        if state == self._state:
+            return
+        self.get_logger().info(f'{self._state} -> {state}')
+        self._state = state
+        self._state_since = time.monotonic()
+        self._reset_pid()
+        if state == SEARCHING:
+            self._search_travel = 0.0
+
+    def _search_cb(self, request, response):
+        if not self._enabled:
+            response.success = False
+            response.message = 'Servo is disabled; enable it first.'
+            return response
+        self._set_state(SEARCHING)
+        response.success = True
+        response.message = (
+            'Searching for a hand. Hold one in view; it will home again after '
+            f'{self._lost_timeout:.0f}s without a sighting.'
+        )
+        return response
+
+    def _go_home(self) -> None:
+        """Ask the driver to return to its fixed home pose."""
+        if not self._home_cli.service_is_ready():
+            self.get_logger().warn(
+                '/arm/home unavailable; staying put instead of homing.')
+            self._set_state(IDLE)
+            return
+        req = SetBool.Request()
+        req.data = True
+        future = self._home_cli.call_async(req)
+        # Homing sets _in_motion in the driver, which makes it ignore jogs for
+        # the duration, so we simply wait for it rather than commanding motion.
+        future.add_done_callback(lambda _f: self._set_state(IDLE))
 
     # ---- Inputs ----
 
@@ -191,33 +359,30 @@ class VisualServoNode(Node):
                 f'First target sighting on {self._point_topic} -- tracking is live.')
             self._ever_received_point = True
         self._last_point = (msg.point.x, msg.point.y)
+        # z carries palm width in pixels, not a depth. See hand_tracker_node.
+        self._last_size_px = msg.point.z if msg.point.z > 0 else None
         self._last_point_time = time.monotonic()
 
     def _enable_cb(self, request, response):
+        """Master on/off. Probing now happens on the SEARCHING -> TRACKING
+        transition instead of here, so this is purely a kill switch: disabling
+        stops the arm immediately, wherever it is in the state machine.
+        """
         want = bool(request.data)
-        if want and not self._probed:
-            if not self._auto_probe:
-                response.success = False
-                response.message = (
-                    'auto_probe is off and no Jacobian is set; refusing to '
-                    'servo with an unknown camera orientation.'
-                )
-                return response
-            ok, detail = self._probe()
-            if not ok:
-                response.success = False
-                response.message = f'Probe failed: {detail}'
-                self.get_logger().error(f'Probe failed: {detail}')
-                return response
-
-        # Start from clean PID state either way: on enable so a stale integral
-        # from a previous run cannot lurch the arm, on disable so it does not
-        # sit accumulating.
+        # Clean PID state either way: on enable so a stale integral cannot
+        # lurch the arm, on disable so it does not sit accumulating.
         self._reset_pid()
-
         self._enabled = want
+
+        if not want:
+            self._set_state(IDLE)
+            response.message = 'Servo disabled; arm stopped where it is.'
+        else:
+            response.message = (
+                'Servo enabled and idle. Trigger a hunt with: '
+                'ros2 service call /servo/search std_srvs/srv/Trigger'
+            )
         response.success = True
-        response.message = f'Servo {"enabled" if want else "disabled"}'
         self.get_logger().info(response.message)
         return response
 
@@ -277,6 +442,37 @@ class VisualServoNode(Node):
         dx = (after[0] - before[0]) / (self._width / 2.0)
         dy = (after[1] - before[1]) / (self._height / 2.0)
         return (dx, dy), None
+
+    def _probe_approach(self):
+        """Determine whether the approach joint moves the camera nearer.
+
+        Returns (+1, None) if a positive jog makes the hand look bigger,
+        (-1, None) if smaller, or (None, reason) if it cannot be told.
+        """
+        if self._last_size_px is None:
+            return None, 'tracker is not reporting palm size'
+        before = self._last_size_px
+
+        self._send_jog(self._approach_joint, self._probe_deg)
+        time.sleep(self._probe_settle)
+        after = self._last_size_px
+
+        self._send_jog(self._approach_joint, -self._probe_deg)
+        time.sleep(self._probe_settle)
+
+        if after is None:
+            return None, 'target lost during approach probe'
+
+        change = (after - before) / max(before, 1.0)
+        # Require a clear change. Below this the measurement is camera noise,
+        # and committing to a sign from noise means approaching in the wrong
+        # direction, which drives the arm away from the hand.
+        if abs(change) < 0.02:
+            return None, (
+                f'apparent size barely changed ({change * 100:+.1f}%); this '
+                f'joint may not move the camera along its view'
+            )
+        return (1.0 if change > 0 else -1.0), None
 
     def _probe(self):
         """Measure the image Jacobian by moving each joint and watching.
@@ -371,6 +567,25 @@ class VisualServoNode(Node):
 
             # Scale to per-degree, since the probe used probe_deg steps.
             self._jinv = np.linalg.inv(j) * self._probe_deg
+
+            # Learn which way the approach joint changes apparent size. Only
+            # the sign is needed: the magnitude varies with distance and pose,
+            # so a fixed gain plus the correct direction is more robust than a
+            # calibrated scale that is wrong everywhere except where measured.
+            if self._approach_enabled:
+                sign, err = self._probe_approach()
+                if sign is None:
+                    self.get_logger().warn(
+                        f'Approach probe failed ({err}); centring only, no '
+                        'closing in. Set approach_enabled:=false to silence.')
+                    self._approach_sign = 0.0
+                else:
+                    self._approach_sign = sign
+                    direction = 'closer' if sign > 0 else 'further'
+                    self.get_logger().info(
+                        f'  {self._approach_joint} +{self._probe_deg}deg makes '
+                        f'the hand appear {direction}')
+
             self._probed = True
             self.get_logger().info('Probe OK -- Jacobian estimated.')
             return True, 'ok'
@@ -392,35 +607,106 @@ class VisualServoNode(Node):
         self._prev_error = None
         self._prev_time = None
 
+    def _search_sweep(self) -> None:
+        """Pan the base joint back and forth looking for a hand.
+
+        Deliberately slow: MediaPipe needs a few clean frames to lock on, and
+        sweeping faster than it can detect means panning straight past a hand
+        that was in view the whole time.
+        """
+        step = self._search_step * self._search_dir
+        self._send_jog(self._search_joint, step)
+        self._search_travel += step
+
+        # Reverse at the ends of the sweep. Range is measured from wherever the
+        # search started, so it stays near the home pose instead of wandering.
+        if abs(self._search_travel) >= self._search_range / 2.0:
+            self._search_dir *= -1.0
+            self.get_logger().info(
+                f'Search sweep reversing at {self._search_travel:+.0f}deg')
+
+        self.get_logger().info(
+            f'Searching... {self._search_joint} at {self._search_travel:+.0f}deg',
+            throttle_duration_sec=3.0)
+
+    def _approach_step(self) -> float:
+        """Degrees to move the approach joint to close in on the hand.
+
+        Uses apparent palm size as the range proxy: bigger means nearer. Zero
+        if approach is off, the probe could not determine a direction, or the
+        hand already fills the target fraction of the frame.
+        """
+        if (not self._approach_enabled or self._approach_sign == 0.0
+                or self._last_size_px is None or self._width is None):
+            return 0.0
+
+        current = self._last_size_px / float(self._width)
+        error = self._target_size - current
+        if abs(error) < self._approach_deadband:
+            return 0.0
+
+        step = self._approach_gain * error * self._approach_sign
+        return max(-self._max_approach_step,
+                   min(self._max_approach_step, step))
+
+    def _target_age(self) -> float:
+        if self._last_point is None:
+            return float('inf')
+        return time.monotonic() - self._last_point_time
+
     def _servo_step(self) -> None:
-        if self._probing:
+        if self._probing or not self._enabled:
             return
-        if not self._enabled:
+
+        # HOMING is driven by the service callback; nothing to do until it
+        # completes and flips the state to IDLE.
+        if self._state in (IDLE, HOMING):
             return
+
+        visible = self._target_age() <= self._timeout
+
+        if self._state == SEARCHING:
+            if not visible:
+                self._search_sweep()
+                return
+            # Found one. Probe first if the camera orientation is still unknown.
+            if not self._probed:
+                ok, detail = self._probe()
+                if not ok:
+                    self.get_logger().error(
+                        f'Probe failed: {detail}. Returning home.')
+                    self._set_state(HOMING)
+                    self._go_home()
+                    return
+            self._set_state(TRACKING)
+            return
+
+        # --- TRACKING ---
+        if not visible:
+            lost_for = self._target_age()
+            if lost_for > self._lost_timeout:
+                self.get_logger().info(
+                    f'No sighting for {self._lost_timeout:.0f}s -- going home.')
+                self._set_state(HOMING)
+                self._go_home()
+                return
+            # Hold position during a brief dropout rather than sweeping away
+            # from a hand that is probably about to reappear.
+            self.get_logger().info(
+                f'Target lost {lost_for:.1f}s ago; holding '
+                f'({self._lost_timeout - lost_for:.0f}s until home)',
+                throttle_duration_sec=2.0)
+            self._reset_pid()
+            return
+
         if self._jinv is None:
             self.get_logger().warn(
-                'Enabled but no Jacobian -- the orientation probe has not run '
-                'successfully. Disable and re-enable to retry.',
+                'Tracking with no Jacobian -- probe did not run.',
                 throttle_duration_sec=3.0)
             return
 
         err = self._current_error()
         if err is None:
-            # Enabled and expected to be working, so say why nothing happens
-            # rather than sitting there quietly doing nothing.
-            if self._width is None:
-                reason = 'no image received yet'
-            elif self._last_point is None:
-                reason = 'no target has ever been seen'
-            else:
-                age = time.monotonic() - self._last_point_time
-                reason = (f'target last seen {age:.1f}s ago, over the '
-                          f'{self._timeout}s timeout')
-            self.get_logger().warn(
-                f'Not servoing: {reason}', throttle_duration_sec=3.0)
-            # Losing sight of the target invalidates the accumulated history:
-            # the integral describes an error we can no longer verify, and the
-            # derivative would see a spurious jump when tracking resumes.
             self._reset_pid()
             return
         ex, ey = err
@@ -467,17 +753,35 @@ class VisualServoNode(Node):
         dh = max(-self._max_step, min(self._max_step, dh))
         dv = max(-self._max_step, min(self._max_step, dv))
 
+        names = [self._h_joint, self._v_joint]
+        deltas = [dh, dv]
+
+        # Close in as well as centre. Sent in the same message so the arm
+        # approaches and tracks together rather than alternating between them.
+        da = self._approach_step()
+        if da != 0.0:
+            if self._approach_joint in names:
+                deltas[names.index(self._approach_joint)] += da
+            else:
+                names.append(self._approach_joint)
+                deltas.append(da)
+
         msg = JointJog()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = [self._h_joint, self._v_joint]
-        msg.displacements = [dh, dv]
+        msg.joint_names = names
+        msg.displacements = deltas
         self._jog_pub.publish(msg)
+
+        size_note = ''
+        if self._last_size_px is not None and self._width:
+            frac = self._last_size_px / float(self._width)
+            size_note = f' size={frac:.2f}/{self._target_size:.2f}'
 
         # If this logs but the arm does not move, the jog is being rejected by
         # the driver -- check the driver's console, which now says why.
         self.get_logger().info(
-            f'err=({ex:+.3f},{ey:+.3f}) -> {self._h_joint}{dh:+.2f}deg '
-            f'{self._v_joint}{dv:+.2f}deg',
+            f'err=({ex:+.3f},{ey:+.3f}){size_note} -> '
+            + ' '.join(f'{n}{d:+.2f}' for n, d in zip(names, deltas)),
             throttle_duration_sec=2.0)
 
 

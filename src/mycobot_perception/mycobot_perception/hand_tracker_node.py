@@ -4,8 +4,17 @@ MediaPipe hand/finger tracking for the myCobot.
 Subscribes to the camera stream and publishes where a fingertip is, in three
 progressively more useful forms depending on what calibration is available:
 
-  /hand/point_px    geometry_msgs/PointStamped  pixel (x, y), z = 0
+  /hand/point_px    geometry_msgs/PointStamped
+                    x, y = fingertip pixel position
+                    z    = palm width IN PIXELS (not a depth in metres)
                     Always published when a hand is visible. Needs nothing.
+
+                    Palm width rides in z so position and apparent size stay
+                    in one atomic message. It is the servo's stand-in for
+                    range: with no depth sensor, a hand that grows in the
+                    frame is a hand getting closer, which is enough to drive
+                    an approach. Using the palm specifically because it is
+                    rigid -- a finger segment changes length as it curls.
 
   /hand/point_cam   geometry_msgs/PointStamped  metres in the camera frame
                     Requires real camera intrinsics on /camera/camera_info.
@@ -242,11 +251,16 @@ class HandTrackerNode(Node):
             )
         sx, sy = self._smoothed_px
 
+        # Palm width in pixels: the servo's proxy for range. Same landmark pair
+        # used for the metric depth estimate below, so the two agree.
+        a, b = landmarks[RULER_A], landmarks[RULER_B]
+        palm_px = math.hypot((a.x - b.x) * w, (a.y - b.y) * h)
+
         px_msg = PointStamped()
         px_msg.header = msg.header
         px_msg.point.x = float(sx)
         px_msg.point.y = float(sy)
-        px_msg.point.z = 0.0
+        px_msg.point.z = float(palm_px)
         self._px_pub.publish(px_msg)
 
         depth_m = self._estimate_depth_m(landmarks, world, w, h)

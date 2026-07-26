@@ -15,36 +15,35 @@ MoveIt entirely -- it jogs joints directly from image error -- so planning is
 dead weight here, and it is a lot of dead weight on a VM. Use
 moveit_bringup.launch.py when you want planning.
 
-NOTHING MOVES until both gates are opened, in either order:
+Servoing and jogging are armed automatically. The arm still sits idle at home
+until you ask it to hunt:
 
-    ros2 service call /arm/jog_enable  std_srvs/srv/SetBool "{data: true}"
-    ros2 service call /servo/enable    std_srvs/srv/SetBool "{data: true}"
+    ros2 service call /servo/search std_srvs/srv/Trigger
 
-Setting either to false stops the arm. Enabling the servo triggers a one-time
-orientation probe: it twitches two joints to learn which way the camera is
-mounted, so hold your hand in view and still while it runs.
+It then sweeps to find a hand, centres on it, and closes in. After 15s with no
+sighting it returns home and waits for the next trigger. To stop it at any
+point:
 
-Pass auto_enable:=true to open both gates automatically a few seconds after
-startup. Off by default: the arm should not start moving merely because you
-launched a file.
+    ros2 service call /servo/enable std_srvs/srv/SetBool "{data: false}"
+
+The first time it finds a hand it runs a one-time orientation probe, twitching
+a few joints to learn how the camera is mounted -- hold your hand still for it.
 
 Useful arguments:
-    robot_ip:=192.168.1.46      Pi address
-    gain:=1.5                   lower if the arm oscillates
-    show_window:=true           OpenCV window of the tracker (needs a display)
-    auto_enable:=true           skip the manual service calls
+    robot_ip:=192.168.1.46         Pi address
+    gain:=1.5                      lower if the arm oscillates
+    ki:=0.6                        lower if it overshoots and hunts
+    lost_timeout:=30.0             longer grace before homing
+    target_size_fraction:=0.55     closer approach (0.45 default)
+    approach_enabled:=false        centre only, do not close in
+    search_on_start:=true          start hunting without the trigger
+    show_window:=true              OpenCV window (needs a display)
 """
 
 import os
 
 from launch import LaunchDescription
-from launch.actions import (
-    DeclareLaunchArgument,
-    ExecuteProcess,
-    IncludeLaunchDescription,
-    TimerAction,
-)
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -71,9 +70,19 @@ def generate_launch_description():
     show_window_arg = DeclareLaunchArgument(
         'show_window', default_value='false',
         description='Open an OpenCV window from the tracker (needs a display)')
-    auto_enable_arg = DeclareLaunchArgument(
-        'auto_enable', default_value='false',
-        description='Open both safety gates automatically after startup')
+    lost_timeout_arg = DeclareLaunchArgument(
+        'lost_timeout', default_value='15.0',
+        description='Seconds without a sighting before returning home')
+    target_size_arg = DeclareLaunchArgument(
+        'target_size_fraction', default_value='0.45',
+        description='Palm width as a fraction of frame width to close in to')
+    approach_enabled_arg = DeclareLaunchArgument(
+        'approach_enabled', default_value='true',
+        description='Close in on the hand as well as centring it')
+    search_on_start_arg = DeclareLaunchArgument(
+        'search_on_start', default_value='false',
+        description='Begin hunting immediately instead of waiting for the '
+                    '/servo/search trigger')
 
     bringup_dir = get_package_share_directory('mycobot_bringup')
 
@@ -108,28 +117,12 @@ def generate_launch_description():
             'ki': LaunchConfiguration('ki'),
             'kd': LaunchConfiguration('kd'),
             'deadband': LaunchConfiguration('deadband'),
+            'lost_timeout': LaunchConfiguration('lost_timeout'),
+            'target_size_fraction': LaunchConfiguration('target_size_fraction'),
+            'approach_enabled': LaunchConfiguration('approach_enabled'),
+            'search_on_start': LaunchConfiguration('search_on_start'),
         }],
         output='screen',
-    )
-
-    # Delayed so the driver has read joint angles and the tracker has seen a
-    # hand before the probe runs. Enabling immediately would probe against a
-    # driver that cannot jog yet.
-    auto_enable = TimerAction(
-        period=8.0,
-        actions=[
-            ExecuteProcess(
-                cmd=['ros2', 'service', 'call', '/arm/jog_enable',
-                     'std_srvs/srv/SetBool', '{data: true}'],
-                output='screen',
-            ),
-            ExecuteProcess(
-                cmd=['ros2', 'service', 'call', '/servo/enable',
-                     'std_srvs/srv/SetBool', '{data: true}'],
-                output='screen',
-            ),
-        ],
-        condition=IfCondition(LaunchConfiguration('auto_enable')),
     )
 
     return LaunchDescription([
@@ -141,9 +134,11 @@ def generate_launch_description():
         kd_arg,
         deadband_arg,
         show_window_arg,
-        auto_enable_arg,
+        lost_timeout_arg,
+        target_size_arg,
+        approach_enabled_arg,
+        search_on_start_arg,
         robot,
         hand_tracker,
         servo,
-        auto_enable,
     ])

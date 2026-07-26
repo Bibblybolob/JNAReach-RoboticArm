@@ -25,6 +25,7 @@ from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from sensor_msgs.msg import JointState
 from control_msgs.action import FollowJointTrajectory
+from control_msgs.msg import JointJog
 from std_srvs.srv import SetBool
 
 from pymycobot import MyCobot280Socket
@@ -109,6 +110,24 @@ class MyCobotHardwareNode(Node):
         self.declare_parameter('home_speed', 30)
         self.declare_parameter('home_timeout', 15.0)
 
+        # --- Jogging (visual servoing) ---
+        # Largest displacement honoured in a single JointJog, in degrees. A
+        # spurious detection should nudge the arm, not fling it.
+        self.declare_parameter('max_jog_deg', 3.0)
+        self.declare_parameter('jog_speed', 40)
+        # Per-joint travel in degrees, used to clamp jog targets. Defaults
+        # match the URDF limits for the myCobot 280 Pi. Holding a servo against
+        # its hard stop damages it, so this clamp is about the hardware, not
+        # about being conservative with the workspace.
+        self.declare_parameter('joint_limits_deg', [
+            -168.0, 168.0,
+            -140.0, 140.0,
+            -150.0, 150.0,
+            -150.0, 150.0,
+            -155.0, 160.0,
+            -180.0, 180.0,
+        ])
+
         ip = self.get_parameter('robot_ip').get_parameter_value().string_value
         port = self.get_parameter('robot_port').get_parameter_value().integer_value
         self._rate = self.get_parameter('publish_rate').get_parameter_value().double_value
@@ -146,6 +165,26 @@ class MyCobotHardwareNode(Node):
         # Most recent commanded joint positions (radians), published in place
         # of a hardware read while _in_motion is set. See _publish_joint_states.
         self._cmd_positions = None
+        # Last measured joint angles (radians), refreshed by the joint-state
+        # timer. Jogging applies its deltas to this rather than paying a
+        # blocking read per command.
+        self._last_angles_rad = None
+        self._last_jog_time = 0.0
+        # Jogging is off until explicitly enabled via /arm/jog_enable.
+        self._jog_enabled = False
+
+        self._max_jog_deg = self.get_parameter('max_jog_deg').get_parameter_value().double_value
+        self._jog_speed = self.get_parameter('jog_speed').get_parameter_value().integer_value
+        flat = list(
+            self.get_parameter('joint_limits_deg').get_parameter_value().double_array_value
+        )
+        if len(flat) != 12:
+            self.get_logger().warn(
+                f'joint_limits_deg has {len(flat)} entries, expected 12 '
+                '(lo,hi per joint). Falling back to +/-160 for all joints.'
+            )
+            flat = [v for _ in range(6) for v in (-160.0, 160.0)]
+        self._joint_limits_deg = [(flat[i], flat[i + 1]) for i in range(0, 12, 2)]
 
         self.get_logger().info(f'Connecting to myCobot at {ip}:{port}')
         self._mc = MyCobot280Socket(ip, port)
@@ -185,6 +224,18 @@ class MyCobotHardwareNode(Node):
         # side effect of launching the driver.
         self._home_srv = self.create_service(
             SetBool, 'arm/home', self._home_callback,
+            callback_group=service_cb_group,
+        )
+
+        # Jogging: relative joint moves for visual servoing. Gated behind
+        # /arm/jog_enable so a running servo node cannot move the arm until
+        # someone deliberately turns it on.
+        self._jog_sub = self.create_subscription(
+            JointJog, 'arm/jog', self._jog_callback, 1,
+            callback_group=action_cb_group,
+        )
+        self._jog_enable_srv = self.create_service(
+            SetBool, 'arm/jog_enable', self._jog_enable_callback,
             callback_group=service_cb_group,
         )
 
@@ -234,11 +285,96 @@ class MyCobotHardwareNode(Node):
         if angles is None:
             return
 
+        # Cache for jogging, which needs a starting point to apply a delta to
+        # without paying its own blocking read on every command.
+        self._last_angles_rad = angles
+
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = list(self.JOINT_NAMES)
         msg.position = angles
         self._js_pub.publish(msg)
+
+    # ---- Jogging (for visual servoing) ----
+
+    def _jog_callback(self, msg: JointJog):
+        """Apply a relative joint displacement immediately.
+
+        This exists because Server.py accepts a single client: a servo node
+        cannot open its own connection to the arm, so incremental commands
+        have to come through the driver that already owns the socket.
+
+        Displacements are in DEGREES here (JointJog does not fix units, and
+        degrees match what send_angles takes, avoiding a conversion that is
+        easy to get wrong in a fast loop).
+
+        Deliberately ignored while a trajectory is executing -- two things
+        commanding the arm at once produces motion neither one intended.
+        """
+        if self._in_motion.is_set():
+            return
+
+        if not self._jog_enabled:
+            return
+
+        base = self._last_angles_rad
+        if base is None:
+            # No joint state read yet; nothing sane to apply a delta to.
+            return
+
+        # Rate-limit to the same interval the trajectory streamer uses. A servo
+        # loop publishing faster than the link can carry just builds a backlog.
+        now = time.monotonic()
+        if now - self._last_jog_time < self._cmd_interval:
+            return
+
+        target_deg = [math.degrees(a) for a in base]
+
+        names = list(msg.joint_names)
+        deltas = list(msg.displacements)
+        if len(names) != len(deltas):
+            self.get_logger().warn(
+                f'JointJog has {len(names)} names but {len(deltas)} '
+                'displacements; ignoring'
+            )
+            return
+
+        moved = False
+        for name, delta in zip(names, deltas):
+            if name not in self.JOINT_NAMES:
+                continue
+            idx = self.JOINT_NAMES.index(name)
+            # Cap any single step. A bad detection should nudge the arm, not
+            # fling it across the workspace.
+            delta = max(-self._max_jog_deg, min(self._max_jog_deg, float(delta)))
+            lo, hi = self._joint_limits_deg[idx]
+            # Clamp to the joint's travel. This is not about being cautious
+            # with the workspace -- driving a servo into its hard stop and
+            # holding it there is how you damage it.
+            target_deg[idx] = max(lo, min(hi, target_deg[idx] + delta))
+            moved = True
+
+        if not moved:
+            return
+
+        try:
+            with self._lock:
+                self._mc.send_angles(target_deg, self._jog_speed)
+            self._last_jog_time = now
+            # Track the commanded pose so successive jogs compound instead of
+            # each one being applied to a stale reading.
+            self._last_angles_rad = [math.radians(d) for d in target_deg]
+        except Exception as e:
+            self.get_logger().warn(f'jog send_angles failed: {e}')
+
+    def _jog_enable_callback(self, request, response):
+        """Deadman for jogging. Servoing does nothing until this is enabled."""
+        self._jog_enabled = bool(request.data)
+        state = 'ENABLED' if self._jog_enabled else 'disabled'
+        response.success = True
+        response.message = f'Jogging {state}'
+        self.get_logger().info(f'Jogging {state}')
+        return response
 
     # ---- FollowJointTrajectory Action ----
 

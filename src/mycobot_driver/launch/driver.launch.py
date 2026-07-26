@@ -54,6 +54,10 @@ def generate_launch_description():
             'command_interval': 0.06,
             'lookahead': 0.12,
             'trajectory_speed': 60,
+            # See scripts/measure_arm.py — speed_at_100_deg_s is a guess.
+            'adaptive_speed': True,
+            'speed_at_100_deg_s': 120.0,
+            'speed_headroom': 1.3,
             'settle_timeout': 2.0,
             'settle_tolerance_deg': 4.0,
             # Fixed home pose, degrees. Override for your workspace.

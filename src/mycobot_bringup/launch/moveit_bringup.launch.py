@@ -82,6 +82,12 @@ def generate_launch_description():
             'command_interval': 0.06,
             'lookahead': 0.12,
             'trajectory_speed': 60,
+            # Scale each streaming step's speed to its size instead of using a
+            # fixed value. speed_at_100_deg_s is a GUESS — measure it with
+            # scripts/measure_arm.py and set the real number here.
+            'adaptive_speed': True,
+            'speed_at_100_deg_s': 120.0,
+            'speed_headroom': 1.3,
             'home_angles_deg': [0.0, 90.0, -90.0, -90.0, 0.0, 0.0],
             'home_speed': 30,
         }],

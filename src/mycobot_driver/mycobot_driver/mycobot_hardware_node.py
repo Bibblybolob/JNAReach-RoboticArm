@@ -69,10 +69,27 @@ class MyCobotHardwareNode(Node):
         # Aiming slightly ahead keeps a moving target in front of it, which is
         # what produces continuous motion.
         self.declare_parameter('lookahead', 0.12)
-        # Speed passed to send_angles during streaming. Lower than a point-to-
-        # point move: each command is a small step along the path, so the arm
-        # does not need to sprint to it.
+        # Fallback speed for streaming if adaptive speed is disabled.
         self.declare_parameter('trajectory_speed', 60)
+        # Scale send_angles speed to the size of each step.
+        #
+        # A fixed speed is wrong for streaming: send_angles(target, speed) is a
+        # point-to-point command, so a constant 60 tells the arm to sprint to a
+        # target only ~60ms away, arrive, stop, and wait for the next one. That
+        # micro stop-start is felt as jerk even when commands arrive on time.
+        # Instead, pick the speed that covers this step in roughly the time
+        # until the next command, so the arm is still moving when it arrives.
+        self.declare_parameter('adaptive_speed', True)
+        # Degrees/second the fastest joint achieves at send_angles speed=100.
+        # THIS IS A GUESS AND SHOULD BE MEASURED — see scripts/measure_arm.py.
+        # Too high makes every step under-speed (arm lags, motion drags);
+        # too low makes it over-speed (arm sprints and stops = jerk).
+        self.declare_parameter('speed_at_100_deg_s', 120.0)
+        # Command slightly more speed than strictly needed so the arm leads
+        # rather than trails the schedule. 1.0 = exact, 1.3 = 30% margin.
+        self.declare_parameter('speed_headroom', 1.3)
+        self.declare_parameter('min_speed', 15)
+        self.declare_parameter('max_speed', 100)
         # Grace period after the planned trajectory end to let the arm settle
         # before we report success.
         self.declare_parameter('settle_timeout', 2.0)
@@ -101,6 +118,11 @@ class MyCobotHardwareNode(Node):
         self._cmd_interval = self.get_parameter('command_interval').get_parameter_value().double_value
         self._lookahead = self.get_parameter('lookahead').get_parameter_value().double_value
         self._traj_speed = self.get_parameter('trajectory_speed').get_parameter_value().integer_value
+        self._adaptive_speed = self.get_parameter('adaptive_speed').get_parameter_value().bool_value
+        self._speed_at_100 = self.get_parameter('speed_at_100_deg_s').get_parameter_value().double_value
+        self._speed_headroom = self.get_parameter('speed_headroom').get_parameter_value().double_value
+        self._min_speed = self.get_parameter('min_speed').get_parameter_value().integer_value
+        self._max_speed = self.get_parameter('max_speed').get_parameter_value().integer_value
         self._settle_timeout = self.get_parameter('settle_timeout').get_parameter_value().double_value
         self._settle_tol = self.get_parameter('settle_tolerance_deg').get_parameter_value().double_value
 
@@ -118,10 +140,12 @@ class MyCobotHardwareNode(Node):
 
         # Counts joint-state cycles so polling can be throttled during motion.
         self._js_cycle = 0
-        # Set while a trajectory (or homing) is executing. Joint-state polling
-        # backs off to _motion_rate so the single TCP link stays available for
-        # motion commands.
+        # Set while a trajectory (or homing) is executing. While set, the
+        # joint-state timer stops touching the hardware entirely.
         self._in_motion = threading.Event()
+        # Most recent commanded joint positions (radians), published in place
+        # of a hardware read while _in_motion is set. See _publish_joint_states.
+        self._cmd_positions = None
 
         self.get_logger().info(f'Connecting to myCobot at {ip}:{port}')
         self._mc = MyCobot280Socket(ip, port)
@@ -182,14 +206,29 @@ class MyCobotHardwareNode(Node):
             return None
 
     def _publish_joint_states(self):
-        # Back off hard while the arm is moving. get_angles() is a blocking
-        # round-trip on the same single-client socket the motion commands use;
-        # stealing that bandwidth mid-trajectory is what makes motion stutter.
         self._js_cycle += 1
+
         if self._in_motion.is_set():
-            stride = max(1, int(round(self._rate / max(self._motion_rate, 0.1))))
-            if self._js_cycle % stride:
+            # Do NOT read the hardware while moving. get_angles() blocks up to
+            # 100ms in the Pi's server while holding self._lock, which stalls
+            # the command stream for the duration. Even at 2Hz that is a hitch
+            # twice a second, which is felt directly as jerk.
+            #
+            # We already know where the arm was told to go, so publish the
+            # commanded setpoint instead: MoveIt's state monitor gets a smooth,
+            # continuous feed and the link stays entirely free for motion.
+            # The cost is that /joint_states reports intent rather than measured
+            # position during the move; the first post-motion cycle reads real
+            # hardware again and corrects any discrepancy.
+            cmd = self._cmd_positions
+            if cmd is None:
                 return
+            msg = JointState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.name = list(self.JOINT_NAMES)
+            msg.position = list(cmd)
+            self._js_pub.publish(msg)
+            return
 
         angles = self._read_angles_rad()
         if angles is None:
@@ -212,13 +251,20 @@ class MyCobotHardwareNode(Node):
         return CancelResponse.ACCEPT
 
     def _wait_until_reached(self, target_deg, tolerance_deg=5.0, timeout=8.0):
-        """Poll joint angles until robot reaches target or timeout."""
+        """Poll joint angles until robot reaches target or timeout.
+
+        Reads here feed _cmd_positions as a side effect, so /joint_states can
+        publish real measured angles during this phase without spending a
+        second round-trip on the link (hardware reads in the joint-state timer
+        are suppressed while _in_motion is set).
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
                 with self._lock:
                     current = self._mc.get_angles()
                 if isinstance(current, list) and len(current) == 6:
+                    self._cmd_positions = [math.radians(c) for c in current]
                     max_err = max(abs(c - t) for c, t in zip(current, target_deg))
                     if max_err < tolerance_deg:
                         return True
@@ -261,6 +307,26 @@ class MyCobotHardwareNode(Node):
                 return [q0 + a * (q1 - q0) for q0, q1 in zip(p0, p1)]
         return list(last.positions)
 
+    def _step_speed(self, from_deg, to_deg, dt):
+        """Pick a send_angles speed (0..100) that covers this step in ~dt.
+
+        send_angles is point-to-point: it drives to the target at the given
+        speed and stops. During streaming each target is only one command
+        interval away, so a fixed speed makes the arm sprint the tiny gap and
+        wait — micro stop-start that reads as jerk. Sizing speed to the step
+        keeps it moving continuously into the next command.
+        """
+        if not self._adaptive_speed or dt <= 0.0:
+            return self._traj_speed
+        max_delta = max(abs(a - b) for a, b in zip(from_deg, to_deg))
+        if max_delta <= 0.0:
+            return self._min_speed
+        needed_deg_s = (max_delta / dt) * self._speed_headroom
+        if self._speed_at_100 <= 0.0:
+            return self._traj_speed
+        speed = int(round(needed_deg_s / self._speed_at_100 * 100.0))
+        return max(self._min_speed, min(self._max_speed, speed))
+
     def _execute_trajectory(self, goal_handle):
         trajectory = goal_handle.request.trajectory
         feedback_msg = FollowJointTrajectory.Feedback()
@@ -276,6 +342,7 @@ class MyCobotHardwareNode(Node):
             # Untimed trajectory (some planners emit these) — nothing to pace
             # against, so just command the endpoint.
             final_deg = [math.degrees(p) for p in points[-1].positions]
+            self._cmd_positions = list(points[-1].positions)
             self._in_motion.set()
             try:
                 with self._lock:
@@ -286,6 +353,7 @@ class MyCobotHardwareNode(Node):
                 )
             finally:
                 self._in_motion.clear()
+                self._cmd_positions = None
             goal_handle.succeed()
             return FollowJointTrajectory.Result()
 
@@ -295,7 +363,12 @@ class MyCobotHardwareNode(Node):
             f'(lookahead {self._lookahead * 1000:.0f}ms)'
         )
 
-        # Suppress the joint-state polling storm for the duration of the move.
+        # Seed the commanded position before suppressing hardware reads, so
+        # /joint_states has something valid to publish from the first cycle.
+        self._cmd_positions = list(points[0].positions)
+        prev_deg = [math.degrees(p) for p in points[0].positions]
+
+        # Stop reading the hardware for the duration of the move.
         self._in_motion.set()
         result = FollowJointTrajectory.Result()
         start = time.monotonic()
@@ -327,13 +400,21 @@ class MyCobotHardwareNode(Node):
                 target_rad = self._sample_trajectory(points, elapsed + self._lookahead)
                 target_deg = [math.degrees(p) for p in target_rad]
 
+                # Size the speed to this specific step so the arm flows into
+                # the next command instead of sprinting and stopping.
+                speed = self._step_speed(prev_deg, target_deg, self._cmd_interval)
+
                 try:
                     with self._lock:
-                        self._mc.send_angles(target_deg, self._traj_speed)
+                        self._mc.send_angles(target_deg, speed)
                 except Exception as e:
                     # A dropped command is recoverable: the next one is only
                     # command_interval away and supersedes it anyway.
                     self.get_logger().warn(f'send_angles failed mid-stream: {e}')
+
+                # Feeds /joint_states while hardware reads are suppressed.
+                self._cmd_positions = list(target_rad)
+                prev_deg = target_deg
 
                 next_cmd += self._cmd_interval
                 sleep_for = next_cmd - time.monotonic()
@@ -346,9 +427,13 @@ class MyCobotHardwareNode(Node):
 
             # Command the exact endpoint, then let the arm settle into it.
             final_deg = [math.degrees(p) for p in points[-1].positions]
+            self._cmd_positions = list(points[-1].positions)
             try:
                 with self._lock:
-                    self._mc.send_angles(final_deg, self._traj_speed)
+                    self._mc.send_angles(
+                        final_deg,
+                        self._step_speed(prev_deg, final_deg, self._cmd_interval),
+                    )
             except Exception as e:
                 self.get_logger().error(f'Failed to send final angles: {e}')
 
@@ -364,6 +449,8 @@ class MyCobotHardwareNode(Node):
                 )
         finally:
             self._in_motion.clear()
+            # Fall back to real hardware reads now that the link is free.
+            self._cmd_positions = None
 
         # Publish one feedback sample at the end. Publishing per-command during
         # the stream would mean an extra blocking get_angles() round-trip on
@@ -398,6 +485,12 @@ class MyCobotHardwareNode(Node):
         target = list(self._home_angles)
         self.get_logger().info(f'Homing to {target} at speed {self._home_speed}')
 
+        # Homing is a single point-to-point move, not a command stream, so
+        # there is no burst of commands to protect. _in_motion is still set to
+        # stop the joint-state timer from adding a *second* concurrent read on
+        # top of the one _wait_until_reached is already doing; that polling
+        # feeds _cmd_positions with real measured angles, so /joint_states
+        # keeps reporting the arm's actual position as it travels.
         self._in_motion.set()
         try:
             with self._lock:
@@ -414,6 +507,7 @@ class MyCobotHardwareNode(Node):
             return response
         finally:
             self._in_motion.clear()
+            self._cmd_positions = None
 
         response.success = bool(reached)
         if reached:

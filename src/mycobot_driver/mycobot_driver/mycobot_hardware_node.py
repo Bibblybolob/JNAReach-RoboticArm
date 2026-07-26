@@ -276,12 +276,17 @@ class MyCobotHardwareNode(Node):
             angles = None
             for attempt in range(5):
                 angles = mc.get_angles()
-                if isinstance(angles, list) and len(angles) == 6:
+                if (isinstance(angles, list) and len(angles) == 6
+                        and self._angles_within_limits(angles)):
                     break
                 time.sleep(0.3)
             if not isinstance(angles, list) or len(angles) != 6:
                 raise RuntimeError(
                     f'connected but get_angles() returned {angles!r}')
+            if not self._angles_within_limits(angles):
+                raise RuntimeError(
+                    f'connected but get_angles() returned implausible '
+                    f'angles {angles!r} (outside joint_limits_deg)')
             self._mc = mc
             self.get_logger().info(f'Connected. Joint angles: '
                                    f'{[round(a, 1) for a in angles]}')
@@ -308,6 +313,25 @@ class MyCobotHardwareNode(Node):
     def _retry_connect(self) -> None:
         if self._mc is None:
             self._connect()
+
+    def _angles_within_limits(self, angles_deg) -> bool:
+        """Reject an angle reading that is not physically plausible.
+
+        A garbled response on a flaky link can still decode to a valid list
+        of 6 floats -- just not real ones. Trusting that blindly poisons
+        self._last_angles_rad: a jog only clamps the joint(s) it is actually
+        moving, so a bad value on any other joint gets silently re-sent
+        forever until the arm's own validation finally rejects it (seen in
+        practice as pymycobot raising "invalid angle value" on a jog that
+        never should have contained that number in the first place). A
+        margin beyond the configured limits avoids flagging a real reading
+        that is legitimately near a limit.
+        """
+        margin = 5.0
+        return all(
+            (lo - margin) <= a <= (hi + margin)
+            for a, (lo, hi) in zip(angles_deg, self._joint_limits_deg)
+        )
 
     def _handle_link_error(self, exc: Exception, context: str) -> None:
         """Mark the arm disconnected after a socket-level failure.
@@ -340,6 +364,12 @@ class MyCobotHardwareNode(Node):
             with self._lock:
                 angles_deg = self._mc.get_angles()
             if not isinstance(angles_deg, list) or len(angles_deg) != 6:
+                return None
+            if not self._angles_within_limits(angles_deg):
+                self.get_logger().warn(
+                    f'Ignoring implausible angle read {angles_deg} '
+                    '(outside joint_limits_deg) -- treating as a bad read.',
+                    throttle_duration_sec=2.0)
                 return None
             return [math.radians(a) for a in angles_deg]
         except Exception as e:
@@ -453,6 +483,15 @@ class MyCobotHardwareNode(Node):
             return
 
         target_deg = [math.degrees(a) for a in base]
+        # Clamp every joint here, not just the one(s) this message actually
+        # jogs. Only the touched joints get re-clamped below after their
+        # delta is applied -- an untouched joint's slot is just carried over
+        # from base, so if base ever picked up one bad value (a garbled
+        # read on a flaky link, say), it would be resent unchecked on every
+        # future jog indefinitely, since nothing here ever looks at it again
+        # until the arm itself finally refuses it.
+        for i, (lo, hi) in enumerate(self._joint_limits_deg):
+            target_deg[i] = max(lo, min(hi, target_deg[i]))
 
         names = list(msg.joint_names)
         deltas = list(msg.displacements)
@@ -495,8 +534,17 @@ class MyCobotHardwareNode(Node):
             # Track the commanded pose so successive jogs compound instead of
             # each one being applied to a stale reading.
             self._last_angles_rad = [math.radians(d) for d in target_deg]
-        except Exception as e:
+        except OSError as e:
+            # A real socket-level failure -- the link is actually dead.
             self._handle_link_error(e, 'jog')
+        except Exception as e:
+            # pymycobot validates the target locally before it ever touches
+            # the socket, so a rejected value (e.g. "invalid angle value")
+            # raises here too but has nothing to do with the connection.
+            # Treating it as a lost link would tear down a perfectly healthy
+            # socket over a bad number -- just drop this jog and log it.
+            self.get_logger().warn(
+                f'jog rejected: {e}', throttle_duration_sec=2.0)
 
     def _jog_enable_callback(self, request, response):
         """Deadman for jogging. Servoing does nothing until this is enabled."""
@@ -681,7 +729,7 @@ class MyCobotHardwareNode(Node):
                 try:
                     with self._lock:
                         self._mc.send_angles(target_deg, speed)
-                except Exception as e:
+                except OSError as e:
                     # A dropped command on an otherwise-live link is
                     # recoverable: the next one is only command_interval away
                     # and supersedes it anyway. A socket-level failure is not
@@ -690,6 +738,13 @@ class MyCobotHardwareNode(Node):
                     # socket instead of the 5s reconnect timer ever getting a
                     # chance to open a new one.
                     self._handle_link_error(e, 'trajectory streaming')
+                except Exception as e:
+                    # Local validation rejecting this target has nothing to
+                    # do with the link -- do not tear down a healthy socket
+                    # over it.
+                    self.get_logger().warn(
+                        f'send_angles rejected mid-stream: {e}',
+                        throttle_duration_sec=2.0)
 
                 # Feeds /joint_states while hardware reads are suppressed.
                 self._cmd_positions = list(target_rad)
@@ -713,8 +768,11 @@ class MyCobotHardwareNode(Node):
                         final_deg,
                         self._step_speed(prev_deg, final_deg, self._cmd_interval),
                     )
-            except Exception as e:
+            except OSError as e:
                 self._handle_link_error(e, 'trajectory final position')
+            except Exception as e:
+                self.get_logger().warn(f'send_angles rejected for final '
+                                       f'position: {e}')
 
             reached = self._wait_until_reached(
                 final_deg,
@@ -785,8 +843,13 @@ class MyCobotHardwareNode(Node):
                 tolerance_deg=self._settle_tol,
                 timeout=self._home_timeout,
             )
-        except Exception as e:
+        except OSError as e:
             self._handle_link_error(e, 'homing')
+            response.success = False
+            response.message = f'Homing failed: {e}'
+            self.get_logger().error(response.message)
+            return response
+        except Exception as e:
             response.success = False
             response.message = f'Homing failed: {e}'
             self.get_logger().error(response.message)

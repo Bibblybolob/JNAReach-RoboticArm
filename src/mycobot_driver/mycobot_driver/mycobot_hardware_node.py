@@ -311,15 +311,32 @@ class MyCobotHardwareNode(Node):
         Deliberately ignored while a trajectory is executing -- two things
         commanding the arm at once produces motion neither one intended.
         """
+        # Every rejection below is throttled-logged rather than silent. A servo
+        # loop that publishes correctly into a driver that quietly discards
+        # everything is indistinguishable from a broken servo loop, and that is
+        # a miserable thing to debug.
         if self._in_motion.is_set():
+            self.get_logger().warn(
+                'Ignoring jog: a trajectory is executing.',
+                throttle_duration_sec=2.0)
             return
 
         if not self._jog_enabled:
+            self.get_logger().warn(
+                'Ignoring jog: jogging is disabled. Enable it with: '
+                'ros2 service call /arm/jog_enable std_srvs/srv/SetBool '
+                '"{data: true}"',
+                throttle_duration_sec=2.0)
             return
 
         base = self._last_angles_rad
         if base is None:
-            # No joint state read yet; nothing sane to apply a delta to.
+            # No successful joint-state read yet, so there is no starting pose
+            # to apply a delta to. Usually means the arm is unreachable.
+            self.get_logger().warn(
+                'Ignoring jog: no joint angles read yet -- cannot apply a '
+                'relative move. Is the arm reachable?',
+                throttle_duration_sec=2.0)
             return
 
         # Rate-limit to the same interval the trajectory streamer uses. A servo
@@ -355,11 +372,18 @@ class MyCobotHardwareNode(Node):
             moved = True
 
         if not moved:
+            self.get_logger().warn(
+                f'Ignoring jog: none of {names} are arm joints '
+                f'(expected any of {self.JOINT_NAMES})',
+                throttle_duration_sec=2.0)
             return
 
         try:
             with self._lock:
                 self._mc.send_angles(target_deg, self._jog_speed)
+            self.get_logger().info(
+                f'jog -> {[round(d, 1) for d in target_deg]}',
+                throttle_duration_sec=2.0)
             self._last_jog_time = now
             # Track the commanded pose so successive jogs compound instead of
             # each one being applied to a stale reading.

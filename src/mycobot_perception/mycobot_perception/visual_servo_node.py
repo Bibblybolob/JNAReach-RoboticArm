@@ -348,15 +348,42 @@ class VisualServoNode(Node):
     # ---- Control loop ----
 
     def _servo_step(self) -> None:
-        if not self._enabled or self._probing or self._jinv is None:
+        if self._probing:
+            return
+        if not self._enabled:
+            return
+        if self._jinv is None:
+            self.get_logger().warn(
+                'Enabled but no Jacobian -- the orientation probe has not run '
+                'successfully. Disable and re-enable to retry.',
+                throttle_duration_sec=3.0)
             return
 
         err = self._current_error()
         if err is None:
+            # Enabled and expected to be working, so say why nothing happens
+            # rather than sitting there quietly doing nothing.
+            if self._width is None:
+                reason = 'no image received yet'
+            elif self._last_point is None:
+                reason = 'no target has ever been seen'
+            else:
+                age = time.monotonic() - self._last_point_time
+                reason = (f'target last seen {age:.1f}s ago, over the '
+                          f'{self._timeout}s timeout')
+            self.get_logger().warn(
+                f'Not servoing: {reason}', throttle_duration_sec=3.0)
             return
         ex, ey = err
 
         if math.hypot(ex, ey) < self._deadband:
+            # Being centred is success, not a fault -- but it looks identical
+            # to a dead loop from outside, so say so.
+            self.get_logger().info(
+                f'On target (error {math.hypot(ex, ey):.3f} < deadband '
+                f'{self._deadband}); holding. Move the target off-centre to '
+                'see motion.',
+                throttle_duration_sec=5.0)
             return
 
         # Drive the error to zero: joint delta = -Jinv @ error.
@@ -371,6 +398,13 @@ class VisualServoNode(Node):
         msg.joint_names = [self._h_joint, self._v_joint]
         msg.displacements = [dh, dv]
         self._jog_pub.publish(msg)
+
+        # If this logs but the arm does not move, the jog is being rejected by
+        # the driver -- check the driver's console, which now says why.
+        self.get_logger().info(
+            f'err=({ex:+.3f},{ey:+.3f}) -> {self._h_joint}{dh:+.2f}deg '
+            f'{self._v_joint}{dv:+.2f}deg',
+            throttle_duration_sec=2.0)
 
 
 def main(args=None) -> None:

@@ -1,359 +1,312 @@
-YouTube Video:
-part 1: https://www.youtube.com/watch?v=Jq-79XXTvu4
-part 2: https://youtu.be/tcKRBKju4v4?si=bxCKUUZKw8PSfLP4
-part 3: https://www.youtube.com/watch?v=C2TYpbpt0QM
+# JNAReach — myCobot 280 Pi
 
-# myCobot 280 Pi -- ROS 2 Workspace
+A ROS 2 workspace for driving a myCobot 280 Pi over the network, with
+eye-in-hand visual servoing. The arm finds a hand with a flange-mounted camera,
+centres it in view, and closes in — no camera calibration required.
 
-Remote-control a myCobot 280 Pi over the network from a Desktop PC using ROS 2 Humble and MoveIt2.
+Working toward pressing elevator buttons autonomously.
 
-## Architecture
+This guide assumes **a freshly installed Ubuntu 22.04** and nothing else. If
+you already have ROS 2 Humble, skip to [Get the code](#3-get-the-code).
 
-The Pi runs two lightweight servers (no ROS 2 needed). All ROS 2 nodes run on the Desktop.
+Documentation for the older gripper/food-handling version of this workspace is
+in [legacy/README_ros2_workspace.md](legacy/README_ros2_workspace.md).
 
-A **single** `mycobot_hardware_node` maintains one TCP connection to the Pi's
-`pymycobot Server.py` and handles both arm control and gripper control.
-This is required because `Server.py` only accepts one client at a time.
+---
 
-```
-Desktop PC (Ubuntu 22.04 / ROS 2 Humble)         myCobot 280 Pi (Ubuntu 20.04)
-┌──────────────────────────────────────┐         ┌──────────────────────────────┐
-│  MoveIt2 Planning                    │         │  pymycobot Server.py :9000   │
-│  mycobot_hardware_node ── TCP :9000 ─┼────────►│    └── /dev/ttyAMA0 ──► Arm  │
-│    ├── /joint_states                 │         │                              │
-│    ├── /follow_joint_trajectory      │         │  camera_stream.py :8080      │
-│    └── /gripper/set_state            │         │    └── /dev/video0 ──► Cam   │
-│  camera_node ──── HTTP :8080 ────────┼────────►│                              │
-│    └── /camera/image_raw             │         └──────────────────────────────┘
-│  food_detector_node (YOLO-World)     │
-│    ├── /perception/food_detections   │
-│    └── /perception/food_detections/image
-│  robot_state_publisher               │
-│  RViz2                               │
-└──────────────────────────────────────┘
-```
-
-## Repository Layout
+## How the pieces fit together
 
 ```
-mycobot_project/               # <-- this is the ROS 2 workspace root
-├── src/
-│   ├── mycobot_description/   # URDF (arm + camera + gripper), meshes, RViz config
-│   ├── mycobot_driver/        # Arm + gripper control + pose recorder
-│   ├── mycobot_camera/        # Camera stream consumer (MJPEG -> ROS 2 Image)
-│   ├── mycobot_perception/    # YOLOv11 food detection (CV2 window + ROS 2 topics)
-│   ├── mycobot_moveit_config/ # MoveIt2 planning config (SRDF, kinematics, OMPL)
-│   └── mycobot_bringup/       # Top-level launch files
-├── legacy/                    # Original pymycobot scripts (reference)
-├── pi/                        # Scripts & services for the Pi (no ROS 2)
-│   ├── setup_pi.sh            # One-time Pi dependency installer
-│   ├── start_services.sh      # Start arm server + camera stream
-│   ├── server.py              # TCP-to-serial bridge (raw binary, pymycobot 4.x compatible)
-│   ├── camera_stream.py       # Python MJPEG HTTP server (replaces mjpg-streamer)
-│   ├── mycobot_server.service # systemd unit for server.py
-│   └── mjpg_streamer.service  # systemd unit for camera_stream.py
-└── scripts/                   # Developer utility scripts (sync_to_pi.sh)
+Desktop / VM (Ubuntu 22.04)          Raspberry Pi (on the arm)
+┌──────────────────────────┐         ┌──────────────────────────┐
+│ mycobot_hardware_node    │◄──TCP──►│ server.py       :9000    │──► arm servos
+│   joint states           │  9000   │  (bridges TCP to serial) │
+│   trajectories, jogging  │         │                          │
+│                          │         │                          │
+│ camera_node              │◄──HTTP──│ camera_stream.py  :8080  │◄── USB webcam
+│ hand_tracker_node        │  8080   │  (MJPEG server)          │
+│ visual_servo_node        │         └──────────────────────────┘
+│ move_group (MoveIt2)     │
+└──────────────────────────┘
 ```
 
-## Prerequisites
+**The Pi's TCP server accepts exactly one client.** Only one thing may talk to
+the arm at a time — the driver, or a script like `measure_arm.py`, never both.
+This constraint shapes a lot of the design.
 
-### Desktop PC
-- Ubuntu 22.04
-- ROS 2 Humble (`sudo apt install ros-humble-desktop`)
-- MoveIt 2 (`sudo apt install ros-humble-moveit`)
-- pymycobot (`pip install pymycobot`)
-- cv_bridge (`sudo apt install ros-humble-cv-bridge`)
-- vision_msgs (`sudo apt install ros-humble-vision-msgs`)
-- ultralytics (`pip install ultralytics`) — only needed for `mycobot_perception`
+---
 
-### myCobot 280 Pi
-- Factory image (Ubuntu 20.04) -- no changes required
-- Connected to the same network as the Desktop
-- Default IP: `192.168.1.46`, user: `er`, password: `elephant`
-
-## Quick Start
-
-### 1. One-time Pi setup
+## 1. Install ROS 2 Humble
 
 ```bash
-# From the Desktop, copy setup scripts to the Pi and run them
-scp -r pi/ er@192.168.1.46:~/Documents/robotics_club/mycobot_setup/
-ssh er@192.168.1.46 'bash ~/Documents/robotics_club/mycobot_setup/setup_pi.sh'
+sudo apt update && sudo apt install -y software-properties-common curl && sudo add-apt-repository -y universe
 ```
 
-### 2. Start Pi services
-
 ```bash
-ssh er@192.168.1.46 'bash ~/Documents/robotics_club/mycobot_setup/start_services.sh'
-# Verify camera: open http://192.168.1.46:8080/?action=stream in a browser
-
-# to stop the service
-ssh er@192.168.1.46 'sudo systemctl stop mycobot_server.service'
+sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
 ```
 
-### 3. Build and run (Desktop)
+```bash
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+```
 
 ```bash
-pip install pymycobot
+sudo apt update && sudo apt install -y ros-humble-desktop ros-humble-moveit python3-colcon-common-extensions python3-rosdep
+```
 
-source /opt/ros/humble/setup.bash
-cd mycobot_project
-colcon build --symlink-install
-source install/setup.bash
+Source ROS in every new shell — put it in `.bashrc` so you stop thinking about it:
 
-# Visualize the URDF only
-ros2 launch mycobot_description display.launch.py
+```bash
+echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && source ~/.bashrc
+```
 
-# Driver only (arm + gripper, no camera)
-ros2 launch mycobot_driver driver.launch.py
+## 2. Install Python dependencies
 
-# Connect to robot (driver + camera + robot_state_publisher)
-ros2 launch mycobot_bringup robot_bringup.launch.py
+```bash
+pip install pymycobot mediapipe opencv-python requests numpy
+```
 
-# Full MoveIt2 stack (driver + move_group + RViz2)
+`ultralytics` is only needed for the YOLO food/object detector, which the
+elevator work does not use:
+
+```bash
+pip install ultralytics
+```
+
+## 3. Get the code
+
+```bash
+git clone https://github.com/Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project
+```
+
+## 4. Build
+
+```bash
+cd ~/mycobot_project && colcon build --symlink-install && source install/setup.bash
+```
+
+**Use `--symlink-install`.** Without it colcon *copies* Python files, so edits
+have no effect until you rebuild — and you will lose time to a change that
+"didn't apply" when in fact it was never installed.
+
+Add the workspace to your shell too:
+
+```bash
+echo "source ~/mycobot_project/install/setup.bash" >> ~/.bashrc
+```
+
+## 5. Find the Pi and set its address
+
+The Pi may have **both** WiFi and Ethernet, on different subnets. You need the
+address your desktop can actually reach — check your router, or on the Pi:
+
+```bash
+hostname -I
+```
+
+Then, on the desktop:
+
+```bash
+export MYCOBOT_IP=192.168.0.15
+```
+
+Every launch file reads `$MYCOBOT_IP`. Put it in `.bashrc`. A `robot_ip:=...`
+launch argument overrides it for one run.
+
+If the address comes from DHCP it will change on reboot; a router reservation
+saves repeating this.
+
+## 6. Set up the Pi
+
+One-time, if the Pi has never been configured:
+
+```bash
+scp -r pi/ er@$MYCOBOT_IP:~/Documents/robotics_club/mycobot_setup/ && ssh er@$MYCOBOT_IP 'bash ~/Documents/robotics_club/mycobot_setup/setup_pi.sh'
+```
+
+Afterwards, and whenever anything in `pi/` changes, this deploys the scripts,
+installs the systemd units, frees ports 9000/8080 and restarts both services:
+
+```bash
+./scripts/redeploy_pi.sh
+```
+
+## 7. Check both services before going further
+
+Camera — expect `HTTP 200`:
+
+```bash
+curl -s -m 3 -o /dev/null -w 'camera HTTP %{http_code}\n' "http://$MYCOBOT_IP:8080/?action=snapshot"
+```
+
+Arm — expect a list of six joint angles. This only reads, it does not move:
+
+```bash
+python3 scripts/measure_arm.py --ip $MYCOBOT_IP --skip-motion
+```
+
+Both working means the hard part is done. If either fails, see
+[Troubleshooting](#troubleshooting) — every failure listed there is one that
+actually happened during development.
+
+---
+
+## Running it
+
+### Finger following (one command)
+
+```bash
+ros2 launch mycobot_bringup servo_demo.launch.py
+```
+
+Starts the driver, camera, hand tracker and servo node. Jogging and servoing
+arm themselves, but **the arm stays idle at home** until you ask it to hunt.
+In a second terminal:
+
+```bash
+ros2 service call /servo/search std_srvs/srv/Trigger
+```
+
+It sweeps until it sees a hand, twitches a few joints to learn how the camera
+is mounted (**hold your hand still for this**), then centres and closes in.
+After 15s with no sighting it returns home. Stop it at any time:
+
+```bash
+ros2 service call /servo/enable std_srvs/srv/SetBool "{data: false}"
+```
+
+Useful overrides:
+
+| Argument | Default | Effect |
+|---|---|---|
+| `gain` | 3.0 | proportional gain; halve it if the arm oscillates |
+| `ki` | 1.2 | integral gain — the term that actually centres; lower it if it hunts |
+| `lost_timeout` | 15.0 | seconds before giving up and homing |
+| `target_size_fraction` | 0.45 | how close to get; higher is closer |
+| `approach_enabled` | true | set false to centre without closing in |
+| `search_on_start` | false | start hunting without the trigger |
+| `show_window` | false | OpenCV window from the tracker |
+
+### MoveIt2 planning and RViz
+
+```bash
 ros2 launch mycobot_bringup moveit_bringup.launch.py
 ```
 
-## Controlling the Gripper in MoveIt2
+Heavier, and unnecessary for servoing — visual servoing bypasses MoveIt
+entirely, jogging joints straight from image error.
 
-The gripper is exposed as a separate MoveIt planning group called `gripper`,
-with two named states (`open`, `closed`). It uses the binary myCobot adaptive
-gripper under the hood — the URDF joint range `[0.0, 0.5]` rad is symbolic
-and gets thresholded at the midpoint to decide open vs close.
-
-In RViz2 (after `ros2 launch mycobot_bringup moveit_bringup.launch.py`):
-
-1. Open the **MotionPlanning** panel.
-2. **Planning** tab → **Planning Group** dropdown → select **gripper**.
-3. **Goal State** dropdown → pick **open** or **closed**.
-4. Click **Plan & Execute**. The real gripper actuates and the URDF visual
-   updates via `/joint_states`.
-
-From the command line (bypassing RViz):
+### Homing
 
 ```bash
-# Open
-ros2 action send_goal /gripper_controller/gripper_cmd \
-  control_msgs/action/GripperCommand "{command: {position: 0.5, max_effort: 0.0}}"
-
-# Close
-ros2 action send_goal /gripper_controller/gripper_cmd \
-  control_msgs/action/GripperCommand "{command: {position: 0.0, max_effort: 0.0}}"
+ros2 service call /arm/home std_srvs/srv/SetBool "{data: true}"
 ```
 
-The legacy `/gripper/set_state` (`SetBool`) service is still available for
-quick scripts and teleop:
+Moves to a fixed pose, `[0, 90, -90, -90, 0, 0]` degrees. This is commanded
+from wherever the arm happens to be, which makes it the largest single move the
+arm makes — check the path is clear.
+
+---
+
+## Topics and services
+
+| Name | Type | Purpose |
+|---|---|---|
+| `/joint_states` | JointState | 6 arm joints |
+| `/arm_controller/follow_joint_trajectory` | FollowJointTrajectory | MoveIt execution |
+| `/arm/home` | SetBool | move to the fixed home pose |
+| `/arm/jog` | JointJog | relative joint moves, in **degrees** |
+| `/arm/jog_enable` | SetBool | gate for jogging |
+| `/servo/search` | Trigger | start hunting for a hand |
+| `/servo/enable` | SetBool | master stop for servoing |
+| `/camera/image_raw` | Image | camera feed |
+| `/hand/point_px` | PointStamped | x,y = fingertip pixel; **z = palm width in pixels** |
+| `/hand/annotated` | Image | landmarks drawn, for debugging |
+
+---
+
+## Calibration (optional)
+
+Servoing needs none of this. These unlock metric 3D work later.
+
+**Arm speed** — replaces two guessed constants with measured values. Moves the
+arm; stop the driver first, since only one client may connect:
 
 ```bash
-ros2 service call /gripper/set_state std_srvs/srv/SetBool "{data: true}"   # close
-ros2 service call /gripper/set_state std_srvs/srv/SetBool "{data: false}"  # open
+python3 scripts/measure_arm.py --ip $MYCOBOT_IP
 ```
 
-### If "open" and "close" are swapped on your hardware
-
-Defaults are tuned for this 280 Pi's firmware, which is **inverted** from the
-official Elephant Robotics docs: `set_gripper_value(100)` opens, `(0)` closes.
-If you swap to a docs-compliant gripper, flip the two parameters at launch time
-— no rebuild needed:
+**Camera intrinsics** — needed before any pixel can become a ray:
 
 ```bash
-ros2 launch mycobot_bringup moveit_bringup.launch.py \
-  gripper_open_value:=0 gripper_closed_value:=100
+python3 scripts/calibrate_camera.py --stream "http://$MYCOBOT_IP:8080/?action=stream"
 ```
 
-## Collision Obstacles
+---
 
-The planner avoids physical obstacles (table, walls) defined in
-`src/mycobot_moveit_config/config/obstacles.yaml`.
-They are automatically loaded when the MoveIt2 stack launches and
-appear as green shapes in RViz2.
+## Troubleshooting
 
-Edit the YAML to match your physical setup — dimensions are in metres,
-positions are in the `world` frame (robot mount point at origin, Z up):
+**"Connection refused" on port 9000, but the camera on 8080 works.**
+The Pi has two interfaces and the old `server.py` bound only to the wlan0
+address, so it was listening on an address the desktop could not route to.
+Fixed by binding `0.0.0.0` — but the fix must be deployed:
+`./scripts/redeploy_pi.sh`.
 
-```yaml
-obstacles:
-  - name: table
-    type: box
-    dimensions: [1.0, 1.0, 0.02]   # [x, y, z] size
-    position: [0.0, 0.0, -0.45]    # 45cm below mount
-    orientation: [0.0, 0.0, 0.0]   # [roll, pitch, yaw]
-```
+**The arm was reachable, then stopped accepting connections.**
+The server accepts one client, and older versions had no receive timeout, so a
+client that died without closing blocked it forever. Redeploy, then check
+nothing else holds the socket — a leftover `measure_arm.py` or a second driver
+will lock everything else out.
 
-After editing, rebuild and re-source:
-```bash
-colcon build --packages-select mycobot_moveit_config
-source install/setup.bash
-```
+**A service is dead after a reboot with no error.**
+The units used to start before the network had an address, fail, exhaust
+systemd's start limit, and be abandoned permanently. Fixed in the current
+units; `redeploy_pi.sh` installs them.
 
-## Recording Named Poses (Teach Mode)
-
-Record the robot's current position as a named pose for MoveIt2.
-Use RViz2 to move the arm to a desired position, then capture it:
+**Config changes have no effect.**
+Stale build. Rebuild with `--symlink-install`, and check what is actually
+installed rather than what is in `src/`:
 
 ```bash
-# Terminal 1: Launch the full MoveIt2 stack
-ros2 launch mycobot_bringup moveit_bringup.launch.py
-
-# Terminal 2: Start the pose recorder
-ros2 run mycobot_driver teach_poses
+grep -rn "192.168" ~/mycobot_project/install/*/lib/python3*/site-packages/*/camera_node.py
 ```
 
-In the recorder terminal:
-1. In RViz2, drag the interactive marker and click **Plan & Execute** to move the arm.
-2. Once the arm reaches the desired pose, press **Enter** in the recorder terminal.
-3. Type a name for the pose (e.g. `pick`, `place`, `inspect`).
-4. Repeat for more poses, or type `done` to finish.
-5. Rebuild the config package so MoveIt2 loads the new poses:
+**"Waiting for /arm/jog_enable (is the driver running?)"**
+The driver could not reach the arm. It now stays up and retries every 5s
+instead of dying, and prints the address it failed on.
 
-```bash
-colcon build --packages-select mycobot_moveit_config
-source install/setup.bash
-```
+**Servo enabled but the arm does not move.**
+Both consoles now say why — the driver names the reason a jog was rejected, and
+the servo says whether it is inside the deadband, has no target, or has no
+Jacobian. `On target` means it is already centred: move your hand toward the
+frame edge.
 
-Recorded poses are saved as `<group_state>` entries in the SRDF source file
-and appear in the **Goal State** dropdown in RViz2's MotionPlanning panel.
+**Probe fails with "Jacobian is singular".**
+From that pose the two joints move the image in nearly the same direction, so
+they cannot steer independently. Move the arm elsewhere and re-trigger.
 
-## Food Detection
+**MediaPipe sees nothing.**
+Check `/camera/image_raw` first — with a flange-mounted camera it is often
+pointing somewhere unexpected. MediaPipe also needs the *whole* hand, so back
+off to 30–50cm.
 
-Two modes, one node:
+---
 
-| Mode | Model | When to use |
-|------|-------|-------------|
-| **Open-vocabulary (default)** | YOLO-World v2 (~50 MB) | Detect arbitrary foods you list (e.g. `strawberry`, `ketchup bottle`) without retraining. |
-| **COCO** | YOLOv11n (~6 MB) | Fastest. Limited to 10 COCO food classes (banana, apple, sandwich, orange, broccoli, carrot, hot dog, pizza, donut, cake). |
+## Notes and current state
 
-### One-time setup
-```bash
-pip install ultralytics                              # downloads torch deps (~2 GB)
-pip install ftfy regex git+https://github.com/ultralytics/CLIP.git  # for YOLO-World text encoder
-sudo apt install ros-humble-vision-msgs              # for Detection2DArray
-cd mycobot_project
-colcon build --packages-select mycobot_perception
-source install/setup.bash
-```
+**No collision geometry.** `obstacles.yaml` is empty. Self-collision checking
+still applies, but nothing in the environment is modelled — the planner will
+happily drive through your bench. Add real measured geometry before working
+near anything you care about.
 
-> The `clip` package is only required for **open-vocabulary mode** (YOLO-World).
-> If you only ever use COCO mode (`vocabulary:='[]'`), you can skip installing it.
-> Ultralytics will try to auto-install CLIP on first use, but the manual command
-> above is more reliable (avoids `sudo` / venv permission issues).
+**Two constants are still guesses**, both flagged in their files:
+`speed_at_100_deg_s` in the driver, and `max_velocity` in `joint_limits.yaml`.
+`measure_arm.py` replaces both with measured values in about five minutes.
 
-### Run it — no parameters needed
-```bash
-# Terminal 1: launch the camera (or the full MoveIt2 stack)
-ros2 launch mycobot_bringup moveit_bringup.launch.py
+**Depth is approximate.** With one camera there is no true range — apparent
+palm size stands in for it. An OAK-D Pro would replace that step; the code is
+structured so only the pixel→3D conversion changes.
 
-# Terminal 2: launch the food detector. That's it.
-ros2 launch mycobot_perception food_detector.launch.py
-```
-
-By default the node automatically:
-- subscribes to `/camera/image_raw`
-- loads YOLO-World v2 (`yolov8s-worldv2.pt`, auto-downloads ~50 MB on first run)
-- detects this kitchen-friendly vocabulary out of the box:
-  > broccoli, carrot, tomato, lettuce, bell pepper, cucumber,
-  > apple, banana, orange, strawberry, grape, lemon,
-  > pizza, french fries, ketchup bottle,
-  > egg, bread, milk carton, cookie, cheese
-- pops up a CV2 window with bounding boxes
-- publishes `/perception/food_detections` (`vision_msgs/Detection2DArray`)
-  and `/perception/food_detections/image` (annotated frame)
-
-### Common overrides
-
-```bash
-# Custom vocabulary (open-vocab mode)
-ros2 launch mycobot_perception food_detector.launch.py \
-  vocabulary:='["strawberry","blueberry","raspberry"]'
-
-# Switch to fast COCO mode (no YOLO-World)
-ros2 launch mycobot_perception food_detector.launch.py vocabulary:='[]'
-
-# Headless (no CV2 window, just publish topics)
-ros2 launch mycobot_perception food_detector.launch.py show_window:=false
-
-# Lower threshold if YOLO-World is missing items (default 0.1)
-ros2 launch mycobot_perception food_detector.launch.py confidence_threshold:=0.05
-
-# Custom-trained .pt model
-ros2 launch mycobot_perception food_detector.launch.py \
-  model_path:=/abs/path/my_food.pt vocabulary:='[]'
-```
-
-### Tips for tuning YOLO-World
-
-YOLO-World matches your text prompts against image regions via CLIP, so
-the wording of your vocabulary matters:
-
-- **Use concrete, common nouns**: `"strawberry"` works much better than
-  `"berry"` or `"red fruit"`.
-- **Include the object type**: `"milk carton"` >> `"milk"` (since "milk"
-  is a substance, not a visible object).
-- **Keep the list under ~30 items**; accuracy degrades when the
-  vocabulary is huge.
-- **Default confidence is `0.1`** because YOLO-World scores are typically
-  lower than COCO YOLO. Increase if you get false positives.
-
-### Common errors
-
-| Error | Cause | Fix |
-|-------|-------|-----|
-| `ModuleNotFoundError: No module named 'clip'` | YOLO-World needs OpenAI CLIP for text encoding | `pip install ftfy regex git+https://github.com/ultralytics/CLIP.git` |
-| `ModuleNotFoundError: No module named 'ultralytics'` | Missing main dep | `pip install ultralytics` |
-| `Trying to set parameter 'X' ... expecting type 'BYTE_ARRAY'` | rclpy bug — empty list defaults infer as BYTE_ARRAY | Already fixed in this node via `Parameter.Type.X` declarations |
-| CV2 window blank/grey but no errors | Camera node not publishing yet | `ros2 topic hz /camera/image_raw` should print ~30 Hz |
-| First inference takes ~30 s | YOLO-World downloads model + CLIP weights | Normal; subsequent runs are instant |
-| Many false positives | YOLO-World scores food-shaped non-food | Raise `confidence_threshold:=0.2` or remove ambiguous vocab terms |
-| `'Pose2D' object has no attribute 'x'` | vision_msgs 4.x changed `BoundingBox2D.center` to nest x/y inside `.position` | Use `det.bbox.center.position.x/.y` (already fixed in this node) |
-
-## ROS 2 Topics and Services
-
-| Name | Type | Description |
-|------|------|-------------|
-| `/joint_states` | `sensor_msgs/JointState` | Current joint angles (20 Hz) |
-| `/camera/image_raw` | `sensor_msgs/Image` | Camera feed from Pi |
-| `/camera/camera_info` | `sensor_msgs/CameraInfo` | Camera metadata |
-| `/perception/food_detections/image` | `sensor_msgs/Image` | YOLO-annotated frame (RViz2-friendly) |
-| `/perception/food_detections` | `vision_msgs/Detection2DArray` | Structured bbox + class + score per food item |
-| `/gripper/set_state` | `std_srvs/SetBool` | Open (`false`) / close (`true`) gripper (scripts/CLI) |
-| `arm_controller/follow_joint_trajectory` | Action (`FollowJointTrajectory`) | MoveIt2 arm trajectory execution |
-| `gripper_controller/gripper_cmd` | Action (`GripperCommand`) | MoveIt2 gripper open/close (binary thresholded) |
-
-## Node Parameters
-
-### mycobot_hardware_node
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `robot_ip` | `192.168.1.46` | Pi IP address |
-| `robot_port` | `9000` | pymycobot TCP port |
-| `publish_rate` | `20.0` | Joint state publish rate (Hz) |
-| `default_speed` | `80` | Arm movement speed (0-100) |
-| `gripper_speed` | `80` | Gripper open/close speed (0-100) |
-| `gripper_open_value` | `100` | pymycobot value sent for "open". Defaults match this 280 Pi's firmware (inverted from the official docs). |
-| `gripper_closed_value` | `0` | pymycobot value sent for "closed". Swap with `gripper_open_value` if your gripper is docs-compliant. |
-
-### camera_node
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `camera_url` | `http://192.168.1.46:8080/?action=stream` | MJPEG stream URL |
-| `frame_rate` | `30.0` | Capture rate (Hz) |
-| `frame_id` | `camera_link` | TF frame for camera images |
-
-### food_detector_node
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `image_topic` | `/camera/image_raw` | Input image topic |
-| `model_path` | `yolo11n.pt` | Ultralytics model. Auto-switches to `yolov8s-worldv2.pt` when `vocabulary` is non-empty. |
-| `confidence_threshold` | `0.1` (launch) / `0.4` (node) | Min score to keep a detection. Lower default in launch is tuned for YOLO-World. |
-| `vocabulary` | (kitchen list, see launch file) | Open-vocab class names for YOLO-World. `[]` = COCO mode. |
-| `food_class_ids` | COCO food IDs (46–55) | COCO class IDs to keep when in COCO mode. `[]` = keep all. Ignored in open-vocab mode. |
-| `show_window` | `true` | Show CV2 preview window |
-| `device` | `cpu` | `cpu`, `0`, `cuda:0`, etc. |
-
-## Future: Isaac Sim Integration
-
-The URDF and ROS 2 topic structure are designed for direct integration with
-NVIDIA Isaac Sim via the ROS 2 bridge for RL/IL workflows.
+**The gripper has been removed** from the URDF, SRDF, controllers, and driver.
+Those four must stay consistent: a controller or SRDF referencing a joint the
+URDF does not define stops `move_group` from starting.

@@ -356,7 +356,16 @@ class VisualServoNode(Node):
     def _point_cb(self, msg: PointStamped) -> None:
         if not self._ever_received_point:
             self.get_logger().info(
-                f'First target sighting on {self._point_topic} -- tracking is live.')
+                f'First target sighting on {self._point_topic}.')
+            # This only means the tracker sees a hand -- it fires regardless
+            # of the servo state machine, so on its own it does not mean the
+            # arm will move. Say so explicitly rather than leaving IDLE users
+            # staring at a hand-detected log wondering why nothing happens.
+            if self._state == IDLE:
+                self.get_logger().info(
+                    'Servo is IDLE, so this sighting will not move the arm. '
+                    'Start it with: '
+                    'ros2 service call /servo/search std_srvs/srv/Trigger')
             self._ever_received_point = True
         self._last_point = (msg.point.x, msg.point.y)
         # z carries palm width in pixels, not a depth. See hand_tracker_node.

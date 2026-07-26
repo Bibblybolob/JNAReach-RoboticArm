@@ -108,7 +108,7 @@ def measure_joint_speed(mc, start, sweep_deg, speed, settle=3.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ip', default='192.168.1.46')
+    ap.add_argument('--ip', default='192.168.0.15')
     ap.add_argument('--port', type=int, default=9000)
     ap.add_argument('--sweep', type=float, default=40.0,
                     help='degrees to sweep joint1 (default 40)')

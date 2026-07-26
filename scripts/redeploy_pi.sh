@@ -27,7 +27,7 @@ set -euo pipefail
 
 PI_IP="${1:--e}"
 PI_USER="${MYCOBOT_PI_USER:-er}"
-PI_DIR="${MYCOBOT_PI_DIR:-~/Documents/robotics_club/mycobot_setup}"
+PI_DIR="${MYCOBOT_PI_DIR:-~/JON/mycobot_project/pi}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "Target: ${PI_USER}@${PI_IP}:${PI_DIR}"

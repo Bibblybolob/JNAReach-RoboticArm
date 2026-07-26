@@ -1,0 +1,22 @@
+# Gripper removed for the elevator-button task. The gripper_controller entry
+# and its GripperCommand action are gone; keep this in sync with the SRDF
+# (no gripper group) and the URDF (show_gripper:=false). A controller listing
+# a joint that no longer exists in the model makes move_group fail to start.
+moveit_manage_controllers: true
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - arm_controller
+
+  arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6

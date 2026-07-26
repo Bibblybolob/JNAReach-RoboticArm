@@ -1,0 +1,52 @@
+# Joint limits for myCobot 280 Pi.
+#
+# THESE NUMBERS DIRECTLY CONTROL MOTION SMOOTHNESS. ompl_planning.yaml runs
+# AddTimeOptimalParameterization, which uses the values below to decide how
+# long each trajectory should take. The driver streams commands paced to that
+# schedule, so if these limits claim the arm is faster than it really is,
+# MoveIt hands us a schedule the hardware cannot track: the arm falls behind,
+# the streamer keeps aiming further ahead, and the motion degrades back into a
+# sprint toward the endpoint.
+#
+# The previous values (3.14 rad/s = 180 deg/s, 5.0 rad/s^2) were inherited as
+# "conservative estimates" but are optimistic for this hobby-grade arm, which
+# is part of why motion looked rushed and steppy.
+#
+# The values below are a deliberately cautious starting point, NOT measured
+# truth. Tune them empirically:
+#   1. Command a large single-joint move and time it.
+#   2. max_velocity ~= (travelled radians) / (elapsed seconds), minus ~20%.
+#   3. Raise until motion is as quick as you want while still tracking well.
+# If the arm consistently *beats* the planned duration, these are too low and
+# you are leaving speed on the table.
+joint_limits:
+  joint1:
+    has_velocity_limits: true
+    max_velocity: 5.0
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+  joint2:
+    has_velocity_limits: true
+    max_velocity: 5.0
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+  joint3:
+    has_velocity_limits: true
+    max_velocity: 5.0
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+  joint4:
+    has_velocity_limits: true
+    max_velocity: 5.0
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+  joint5:
+    has_velocity_limits: true
+    max_velocity: 5.0
+    has_acceleration_limits: true
+    max_acceleration: 2.0
+  joint6:
+    has_velocity_limits: true
+    max_velocity: 5.0
+    has_acceleration_limits: true
+    max_acceleration: 2.0

@@ -268,7 +268,17 @@ class MyCobotHardwareNode(Node):
             time.sleep(0.5)
             # Prove the link works rather than trusting that constructing the
             # socket succeeded; a dead server can still accept a connection.
-            angles = mc.get_angles()
+            # The very first command on a fresh socket commonly comes back -1
+            # even on a healthy arm: server.py accepts the TCP connection
+            # before its serial link to the arm's controller has necessarily
+            # synced, so a few retries here save the 5s wait for the next
+            # reconnect timer tick on what is usually just a cold-start blip.
+            angles = None
+            for attempt in range(5):
+                angles = mc.get_angles()
+                if isinstance(angles, list) and len(angles) == 6:
+                    break
+                time.sleep(0.3)
             if not isinstance(angles, list) or len(angles) != 6:
                 raise RuntimeError(
                     f'connected but get_angles() returned {angles!r}')

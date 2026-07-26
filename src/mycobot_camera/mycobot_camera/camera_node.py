@@ -25,10 +25,13 @@ class CameraNode(Node):
         self.declare_parameter('camera_url', 'http://192.168.1.46:8080/?action=stream')
         self.declare_parameter('frame_rate', 30.0)
         self.declare_parameter('frame_id', 'camera_link')
+        self.declare_parameter('stream_read_timeout', 15.0)
 
         self._url = self.get_parameter('camera_url').get_parameter_value().string_value
         rate = self.get_parameter('frame_rate').get_parameter_value().double_value
         self._frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        self._read_timeout = self.get_parameter(
+            'stream_read_timeout').get_parameter_value().double_value
 
         self._bridge = CvBridge()
         self._image_pub = self.create_publisher(Image, 'camera/image_raw', 10)
@@ -51,7 +54,16 @@ class CameraNode(Node):
         multipart HTTP stream and decodes frames as they arrive."""
         while not self._stop_event.is_set():
             try:
-                resp = requests.get(self._url, stream=True, timeout=5)
+                # (connect timeout, read timeout). A single number here would
+                # apply to both, and requests treats it as a per-read stall
+                # detector on a streaming response, not a total-request
+                # deadline: a plain `nc -zv` to the port succeeds instantly
+                # because it only checks the TCP handshake, but a brief gap
+                # between MJPEG frames (Wi-Fi jitter, the Pi's stream loop
+                # getting descheduled) is enough to trip a short read timeout
+                # and force a reconnect even though the stream is healthy.
+                resp = requests.get(
+                    self._url, stream=True, timeout=(5, self._read_timeout))
                 self.get_logger().info('Camera stream connected')
                 buf = b''
                 for chunk in resp.iter_content(chunk_size=4096):

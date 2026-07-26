@@ -28,6 +28,12 @@ def generate_launch_description():
         default_value=f'http://{DEFAULT_ROBOT_IP}:8080/?action=stream',
         description='MJPEG stream URL from camera_stream.py on the Pi',
     )
+    stream_read_timeout_arg = DeclareLaunchArgument(
+        'stream_read_timeout', default_value='15.0',
+        description='Seconds without a new MJPEG frame before reconnecting; '
+                    'raise this if the stream reconnects during brief Wi-Fi '
+                    'or server stalls that would otherwise recover on their own',
+    )
 
     camera_node = Node(
         package='mycobot_camera',
@@ -37,11 +43,13 @@ def generate_launch_description():
             'camera_url': LaunchConfiguration('camera_url'),
             'frame_rate': 30.0,
             'frame_id': 'camera_link',
+            'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
         }],
         output='screen',
     )
 
     return LaunchDescription([
         camera_url_arg,
+        stream_read_timeout_arg,
         camera_node,
     ])

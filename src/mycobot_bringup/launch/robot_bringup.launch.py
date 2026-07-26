@@ -37,6 +37,12 @@ def generate_launch_description():
     camera_port_arg = DeclareLaunchArgument(
         'camera_port', default_value='8080',
     )
+    stream_read_timeout_arg = DeclareLaunchArgument(
+        'stream_read_timeout', default_value='15.0',
+        description='Seconds without a new MJPEG frame before reconnecting; '
+                    'raise this if the stream reconnects during brief Wi-Fi '
+                    'or server stalls that would otherwise recover on their own',
+    )
     robot_ip = LaunchConfiguration('robot_ip')
     robot_port = LaunchConfiguration('robot_port')
     camera_port = LaunchConfiguration('camera_port')
@@ -94,6 +100,7 @@ def generate_launch_description():
                 "' + '/?action=stream'",
             ]),
             'frame_rate': 30.0,
+            'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
         }],
         output='screen',
     )
@@ -102,6 +109,7 @@ def generate_launch_description():
         robot_ip_arg,
         robot_port_arg,
         camera_port_arg,
+        stream_read_timeout_arg,
         robot_state_publisher,
         hardware_node,
         camera_node,

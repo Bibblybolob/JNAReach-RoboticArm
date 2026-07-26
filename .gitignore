@@ -28,3 +28,9 @@ Thumbs.db
 
 # Cursor
 .cursor/
+
+# SSH keypair used to reach the VM — must never be committed
+bob
+bob.pub
+*.pem
+id_rsa*

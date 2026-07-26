@@ -12,10 +12,15 @@
     </inertial>
   </xacro:macro>
 
-  <!-- Set to true when the robot is physically mounted upside-down -->
-  <xacro:arg name="flipped" default="true"/>
-  <!-- Set to false to hide the gripper mesh for debugging -->
-  <xacro:arg name="show_gripper" default="true"/>
+  <!-- Set to true when the robot is physically mounted upside-down.
+       Now false: the arm is mounted base-down and faces up. -->
+  <xacro:arg name="flipped" default="false"/>
+  <!-- Gripper removed for the elevator-button task (no grasping required).
+       This gates both the gripper links and the gripper joints, so
+       gripper_finger_joint disappears from the model entirely — the driver
+       must not publish it either. camera_flange/camera_link are deliberately
+       outside these blocks and remain available for the camera mount. -->
+  <xacro:arg name="show_gripper" default="false"/>
 
   <!-- ==================== Links ==================== -->
 

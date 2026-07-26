@@ -3,7 +3,7 @@ Bring up the myCobot 280 Pi driver and camera nodes.
 
 Launches:
   - robot_state_publisher (publishes URDF TF tree)
-  - mycobot_hardware_node (arm joint states + trajectory action + gripper service)
+  - mycobot_hardware_node (arm joint states + trajectory action + homing service)
   - camera_node (MJPEG stream -> sensor_msgs/Image)
 
 Usage:
@@ -31,18 +31,9 @@ def generate_launch_description():
     camera_port_arg = DeclareLaunchArgument(
         'camera_port', default_value='8080',
     )
-    gripper_open_arg = DeclareLaunchArgument(
-        'gripper_open_value', default_value='100',
-    )
-    gripper_closed_arg = DeclareLaunchArgument(
-        'gripper_closed_value', default_value='0',
-    )
-
     robot_ip = LaunchConfiguration('robot_ip')
     robot_port = LaunchConfiguration('robot_port')
     camera_port = LaunchConfiguration('camera_port')
-    gripper_open_value = LaunchConfiguration('gripper_open_value')
-    gripper_closed_value = LaunchConfiguration('gripper_closed_value')
 
     description_dir = get_package_share_directory('mycobot_description')
     xacro_file = os.path.join(description_dir, 'urdf', 'mycobot_280pi.urdf.xacro')
@@ -65,11 +56,17 @@ def generate_launch_description():
         parameters=[{
             'robot_ip': robot_ip,
             'robot_port': robot_port,
-            'publish_rate': 20.0,
+            # See mycobot_hardware_node.py for why this is 10 and not 20:
+            # the Pi's TCP server is single-client and blocks ~100ms per
+            # read, so fast polling starves the motion commands.
+            'publish_rate': 10.0,
+            'publish_rate_during_motion': 2.0,
             'default_speed': 80,
-            'gripper_speed': 80,
-            'gripper_open_value': gripper_open_value,
-            'gripper_closed_value': gripper_closed_value,
+            'command_interval': 0.06,
+            'lookahead': 0.12,
+            'trajectory_speed': 60,
+            'home_angles_deg': [0.0, 90.0, -90.0, -90.0, 0.0, 0.0],
+            'home_speed': 30,
         }],
         output='screen',
     )
@@ -93,8 +90,6 @@ def generate_launch_description():
         robot_ip_arg,
         robot_port_arg,
         camera_port_arg,
-        gripper_open_arg,
-        gripper_closed_arg,
         robot_state_publisher,
         hardware_node,
         camera_node,

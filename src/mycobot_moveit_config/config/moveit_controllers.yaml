@@ -1,9 +1,13 @@
+# Gripper removed for the elevator-button task. The gripper_controller entry
+# and its GripperCommand action are gone; keep this in sync with the SRDF
+# (no gripper group) and the URDF (show_gripper:=false). A controller listing
+# a joint that no longer exists in the model makes move_group fail to start.
+moveit_manage_controllers: true
 moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
 
 moveit_simple_controller_manager:
   controller_names:
     - arm_controller
-    - gripper_controller
 
   arm_controller:
     type: FollowJointTrajectory
@@ -16,13 +20,3 @@ moveit_simple_controller_manager:
       - joint4
       - joint5
       - joint6
-
-  # GripperCommand controller. moveit_simple_controller_manager builds the
-  # full action name as "<controller_name>/<action_ns>", so this matches
-  # the action server in mycobot_hardware_node at /gripper_controller/gripper_cmd.
-  gripper_controller:
-    type: GripperCommand
-    action_ns: gripper_cmd
-    default: true
-    joints:
-      - gripper_finger_joint

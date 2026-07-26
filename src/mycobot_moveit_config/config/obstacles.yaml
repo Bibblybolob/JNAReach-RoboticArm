@@ -1,29 +1,32 @@
 # Planning scene obstacles for myCobot 280 Pi.
 #
-# The robot is mounted upside-down at the world origin (0,0,0).
-# In the world frame, Z points up and the arm hangs downward (-Z).
-# The myCobot 280 Pi has ~280mm (0.28m) reach.
+# The robot is mounted base-down at the world origin (0,0,0) and faces up
+# (+Z). The myCobot 280 Pi has ~280mm (0.28m) reach.
 #
-# Edit dimensions/positions to match your physical setup, then restart
-# the MoveIt2 launch to reload.
+# ALL OBSTACLES REMOVED. The previous table/shelf/wall definitions were
+# disabled because their positions did not match their own comments (the
+# "25cm behind the robot" shelf sat at y=-0.04, i.e. 4cm, which intersects
+# the robot's own base and makes MoveIt refuse to plan anything).
+#
+# The scene is intentionally empty: self-collision checking still applies via
+# the SRDF, but NOTHING in the physical environment is modelled. The planner
+# will happily drive the arm through the button panel, its mount, cabling, or
+# anything else actually present. Add real, measured geometry before running
+# near hardware you care about.
+#
+# To add one back, append an entry under `obstacles:` in this form and restart
+# the MoveIt2 launch to reload:
+#
+#   obstacles:
+#     - name: button_panel
+#       type: box
+#       dimensions: [0.20, 0.02, 0.30]   # [x, y, z] size in metres
+#       position: [0.0, 0.25, 0.10]      # centre, in the world frame
+#       orientation: [0.0, 0.0, 0.0]     # [roll, pitch, yaw] in radians
+#
+# scene_objects.py handles an empty list gracefully — it logs
+# "No obstacles to publish" and does nothing.
 
 frame_id: world
 
-obstacles:
-  - name: table
-    type: box
-    dimensions: [1.0, 1.0, 0.02]    # [x, y, z] size in meters
-    position: [0.0, 0.0, -0.415]     # surface ~45cm below mount point
-    orientation: [0.0, 0.0, 0.0]    # [roll, pitch, yaw] in radians
-
-  - name: shelf
-    type: box
-    dimensions: [0.02, 1.0, 0.02]
-    position: [0.0, -0.04, 0.04]     # 25cm behind the robot
-    orientation: [0.0, 0.0, 1.5708]
-
-  - name: wall
-    type: box
-    dimensions: [0.02, 1.0, 0.5]
-    position: [0.0, 0.1, -0.22]     # 25cm behind the robot
-    orientation: [0.0, 0.0, 1.5708]
+obstacles: []

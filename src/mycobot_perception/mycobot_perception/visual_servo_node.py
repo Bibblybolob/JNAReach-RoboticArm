@@ -82,7 +82,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 
 from control_msgs.msg import JointJog
 from geometry_msgs.msg import PointStamped
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo
 from std_srvs.srv import SetBool, Trigger
 
 
@@ -99,7 +99,13 @@ class VisualServoNode(Node):
         super().__init__('visual_servo_node')
 
         self.declare_parameter('point_topic', '/hand/point_px')
-        self.declare_parameter('image_topic', '/camera/image_raw')
+        # CameraInfo, not the image stream. All this node needs from the
+        # camera is the frame size, and it only needs it once -- subscribing
+        # to /camera/image_raw for that meant deserialising a ~900KB bgr8
+        # frame every cycle, forever, to read two integers it already had.
+        # On a host whose stalls were dropping the arm connection, that was
+        # megabytes per second of pure waste.
+        self.declare_parameter('camera_info_topic', '/camera/camera_info')
         self.declare_parameter('jog_topic', '/arm/jog')
 
         # Joints used to steer the view. joint1 swings the arm horizontally;
@@ -256,14 +262,14 @@ class VisualServoNode(Node):
         cb = ReentrantCallbackGroup()
 
         self._point_topic = self.get_parameter('point_topic').value
-        self._image_topic_name = self.get_parameter('image_topic').value
+        self._info_topic_name = self.get_parameter('camera_info_topic').value
 
         self._point_sub = self.create_subscription(
             PointStamped, self._point_topic,
             self._point_cb, 1, callback_group=cb)
-        self._image_sub = self.create_subscription(
-            Image, self._image_topic_name,
-            self._image_cb, 1, callback_group=cb)
+        self._info_sub = self.create_subscription(
+            CameraInfo, self._info_topic_name,
+            self._camera_info_cb, 10, callback_group=cb)
         self._jog_pub = self.create_publisher(
             JointJog, self.get_parameter('jog_topic').value, 1)
 
@@ -355,8 +361,8 @@ class VisualServoNode(Node):
 
     # ---- Inputs ----
 
-    def _image_cb(self, msg: Image) -> None:
-        if self._width is None:
+    def _camera_info_cb(self, msg: CameraInfo) -> None:
+        if self._width is None and msg.width > 0 and msg.height > 0:
             self._width, self._height = msg.width, msg.height
             self.get_logger().info(f'Frame size: {msg.width}x{msg.height}')
 
@@ -500,13 +506,13 @@ class VisualServoNode(Node):
             return False, 'already probing'
 
         if self._width is None:
-            n = self.count_publishers(self._image_topic_name)
+            n = self.count_publishers(self._info_topic_name)
             return False, (
-                f'no image received on {self._image_topic_name} '
-                f'({n} publisher(s) detected). '
+                f'no frame size yet -- nothing usable on '
+                f'{self._info_topic_name} ({n} publisher(s) detected). '
                 + ('Is camera_node running?' if n == 0 else
-                   'A publisher exists but no frames arrived -- check '
-                   f'`ros2 topic hz {self._image_topic_name}`.')
+                   'A publisher exists but no CameraInfo arrived -- check '
+                   f'`ros2 topic hz {self._info_topic_name}`.')
             )
 
         # Give the tracker a moment before giving up. Enabling the servo the

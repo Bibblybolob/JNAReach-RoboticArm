@@ -15,6 +15,7 @@ import numpy as np
 import requests
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 
@@ -34,7 +35,21 @@ class CameraNode(Node):
             'stream_read_timeout').get_parameter_value().double_value
 
         self._bridge = CvBridge()
-        self._image_pub = self.create_publisher(Image, 'camera/image_raw', 10)
+        # Sensor-data QoS for the image stream: latest frame wins. The default
+        # RELIABLE/depth-10 profile is wrong for video -- it makes DDS queue
+        # and retransmit frames that are already obsolete by the time they
+        # arrive, which on a loaded host adds latency and memory churn for
+        # data nobody wants. Every consumer (hand_tracker, food_detector)
+        # already requests BEST_EFFORT, so this also stops the publisher doing
+        # reliability bookkeeping no subscriber asked for.
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self._image_pub = self.create_publisher(Image, 'camera/image_raw', sensor_qos)
+        # CameraInfo stays RELIABLE: it is tiny, and consumers need to receive
+        # it once rather than catch it in flight.
         self._info_pub = self.create_publisher(CameraInfo, 'camera/camera_info', 10)
 
         self._width = None

@@ -123,6 +123,20 @@ class MyCobotHardwareNode(Node):
         # the dominant source of visible jerk. Set false to go back to a fixed
         # jog_speed.
         self.declare_parameter('adaptive_jog_speed', True)
+        # Seconds of no jogging before the jog base is resynced from a hardware
+        # read. Jogs chain off the *commanded* pose so they compound; a
+        # measurement taken while the arm is still travelling to the last
+        # target is behind it, and adopting that as the new base throws the
+        # accumulated lead away. Do that a few times a second and the arm
+        # creeps instead of sweeping -- the servo believes it commanded 60deg
+        # of search travel while the joint moves ~9deg. Only resync once
+        # jogging has actually stopped and the arm has settled.
+        self.declare_parameter('jog_resync_after', 0.5)
+        # ...but never let the commanded pose run away from reality. If the
+        # arm is blocked or saturated it will not reach the target, and
+        # without this the base would keep advancing past where the arm can
+        # physically go. Beyond this divergence, trust the hardware.
+        self.declare_parameter('jog_max_divergence_deg', 10.0)
         # Per-joint travel in degrees, used to clamp jog targets. Defaults
         # match the URDF limits for the myCobot 280 Pi. Holding a servo against
         # its hard stop damages it, so this clamp is about the hardware, not
@@ -189,6 +203,10 @@ class MyCobotHardwareNode(Node):
         self._jog_speed = self.get_parameter('jog_speed').get_parameter_value().integer_value
         self._adaptive_jog_speed = self.get_parameter(
             'adaptive_jog_speed').get_parameter_value().bool_value
+        self._jog_resync_after = self.get_parameter(
+            'jog_resync_after').get_parameter_value().double_value
+        self._jog_max_divergence = self.get_parameter(
+            'jog_max_divergence_deg').get_parameter_value().double_value
         flat = list(
             self.get_parameter('joint_limits_deg').get_parameter_value().double_array_value
         )
@@ -475,7 +493,31 @@ class MyCobotHardwareNode(Node):
 
         # Cache for jogging, which needs a starting point to apply a delta to
         # without paying its own blocking read on every command.
-        self._last_angles_rad = angles
+        #
+        # Do NOT adopt this reading as the jog base while jogs are actively
+        # flowing. send_angles is a move, not a teleport, so a read taken
+        # mid-travel sits behind the commanded target, and taking it as the
+        # new base silently discards however far the arm still had to go.
+        # Resync only once jogging has stopped, or if the commanded pose has
+        # drifted implausibly far from where the arm actually is (blocked
+        # joint, saturated servo) -- at which point reality wins.
+        if self._last_angles_rad is None:
+            self._last_angles_rad = angles
+        else:
+            quiet = (time.monotonic() - self._last_jog_time
+                     >= self._jog_resync_after)
+            divergence = max(
+                abs(math.degrees(c - m))
+                for c, m in zip(self._last_angles_rad, angles)
+            )
+            if quiet or divergence > self._jog_max_divergence:
+                if not quiet:
+                    self.get_logger().warn(
+                        f'Jog target has diverged {divergence:.1f}deg from the '
+                        'measured pose -- the arm is not keeping up. '
+                        'Resyncing to hardware.',
+                        throttle_duration_sec=3.0)
+                self._last_angles_rad = angles
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()

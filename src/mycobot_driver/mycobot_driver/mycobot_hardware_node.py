@@ -115,6 +115,14 @@ class MyCobotHardwareNode(Node):
         # spurious detection should nudge the arm, not fling it.
         self.declare_parameter('max_jog_deg', 3.0)
         self.declare_parameter('jog_speed', 40)
+        # Size each jog's speed to the size of that jog, exactly as trajectory
+        # streaming does. A fixed speed is wrong here for the same reason it is
+        # wrong there: send_angles is point-to-point, so commanding speed 40 to
+        # a target 0.5deg away makes the arm sprint the gap, stop, and wait for
+        # the next command ~60ms later. At servo rates that micro stop-start is
+        # the dominant source of visible jerk. Set false to go back to a fixed
+        # jog_speed.
+        self.declare_parameter('adaptive_jog_speed', True)
         # Per-joint travel in degrees, used to clamp jog targets. Defaults
         # match the URDF limits for the myCobot 280 Pi. Holding a servo against
         # its hard stop damages it, so this clamp is about the hardware, not
@@ -179,6 +187,8 @@ class MyCobotHardwareNode(Node):
 
         self._max_jog_deg = self.get_parameter('max_jog_deg').get_parameter_value().double_value
         self._jog_speed = self.get_parameter('jog_speed').get_parameter_value().integer_value
+        self._adaptive_jog_speed = self.get_parameter(
+            'adaptive_jog_speed').get_parameter_value().bool_value
         flat = list(
             self.get_parameter('joint_limits_deg').get_parameter_value().double_array_value
         )
@@ -539,6 +549,8 @@ class MyCobotHardwareNode(Node):
         # until the arm itself finally refuses it.
         for i, (lo, hi) in enumerate(self._joint_limits_deg):
             target_deg[i] = max(lo, min(hi, target_deg[i]))
+        # Where the arm is starting from, for sizing this jog's speed below.
+        from_deg = list(target_deg)
 
         names = list(msg.joint_names)
         deltas = list(msg.displacements)
@@ -571,9 +583,14 @@ class MyCobotHardwareNode(Node):
                 throttle_duration_sec=2.0)
             return
 
+        speed = self._step_speed(
+            from_deg, target_deg, self._cmd_interval,
+            enabled=self._adaptive_jog_speed, fallback=self._jog_speed,
+        )
+
         try:
             with self._lock:
-                self._mc.send_angles(target_deg, self._jog_speed)
+                self._mc.send_angles(target_deg, speed)
             self._last_tx_time = time.monotonic()
             self.get_logger().info(
                 f'jog -> {[round(d, 1) for d in target_deg]}',
@@ -677,7 +694,7 @@ class MyCobotHardwareNode(Node):
                 return [q0 + a * (q1 - q0) for q0, q1 in zip(p0, p1)]
         return list(last.positions)
 
-    def _step_speed(self, from_deg, to_deg, dt):
+    def _step_speed(self, from_deg, to_deg, dt, enabled=None, fallback=None):
         """Pick a send_angles speed (0..100) that covers this step in ~dt.
 
         send_angles is point-to-point: it drives to the target at the given
@@ -685,9 +702,14 @@ class MyCobotHardwareNode(Node):
         interval away, so a fixed speed makes the arm sprint the tiny gap and
         wait — micro stop-start that reads as jerk. Sizing speed to the step
         keeps it moving continuously into the next command.
+
+        `enabled`/`fallback` let jogging reuse this with its own toggle and
+        default speed; omitted, they take the trajectory settings.
         """
-        if not self._adaptive_speed or dt <= 0.0:
-            return self._traj_speed
+        enabled = self._adaptive_speed if enabled is None else enabled
+        fallback = self._traj_speed if fallback is None else fallback
+        if not enabled or dt <= 0.0:
+            return fallback
         max_delta = max(abs(a - b) for a, b in zip(from_deg, to_deg))
         if max_delta <= 0.0:
             return self._min_speed

@@ -78,6 +78,12 @@ def generate_launch_description():
     deadband_arg = DeclareLaunchArgument(
         'deadband', default_value='0.015',
         description='Image error below which the arm holds still')
+    model_complexity_arg = DeclareLaunchArgument(
+        'model_complexity', default_value='0',
+        description='MediaPipe hand model: 0 is ~2x faster than 1. On a '
+                    'CPU-bound host fresher detections smooth the servo loop '
+                    'more than extra landmark precision does. Use 1 if you '
+                    'have GPU inference')
     show_window_arg = DeclareLaunchArgument(
         'show_window', default_value='false',
         description='Open an OpenCV window from the tracker (needs a display)')
@@ -121,6 +127,7 @@ def generate_launch_description():
             # what stalls the stack and drops both links, so this is off unless
             # you are actually looking at the window.
             'publish_annotated': LaunchConfiguration('show_window'),
+            'model_complexity': LaunchConfiguration('model_complexity'),
         }],
         output='screen',
         respawn=True,
@@ -155,6 +162,7 @@ def generate_launch_description():
         ki_arg,
         kd_arg,
         deadband_arg,
+        model_complexity_arg,
         show_window_arg,
         lost_timeout_arg,
         target_size_arg,

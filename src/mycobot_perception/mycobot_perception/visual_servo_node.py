@@ -234,6 +234,13 @@ class VisualServoNode(Node):
 
         self._last_point: tuple[float, float] | None = None
         self._last_point_time = 0.0
+        # Timestamp of the measurement the control loop last acted on. The
+        # loop runs faster than detections arrive, so without this it re-uses
+        # the same reading for several iterations -- integrating the identical
+        # error each time, which inflates the integral term and unloads as a
+        # lurch when the arm finally moves. Acting once per measurement keeps
+        # the integral honest.
+        self._acted_point_time = 0.0
         # Distinguishes "the tracker has never said anything" (wrong topic, node
         # not running, MediaPipe not detecting) from "the hand is momentarily
         # out of frame". These need completely different fixes, and reporting
@@ -615,6 +622,9 @@ class VisualServoNode(Node):
         self._integral[:] = 0.0
         self._prev_error = None
         self._prev_time = None
+        # Let the next measurement through immediately rather than waiting for
+        # one newer than whatever we last acted on before the reset.
+        self._acted_point_time = 0.0
 
     def _search_sweep(self) -> None:
         """Pan the base joint back and forth looking for a hand.
@@ -719,6 +729,14 @@ class VisualServoNode(Node):
             self._reset_pid()
             return
         ex, ey = err
+
+        # Only act once per measurement. The timer runs at `rate` (15Hz) but
+        # detections arrive slower, so without this the same reading would be
+        # integrated repeatedly. Holding the previous command until new data
+        # arrives is both smoother and more correct than acting on a duplicate.
+        if self._last_point_time <= self._acted_point_time:
+            return
+        self._acted_point_time = self._last_point_time
 
         if math.hypot(ex, ey) < self._deadband:
             # Being centred is success, not a fault -- but it looks identical

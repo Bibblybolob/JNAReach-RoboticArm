@@ -101,10 +101,11 @@ def generate_launch_description():
                 "' + ':'", " + '", camera_port,
                 "' + '/?action=stream'",
             ]),
-            # The Pi's camera_stream.py unit serves --fps 10, so republishing
-            # at 30Hz just re-sends each frame ~3x and burns host CPU that the
-            # stack cannot spare. Keep this at or just above the Pi's rate.
-            'frame_rate': 12.0,
+            # Keep this at or just above the Pi's capture rate (--fps in
+            # pi/mjpg_streamer.service, currently 15). It was 30 against a
+            # 10fps source, which just re-sent each frame ~3x and burned host
+            # CPU the stack cannot spare. Raise both together, not one.
+            'frame_rate': 16.0,
             'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
         }],
         output='screen',

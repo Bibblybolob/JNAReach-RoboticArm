@@ -103,6 +103,13 @@ class HandTrackerNode(Node):
         # servo loop makes the arm buzz. 0 = no smoothing, 0.9 = very heavy.
         self.declare_parameter('smoothing', 0.6)
         self.declare_parameter('publish_annotated', True)
+        # MediaPipe landmark model: 0 is roughly twice as fast as 1 for a
+        # modest accuracy cost. On a CPU-bound host the servo loop is starved
+        # of fresh detections long before it is limited by landmark precision,
+        # so 0 usually produces *smoother* tracking despite being the "worse"
+        # model -- fresher data beats more accurate stale data in a control
+        # loop. Raise to 1 if you have GPU inference or a fast host.
+        self.declare_parameter('model_complexity', 1)
 
         self._image_topic = self.get_parameter('image_topic').value
         self._info_topic = self.get_parameter('camera_info_topic').value
@@ -116,6 +123,7 @@ class HandTrackerNode(Node):
         self._hands = mp.solutions.hands.Hands(
             static_image_mode=False,
             max_num_hands=int(self.get_parameter('max_num_hands').value),
+            model_complexity=int(self.get_parameter('model_complexity').value),
             min_detection_confidence=float(
                 self.get_parameter('min_detection_confidence').value),
             min_tracking_confidence=float(

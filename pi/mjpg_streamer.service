@@ -12,7 +12,7 @@ User=er
 # --fps 10 keeps the previous frame rate. camera_stream.py now defaults to 30,
 # so this is explicit rather than implied -- redeploying should not silently
 # change the rate. Raise it here if you want the faster stream.
-ExecStart=/usr/bin/python3 /home/er/JON/mycobot_project/pi/camera_stream.py --port 8080 --device 0 --width 640 --height 480 --fps 10
+ExecStart=/usr/bin/python3 /home/er/JON/mycobot_project/pi/camera_stream.py --port 8080 --device 0 --width 640 --height 480 --fps 15
 Restart=always
 RestartSec=5
 

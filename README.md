@@ -172,6 +172,14 @@ then gives you a menu:
 
 The arm stays **idle at home** until you press `1`.
 
+> **The Pi runs its own copy of the code.** `pi/server.py` and
+> `pi/camera_stream.py` live on the robot, not in the workspace, so editing
+> them here changes nothing until `./scripts/redeploy_pi.sh` pushes them
+> across. Several arm-side fixes — the client idle timeout most of all — exist
+> only in that copy, which makes it possible to "fix" a disconnect, rebuild,
+> and see no change whatsoever. `run.py` now checksums those files against the
+> robot at startup and offers to redeploy if they differ.
+
 Checking the ports up front turns two confusing ROS-level symptoms —
 `Waiting for /arm/jog_enable` and a servo node that never sees a frame — into
 one clear message naming the service that is down.

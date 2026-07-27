@@ -97,6 +97,83 @@ def camera_ok(host, timeout=3.0):
         return False
 
 
+PI_FILES = ['server.py', 'camera_stream.py',
+            'mycobot_server.service', 'mjpg_streamer.service']
+
+
+def pi_files_stale():
+    """Which pi/ files on the robot differ from this repo.
+
+    The Pi runs its own copy of server.py and camera_stream.py, pushed there
+    by scripts/redeploy_pi.sh. Editing them here does nothing until they are
+    deployed -- and because the arm-side fixes (the client idle timeout, for
+    one) live entirely in that copy, it is entirely possible to "fix" a
+    disconnect, rebuild the workspace, and change nothing at all about the
+    robot's behaviour.
+
+    Returns a list of stale filenames, [] if in sync, or None if it could not
+    be determined (no ssh key, different layout).
+    """
+    import hashlib
+    user = os.environ.get('MYCOBOT_PI_USER', 'er')
+    pidir = os.environ.get('MYCOBOT_PI_DIR', '~/JON/mycobot_project/pi')
+
+    local = {}
+    for f in PI_FILES:
+        p = os.path.join(REPO, 'pi', f)
+        if os.path.isfile(p):
+            with open(p, 'rb') as fh:
+                local[f] = hashlib.md5(fh.read()).hexdigest()
+    if not local:
+        return None
+
+    remote_paths = ' '.join(f'{pidir}/{f}' for f in local)
+    r = subprocess.run(
+        ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
+         f'{user}@{IP}', f'md5sum {remote_paths} 2>/dev/null'],
+        capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+
+    remote = {}
+    for line in r.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            remote[os.path.basename(parts[1])] = parts[0]
+    return sorted(f for f, h in local.items() if remote.get(f) != h)
+
+
+def check_pi_in_sync():
+    stale = pi_files_stale()
+    if stale is None:
+        print(f'{DIM}    (could not verify the Pi is running current code){OFF}')
+        return
+    if not stale:
+        say('Pi files in sync.')
+        return
+
+    print(f'\n{RED}{"=" * 66}{OFF}')
+    print(f'{RED}  The robot is running OUTDATED code.{OFF}')
+    print(f'  These differ from this repo: {BOLD}{", ".join(stale)}{OFF}')
+    print(f'  Changes to pi/ do nothing until they are pushed to the robot.')
+    print(f'{RED}{"=" * 66}{OFF}\n')
+    try:
+        ans = input('Redeploy to the Pi now? [Y/n] ').strip().lower()
+    except EOFError:
+        ans = 'n'
+    if ans in ('', 'y', 'yes'):
+        rc = subprocess.run(
+            [os.path.join(REPO, 'scripts', 'redeploy_pi.sh'), IP],
+            cwd=REPO).returncode
+        if rc != 0:
+            warn('Redeploy failed; continuing with the old Pi code.')
+        else:
+            say('Redeployed.')
+            time.sleep(2)
+    else:
+        warn('Continuing with outdated Pi code.')
+
+
 def preflight():
     """Prove the Pi is serving both ports before launching.
 
@@ -110,6 +187,8 @@ def preflight():
                       stderr=subprocess.DEVNULL).returncode != 0:
         die(f'Cannot ping {IP}. Is the Pi powered and on the network? '
             'Set MYCOBOT_IP if the address changed.')
+
+    check_pi_in_sync()
 
     say('Waiting for camera on :8080 ...')
     for i in range(30):

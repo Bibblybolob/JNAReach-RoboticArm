@@ -87,6 +87,19 @@ def port_open(host, port, timeout=2.0):
         return False
 
 
+def ping_ok(host, count=3, wait=3):
+    """Best-effort reachability hint.
+
+    Deliberately more than one packet: on a cold ARP cache -- which is exactly
+    the state after power-cycling the Pi -- the first ICMP is routinely
+    dropped while resolution happens, so `ping -c1` reports a healthy host as
+    unreachable. This is only a hint either way; the port checks decide.
+    """
+    return subprocess.run(
+        ['ping', '-c', str(count), '-W', str(wait), host],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
 def camera_ok(host, timeout=3.0):
     try:
         import urllib.request
@@ -182,11 +195,15 @@ def preflight():
     ROS-level symptoms for one plain infrastructure problem.
     """
     say(f'Checking Pi at {IP} ...')
-    if subprocess.run(['ping', '-c1', '-W2', IP],
-                      stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL).returncode != 0:
-        die(f'Cannot ping {IP}. Is the Pi powered and on the network? '
-            'Set MYCOBOT_IP if the address changed.')
+    if ping_ok(IP):
+        say('Pi reachable.')
+    else:
+        # Never fatal. ICMP is not what this stack needs -- the two ports are
+        # -- and plenty of things make ping lie: a cold ARP cache, a firewall
+        # dropping ICMP, a switch still learning. Failing here would refuse to
+        # launch against a Pi that is serving both ports perfectly well.
+        warn(f'No ping response from {IP}. Continuing anyway -- the port '
+             'checks below are what actually matter.')
 
     check_pi_in_sync()
 
@@ -196,8 +213,12 @@ def preflight():
             say('Camera OK')
             break
         if i == 29:
-            die(f"Camera never came up. Check: ssh {IP} "
-                "'systemctl status mjpg_streamer'")
+            die(f'Camera never came up on {IP}:8080.\n'
+                f'  If ping also failed, the Pi is off or on another address '
+                f'(set MYCOBOT_IP).\n'
+                f"  If ping worked, the service is down: "
+                f"ssh {os.environ.get('MYCOBOT_PI_USER', 'er')}@{IP} "
+                f"'systemctl status mjpg_streamer'")
         time.sleep(1)
 
     say('Waiting for arm TCP on :9000 ...')
@@ -206,8 +227,12 @@ def preflight():
             say('Arm port OK')
             break
         if i == 29:
-            die(f"Arm never came up. Check: ssh {IP} "
-                "'systemctl status mycobot_server'")
+            die(f'Arm never came up on {IP}:9000.\n'
+                f"  ssh {os.environ.get('MYCOBOT_PI_USER', 'er')}@{IP} "
+                f"'systemctl status mycobot_server'\n"
+                '  Note server.py accepts ONE client -- a leftover '
+                'measure_arm.py or a second driver holds the slot and this '
+                'check will keep failing until it exits.')
         time.sleep(1)
     # Let server.py finish closing the probe before the driver claims the slot.
     time.sleep(1)
@@ -402,12 +427,12 @@ class Panel(Node):
 
     def health(self):
         print(f'\n{BOLD}Pi health ({IP}){OFF}')
-        ok = subprocess.run(['ping', '-c1', '-W2', IP],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL).returncode == 0
-        print(f'  {"ping".ljust(20)}{GREEN + "ok" + OFF if ok else RED + "FAILED" + OFF}')
-        if not ok:
-            print(); return
+        ok = ping_ok(IP, count=2)
+        # Report but never stop here -- ping failing while both ports answer
+        # is a normal outcome (ICMP filtered, cold ARP), and the ports are the
+        # part that matters.
+        print(f'  {"ping".ljust(20)}'
+              f'{GREEN + "ok" + OFF if ok else YELLOW + "no reply" + OFF}')
         c = camera_ok(IP)
         print(f'  {"camera :8080".ljust(20)}{GREEN + "ok" + OFF if c else RED + "FAILED" + OFF}')
         a = port_open(IP, 9000)

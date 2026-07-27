@@ -124,6 +124,7 @@ fi
 
 # ---- Go --------------------------------------------------------------------
 say "Launching (MYCOBOT_IP=$IP)"
-[ "$AUTO_SEARCH" = "1" ] || say "Start hunting with: ros2 service call /servo/search std_srvs/srv/Trigger"
+[ "$AUTO_SEARCH" = "1" ] || \
+    say "In another terminal: python3 scripts/control_panel.py  (menu: search, home, stop, status)"
 export MYCOBOT_IP="$IP"
 exec ros2 launch mycobot_bringup servo_demo.launch.py "${LAUNCH_ARGS[@]}"

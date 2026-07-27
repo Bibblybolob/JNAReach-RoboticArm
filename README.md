@@ -172,6 +172,26 @@ arm themselves, but **the arm stays idle at home** until you ask it to hunt.
 In a second terminal:
 
 ```bash
+python3 scripts/control_panel.py
+```
+
+A menu for everything you do while the stack is running — search, home, stop,
+plus status and diagnostics:
+
+```
+  1) Search for a hand      2) Home the arm       3) Stop servoing
+  4) Resume servoing        5/6) Jogging ON/OFF
+  7) Status                 8) Pipeline rates     9) Health check
+```
+
+`7` shows which nodes are up and the live joint angles. `8` samples the camera
+and detection rates — the gap between them tells you whether MediaPipe is your
+bottleneck, and since the servo loop acts once per detection, the detection
+rate *is* your control rate. `9` checks the Pi and both ports.
+
+The equivalent raw call, if you prefer:
+
+```bash
 ros2 service call /servo/search std_srvs/srv/Trigger
 ```
 

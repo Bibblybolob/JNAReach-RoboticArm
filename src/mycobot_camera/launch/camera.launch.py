@@ -5,7 +5,7 @@ Connects to the Pi's MJPEG HTTP stream and publishes ROS 2 Image messages.
 
 Usage:
   ros2 launch mycobot_camera camera.launch.py
-  ros2 launch mycobot_camera camera.launch.py camera_url:=http://192.168.1.46:8080/?action=stream
+  ros2 launch mycobot_camera camera.launch.py camera_url:=http://192.168.0.15:8080/?action=stream
 """
 
 import os

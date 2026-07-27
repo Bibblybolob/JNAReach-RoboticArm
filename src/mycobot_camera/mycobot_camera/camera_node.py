@@ -8,6 +8,7 @@ on port 8080. This node manually parses the multipart MJPEG HTTP stream
 rather than relying on cv2.VideoCapture, which is unreliable across
 different OpenCV/GStreamer builds for this kind of stream.
 """
+import os
 import threading
 
 import cv2
@@ -23,10 +24,16 @@ from cv_bridge import CvBridge
 class CameraNode(Node):
     def __init__(self):
         super().__init__('camera_node')
-        self.declare_parameter('camera_url', 'http://192.168.1.46:8080/?action=stream')
+        # Built from MYCOBOT_IP like everything else, so `ros2 run` on this
+        # node alone reaches the same robot the launch files do rather than a
+        # stale literal. A hostname works here too -- see the README note on
+        # mDNS, since the Pi's DHCP address moves.
+        _default_host = os.environ.get('MYCOBOT_IP', '192.168.0.15')
+        self.declare_parameter(
+            'camera_url', f'http://{_default_host}:8080/?action=stream')
         self.declare_parameter('frame_rate', 30.0)
         self.declare_parameter('frame_id', 'camera_link')
-        self.declare_parameter('stream_read_timeout', 15.0)
+        self.declare_parameter('stream_read_timeout', 30.0)
 
         self._url = self.get_parameter('camera_url').get_parameter_value().string_value
         rate = self.get_parameter('frame_rate').get_parameter_value().double_value

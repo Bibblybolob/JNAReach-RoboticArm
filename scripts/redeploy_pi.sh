@@ -20,7 +20,7 @@
 #
 # Usage:
 #   ./scripts/redeploy_pi.sh                 # uses $MYCOBOT_IP or the default
-#   ./scripts/redeploy_pi.sh 192.168.1.46
+#   ./scripts/redeploy_pi.sh 192.168.0.15
 #   MYCOBOT_PI_USER=pi ./scripts/redeploy_pi.sh
 
 set -euo pipefail

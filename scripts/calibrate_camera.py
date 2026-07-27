@@ -16,7 +16,7 @@ WHAT YOU NEED
 
 USAGE
   Live from the Pi stream (the same source camera_node reads):
-      python3 scripts/calibrate_camera.py --stream http://192.168.1.46:8080/?action=stream
+      python3 scripts/calibrate_camera.py --stream http://192.168.0.15:8080/?action=stream
 
   From a local USB webcam:
       python3 scripts/calibrate_camera.py --device 0

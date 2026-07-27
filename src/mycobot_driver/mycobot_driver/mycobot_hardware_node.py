@@ -16,6 +16,7 @@ carries everything.
 """
 
 import math
+import os
 import time
 import threading
 
@@ -40,7 +41,12 @@ class MyCobotHardwareNode(Node):
     def __init__(self):
         super().__init__('mycobot_hardware_node')
 
-        self.declare_parameter('robot_ip', '192.168.1.46')
+        # Same MYCOBOT_IP convention the launch files use, so running this
+        # node directly with `ros2 run` picks up the same address instead of
+        # a stale literal. Accepts a hostname as readily as an IP -- see the
+        # note on mDNS in the README, since the Pi's DHCP address moves.
+        self.declare_parameter(
+            'robot_ip', os.environ.get('MYCOBOT_IP', '192.168.0.15'))
         self.declare_parameter('robot_port', 9000)
         # NOTE ON LINK BUDGET: Server.py on the Pi accepts a single client and
         # blocks up to 100ms (its read() wait_time) on any command in its

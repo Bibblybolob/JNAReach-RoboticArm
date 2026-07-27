@@ -30,7 +30,7 @@ The first time it finds a hand it runs a one-time orientation probe, twitching
 a few joints to learn how the camera is mounted -- hold your hand still for it.
 
 Useful arguments:
-    robot_ip:=192.168.1.46         Pi address
+    robot_ip:=192.168.0.15         Pi address
     gain:=1.5                      lower if the arm oscillates
     ki:=0.6                        lower if it overshoots and hunts
     lost_timeout:=30.0             longer grace before homing

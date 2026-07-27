@@ -292,6 +292,24 @@ client that died without closing blocked it forever. Redeploy, then check
 nothing else holds the socket — a leftover `measure_arm.py` or a second driver
 will lock everything else out.
 
+**The Pi's IP changed and nothing connects.**
+It will, eventually — the Pi takes a DHCP lease, and a router reboot or a
+lease expiry reassigns it. This repo has already chased that address three
+times. Short-term fix is `export MYCOBOT_IP=<new address>`; every launch file,
+script and node default reads it.
+
+Three ways to stop it mattering, best first:
+
+1. **DHCP reservation on the router.** Bind the Pi's MAC to a fixed address.
+   Nothing on the Pi or in this repo changes, and it survives reflashing.
+2. **mDNS.** `MYCOBOT_IP` accepts a hostname, and every consumer of it
+   (`ping`, `ssh`, `socket.create_connection`, the MJPEG URL, pymycobot)
+   resolves names fine. Find the Pi's hostname with
+   `ssh er@<current-ip> hostname`, then `export MYCOBOT_IP=<hostname>.local`
+   and the address can move freely.
+3. **Static IP on the Pi**, or a direct Ethernet link with static addresses on
+   both ends — which sidesteps DHCP entirely and is worth doing anyway.
+
 **A service is dead after a reboot with no error.**
 The units used to start before the network had an address, fail, exhaust
 systemd's start limit, and be abandoned permanently. Fixed in the current

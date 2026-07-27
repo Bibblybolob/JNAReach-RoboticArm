@@ -5,7 +5,7 @@ Measure the two numbers the motion tuning is currently guessing at.
 Run this with the ROS 2 driver STOPPED — Server.py on the Pi accepts one
 client, so this script and the driver cannot both be connected.
 
-    python3 scripts/measure_arm.py --ip 192.168.1.46
+    python3 scripts/measure_arm.py --ip 192.168.0.15
 
 It reports:
 

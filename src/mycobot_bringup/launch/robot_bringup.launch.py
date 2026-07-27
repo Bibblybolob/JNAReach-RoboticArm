@@ -8,7 +8,7 @@ Launches:
 
 Usage:
   ros2 launch mycobot_bringup robot_bringup.launch.py
-  ros2 launch mycobot_bringup robot_bringup.launch.py robot_ip:=192.168.1.46
+  ros2 launch mycobot_bringup robot_bringup.launch.py robot_ip:=192.168.0.15
 """
 
 import os

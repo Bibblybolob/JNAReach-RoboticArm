@@ -170,6 +170,10 @@ class MyCobotHardwareNode(Node):
         # blocking read per command.
         self._last_angles_rad = None
         self._last_jog_time = 0.0
+        # Monotonic time of the last command actually put on the socket. The
+        # keepalive timer uses this to tell "quiet because nothing needs
+        # sending" from "quiet because the link is genuinely unused".
+        self._last_tx_time = 0.0
         # Jogging is off until explicitly enabled via /arm/jog_enable.
         self._jog_enabled = False
 
@@ -246,6 +250,12 @@ class MyCobotHardwareNode(Node):
             5.0, self._retry_connect, callback_group=service_cb_group,
         )
 
+        # Shares service_cb_group (MutuallyExclusive) so it can never re-enter
+        # itself or run concurrently with the reconnect timer.
+        self._keepalive_timer = self.create_timer(
+            2.0, self._keepalive, callback_group=service_cb_group,
+        )
+
         if self._mc is None:
             self.get_logger().warn(
                 'myCobot hardware node ready but NOT CONNECTED. Services and '
@@ -314,6 +324,42 @@ class MyCobotHardwareNode(Node):
         if self._mc is None:
             self._connect()
 
+    def _keepalive(self) -> None:
+        """Keep the TCP link warm so the Pi never sees it as idle.
+
+        server.py closes a client that has said nothing for CLIENT_IDLE_TIMEOUT
+        seconds, which is correct for a dead peer but fires on a merely stalled
+        one too. The joint-state timer normally keeps the link busy, but it
+        backs off hard while jogging is armed (see _publish_joint_states), and
+        the whole process can stall on a loaded host -- so there are real
+        windows where nothing is sent for long enough to be disconnected.
+
+        A cheap periodic read closes those windows. This is belt-and-braces
+        alongside the raised timeout on the server: if the host stalls badly
+        enough, this timer stalls with it and only the server-side change
+        saves the connection.
+        """
+        if self._mc is None or self._in_motion.is_set():
+            return
+        if time.monotonic() - self._last_tx_time < 5.0:
+            return
+
+        # Never block a jog waiting for the link. If the lock is held, the
+        # socket is busy by definition, which is exactly the state this timer
+        # exists to create -- so there is nothing to do.
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._mc.get_angles()
+            self._last_tx_time = time.monotonic()
+        except OSError as e:
+            self._handle_link_error(e, 'keepalive')
+        except Exception as e:
+            self.get_logger().warn(
+                f'keepalive read failed: {e}', throttle_duration_sec=10.0)
+        finally:
+            self._lock.release()
+
     def _angles_within_limits(self, angles_deg) -> bool:
         """Reject an angle reading that is not physically plausible.
 
@@ -363,6 +409,7 @@ class MyCobotHardwareNode(Node):
         try:
             with self._lock:
                 angles_deg = self._mc.get_angles()
+            self._last_tx_time = time.monotonic()
             if not isinstance(angles_deg, list) or len(angles_deg) != 6:
                 return None
             if not self._angles_within_limits(angles_deg):
@@ -527,6 +574,7 @@ class MyCobotHardwareNode(Node):
         try:
             with self._lock:
                 self._mc.send_angles(target_deg, self._jog_speed)
+            self._last_tx_time = time.monotonic()
             self.get_logger().info(
                 f'jog -> {[round(d, 1) for d in target_deg]}',
                 throttle_duration_sec=2.0)
@@ -729,6 +777,7 @@ class MyCobotHardwareNode(Node):
                 try:
                     with self._lock:
                         self._mc.send_angles(target_deg, speed)
+                    self._last_tx_time = time.monotonic()
                 except OSError as e:
                     # A dropped command on an otherwise-live link is
                     # recoverable: the next one is only command_interval away

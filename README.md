@@ -156,8 +156,16 @@ actually happened during development.
 ### Finger following (one command)
 
 ```bash
-ros2 launch mycobot_bringup servo_demo.launch.py
+./run.sh
 ```
+
+Sources the workspace (building it first if needed), checks the Pi is actually
+serving both ports, then launches. Doing the port checks up front turns two
+confusing ROS-level symptoms — `Waiting for /arm/jog_enable` and a servo node
+that never sees a frame — into one clear message naming the service that is
+down.
+
+Extra arguments pass straight through, e.g. `./run.sh gain:=1.5`.
 
 Starts the driver, camera, hand tracker and servo node. Jogging and servoing
 arm themselves, but **the arm stays idle at home** until you ask it to hunt.
@@ -166,6 +174,15 @@ In a second terminal:
 ```bash
 ros2 service call /servo/search std_srvs/srv/Trigger
 ```
+
+Or let the launcher do it for you once the nodes are up:
+
+```bash
+./run.sh --search
+```
+
+The raw `ros2 launch mycobot_bringup servo_demo.launch.py` still works if you
+have already sourced the workspace and know the Pi is up.
 
 It sweeps until it sees a hand, twitches a few joints to learn how the camera
 is mounted (**hold your hand still for this**), then centres and closes in.
@@ -274,6 +291,22 @@ grep -rn "192.168" ~/mycobot_project/install/*/lib/python3*/site-packages/*/came
 **"Waiting for /arm/jog_enable (is the driver running?)"**
 The driver could not reach the arm. It now stays up and retries every 5s
 instead of dying, and prints the address it failed on.
+
+**Repeated "Lost connection to the arm ... Broken pipe" and camera read
+timeouts.**
+The link is not flaky — the host is stalling. `server.py` drops a client that
+has been silent too long (to stop a dead client locking out the single-client
+server forever), and a loaded desktop VM freezes every ROS node for tens of
+seconds at a time, which looks identical to a dead client from the Pi's side.
+The tell is that *both* the driver and the servo node go completely silent for
+the same window, despite independent timers that log every 2–3s.
+
+Mitigated on three fronts: the server's idle timeout is now 120s with TCP
+keepalive tuned to reap a genuinely dead peer in ~60s, the driver sends a
+keepalive read every 5s so the link rarely goes idle, and the camera's read
+timeout is 30s. If it still happens, fix the stall rather than the timeouts —
+run `free -h` and `vmstat 1` while the stack is up, and if it is swapping give
+the VM more RAM (≥4 GB) and ≥2 vCPUs.
 
 **Servo enabled but the arm does not move.**
 Both consoles now say why — the driver names the reason a jog was rejected, and

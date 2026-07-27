@@ -60,6 +60,11 @@ def generate_launch_description():
     robot_ip_arg = DeclareLaunchArgument('robot_ip', default_value=DEFAULT_ROBOT_IP)
     robot_port_arg = DeclareLaunchArgument('robot_port', default_value='9000')
     camera_port_arg = DeclareLaunchArgument('camera_port', default_value='8080')
+    stream_read_timeout_arg = DeclareLaunchArgument(
+        'stream_read_timeout', default_value='30.0',
+        description='Seconds without a new MJPEG frame before reconnecting. '
+                    'Generous on purpose: a loaded host can stall for tens of '
+                    'seconds, and reconnecting mid-stall makes it worse')
     gain_arg = DeclareLaunchArgument(
         'gain', default_value='3.0',
         description='Servo proportional gain; halve it if the arm oscillates')
@@ -101,6 +106,7 @@ def generate_launch_description():
             'robot_ip': LaunchConfiguration('robot_ip'),
             'robot_port': LaunchConfiguration('robot_port'),
             'camera_port': LaunchConfiguration('camera_port'),
+            'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
         }.items(),
     )
 
@@ -110,8 +116,15 @@ def generate_launch_description():
         name='hand_tracker_node',
         parameters=[{
             'show_window': LaunchConfiguration('show_window'),
+            # Encoding and publishing an annotated frame costs real CPU per
+            # frame, and nothing subscribes to it in this launch. Host load is
+            # what stalls the stack and drops both links, so this is off unless
+            # you are actually looking at the window.
+            'publish_annotated': LaunchConfiguration('show_window'),
         }],
         output='screen',
+        respawn=True,
+        respawn_delay=3.0,
     )
 
     servo = Node(
@@ -129,12 +142,15 @@ def generate_launch_description():
             'search_on_start': LaunchConfiguration('search_on_start'),
         }],
         output='screen',
+        respawn=True,
+        respawn_delay=3.0,
     )
 
     return LaunchDescription([
         robot_ip_arg,
         robot_port_arg,
         camera_port_arg,
+        stream_read_timeout_arg,
         gain_arg,
         ki_arg,
         kd_arg,

@@ -41,10 +41,18 @@ SERIAL_BAUD = 1000000
 # recv() forever and never returns to accept(), so nothing can ever connect
 # again. The arm appears dead and only a service restart clears it.
 #
-# Any real client talks constantly (the ROS driver polls joint states several
-# times a second), so prolonged total silence means the peer is gone. This is
-# generous enough never to drop a working client.
-CLIENT_IDLE_TIMEOUT = 20.0
+# DO NOT lower this back to 20s. The assumption that "a real client talks
+# constantly, so silence means it is gone" is wrong when the client is a
+# desktop VM: a host stall (memory pressure, CPU oversubscription, software
+# GL) freezes every ROS node for tens of seconds at a time while the peer is
+# perfectly alive. At 20s that produced a hard disconnect on every stall --
+# observed as BrokenPipeError on the driver at 20.4s, 20.4s, 20.9s and 21.2s
+# after its last write -- which broke jogging and forced a reconnect cycle.
+#
+# The anti-lockout property is preserved by TCP keepalive below, which reaps a
+# genuinely dead peer in ~60s regardless of this value. This timeout is now
+# just a generous backstop.
+CLIENT_IDLE_TIMEOUT = 120.0
 
 has_return = [
     0x01, 0x02, 0x03, 0x04, 0x09, 0x12, 0x14, 0x15, 0x17, 0x1B,
@@ -115,8 +123,19 @@ class MycobotServer:
                 conn.settimeout(CLIENT_IDLE_TIMEOUT)
                 # Detect half-open connections (peer powered off or dropped off
                 # the network) rather than waiting for the idle timeout.
+                #
+                # SO_KEEPALIVE alone is nearly useless here: Linux defaults to
+                # probing only after 7200s of idle, so it never fires in any
+                # session anyone actually runs. Tuning the three knobs makes it
+                # do the job the 20s idle timeout used to be (badly) covering:
+                # start probing after 30s quiet, retry every 10s, give up after
+                # 3 failures -- so a dead peer is dropped in ~60s, while a peer
+                # that is merely stalled keeps its connection.
                 try:
                     conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
                 except Exception:
                     pass
 

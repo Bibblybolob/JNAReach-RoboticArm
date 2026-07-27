@@ -38,7 +38,7 @@ def generate_launch_description():
         'camera_port', default_value='8080',
     )
     stream_read_timeout_arg = DeclareLaunchArgument(
-        'stream_read_timeout', default_value='15.0',
+        'stream_read_timeout', default_value='30.0',
         description='Seconds without a new MJPEG frame before reconnecting; '
                     'raise this if the stream reconnects during brief Wi-Fi '
                     'or server stalls that would otherwise recover on their own',
@@ -87,6 +87,8 @@ def generate_launch_description():
             'home_speed': 30,
         }],
         output='screen',
+        respawn=True,
+        respawn_delay=3.0,
     )
 
     camera_node = Node(
@@ -99,10 +101,15 @@ def generate_launch_description():
                 "' + ':'", " + '", camera_port,
                 "' + '/?action=stream'",
             ]),
-            'frame_rate': 30.0,
+            # The Pi's camera_stream.py unit serves --fps 10, so republishing
+            # at 30Hz just re-sends each frame ~3x and burns host CPU that the
+            # stack cannot spare. Keep this at or just above the Pi's rate.
+            'frame_rate': 12.0,
             'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
         }],
         output='screen',
+        respawn=True,
+        respawn_delay=3.0,
     )
 
     return LaunchDescription([

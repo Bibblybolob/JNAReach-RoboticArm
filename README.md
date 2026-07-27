@@ -156,53 +156,42 @@ actually happened during development.
 ### Finger following (one command)
 
 ```bash
-./run.sh
+./run.py
 ```
 
-Sources the workspace (building it first if needed), checks the Pi is actually
-serving both ports, then launches. Doing the port checks up front turns two
-confusing ROS-level symptoms — `Waiting for /arm/jog_enable` and a servo node
-that never sees a frame — into one clear message naming the service that is
-down.
-
-Extra arguments pass straight through, e.g. `./run.sh gain:=1.5`.
-
-Starts the driver, camera, hand tracker and servo node. Jogging and servoing
-arm themselves, but **the arm stays idle at home** until you ask it to hunt.
-In a second terminal:
-
-```bash
-python3 scripts/control_panel.py
-```
-
-A menu for everything you do while the stack is running — search, home, stop,
-plus status and diagnostics:
+That is the whole thing. It checks the Pi is actually serving both ports,
+launches the stack (output to `/tmp/mycobot_stack.log`), waits for the nodes,
+then gives you a menu:
 
 ```
   1) Search for a hand      2) Home the arm       3) Stop servoing
   4) Resume servoing        5/6) Jogging ON/OFF
   7) Status                 8) Pipeline rates     9) Health check
+  l) Live log               q) Quit (shuts the stack down)
 ```
 
-`7` shows which nodes are up and the live joint angles. `8` samples the camera
-and detection rates — the gap between them tells you whether MediaPipe is your
-bottleneck, and since the servo loop acts once per detection, the detection
-rate *is* your control rate. `9` checks the Pi and both ports.
+The arm stays **idle at home** until you press `1`.
 
-The equivalent raw call, if you prefer:
+Checking the ports up front turns two confusing ROS-level symptoms —
+`Waiting for /arm/jog_enable` and a servo node that never sees a frame — into
+one clear message naming the service that is down.
+
+`7` shows which nodes are up and live joint angles. `8` samples the camera and
+detection rates; the gap tells you whether MediaPipe is the bottleneck, and
+since the servo loop acts once per detection, the detection rate *is* your
+control rate. `l` tails the launch output, so you keep the diagnostics without
+them drowning the menu. `q` shuts the stack down cleanly, so nothing is left
+holding the arm's single client slot.
+
+Extra arguments pass through, e.g. `./run.py gain:=1.5`. If a stack is already
+running it attaches to it rather than starting a second one.
+
+The raw equivalents still work if you prefer them:
 
 ```bash
+ros2 launch mycobot_bringup servo_demo.launch.py
 ros2 service call /servo/search std_srvs/srv/Trigger
 ```
-
-Or let the launcher do it for you once the nodes are up:
-
-```bash
-./run.sh --search
-```
-
-The raw `ros2 launch mycobot_bringup servo_demo.launch.py` still works if you
-have already sourced the workspace and know the Pi is up.
 
 It sweeps until it sees a hand, twitches a few joints to learn how the camera
 is mounted (**hold your hand still for this**), then centres and closes in.

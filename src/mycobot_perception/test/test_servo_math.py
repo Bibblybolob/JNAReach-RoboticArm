@@ -69,7 +69,7 @@ for _name in WANTED:
 
 
 def make(h=1.0, v=1.0, lag=0.15, max_comp=0.8, samples=25,
-         lead=0.15, vel_smoothing=0.0, max_speed=3.0):
+         lead=0.15, vel_smoothing=0.0, max_speed=3.0, sat_limit=8):
     s = _Servo()
     s._command_lag = lag
     s._max_comp = max_comp
@@ -80,8 +80,11 @@ def make(h=1.0, v=1.0, lag=0.15, max_comp=0.8, samples=25,
     s._lead_time = lead
     s._vel_smoothing = vel_smoothing
     s._max_target_speed = max_speed
+    s._vel_sat_limit = sat_limit
     s._vel = np.zeros(2)
     s._vel_prev = None
+    s._vel_saturated = 0
+    s._vel_untrusted = False
     s._sent = []
     s._corr = np.zeros(2)
     s._pmag = np.zeros(2)
@@ -277,6 +280,86 @@ def test_leading_a_moving_hand_aims_ahead_of_it():
     err = np.array([0.1, 0.0]) + v * s._lead_time
     assert err[0] > 0.1
     assert np.isclose(err[0], 0.1 + 0.4 * 0.2)
+
+
+# --- A joint that is commanded but does not move -----------------------------
+#
+# Observed on hardware: joint1 was not turning, the driver pinned its target,
+# and _update_velocity booked the predicted-but-absent image motion as the
+# TARGET moving at the clamp speed -- in the direction that makes the error
+# look bigger. The lead then drove harder, which sustained the saturation.
+# A stuck axis became a runaway. These pin the way out of that.
+
+def _stuck_joint(s, n, dt=0.0667, jog=5.0):
+    """Feed n detections where jogs are commanded and nothing moves."""
+    t = 100.0
+    still = np.array([0.4, 0.4])
+    s._update_velocity(t, still)
+    for _ in range(n):
+        s._record_sent(t - s._command_lag + 1e-6, jog, jog)
+        t += dt
+        s._update_velocity(t, still)
+    return s._vel
+
+
+def test_unexecuted_jogs_are_seen_as_target_motion():
+    """The mechanism, pinned so the fix is not mistaken for the bug."""
+    s = make(sat_limit=10_000)          # guard off, mechanism visible
+    v = _stuck_joint(s, 3)
+    # Predicted image motion that never arrived, booked as the hand moving
+    # the other way -- and fast.
+    assert np.linalg.norm(v) > 1.0
+    assert v[0] < 0 and v[1] < 0
+
+
+def test_a_stuck_joint_stops_the_lead_rather_than_amplifying_it():
+    LOGS.clear()
+    s = make(sat_limit=8)
+    v = _stuck_joint(s, 20)
+    assert s._vel_untrusted
+    assert np.allclose(v, np.zeros(2))
+    assert any('not reaching the arm' in m for m in LOGS)
+
+
+def test_one_saturated_sample_does_not_disable_the_lead():
+    """A glitch is not an indictment; only a run of them is."""
+    s = make(sat_limit=8)
+    s._update_velocity(10.0, np.array([0.0, 0.0]))
+    s._update_velocity(10.01, np.array([1.0, 1.0]))   # saturates
+    assert not s._vel_untrusted
+    v = s._update_velocity(10.14, np.array([1.01, 1.01]))
+    assert not s._vel_untrusted
+    assert s._vel_saturated == 0
+    assert np.linalg.norm(v) < 3.0
+
+
+def test_the_lead_is_restored_once_the_estimate_is_sane_again():
+    LOGS.clear()
+    s = make(sat_limit=8)
+    _stuck_joint(s, 20)
+    assert s._vel_untrusted
+    # Arm starts moving again: predicted motion now actually shows up.
+    t, pos = 200.0, np.array([0.4, 0.4])
+    s._update_velocity(t, pos)
+    for _ in range(3):
+        t += 0.0667
+        pos = pos + np.array([0.01, 0.01])
+        s._update_velocity(t, pos)
+    assert not s._vel_untrusted
+    assert any('plausible again' in m for m in LOGS)
+
+
+def test_a_genuinely_fast_hand_still_gets_led():
+    """The guard must not punish a hand that really is moving quickly."""
+    s = make(sat_limit=8, vel_smoothing=0.6)
+    t, pos = 100.0, np.array([0.0, 0.0])
+    s._update_velocity(t, pos)
+    for _ in range(20):
+        t += 0.0667
+        pos = pos + np.array([0.08, 0.0])   # ~1.2/s, under the 3.0 ceiling
+        v = s._update_velocity(t, pos)
+    assert not s._vel_untrusted
+    assert v[0] > 0.8
 
 
 # --- auto_sign --------------------------------------------------------------

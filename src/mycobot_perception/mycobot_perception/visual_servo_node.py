@@ -347,6 +347,31 @@ class VisualServoNode(Node):
         # produces one enormous difference; without a clamp that becomes one
         # enormous lead and the arm lunges.
         self.declare_parameter('max_target_speed', 3.0)
+        # Ceiling on the lead itself, in half-frames. max_target_speed alone is
+        # not enough protection: at 3.0 and lead_time 0.15 a saturated estimate
+        # still adds 0.45, which is most of the way to the frame edge and
+        # swamps the real error.
+        self.declare_parameter('max_lead', 0.25)
+        # How many consecutive saturated velocity estimates before the lead is
+        # abandoned as unreliable.
+        #
+        # A real hand cannot travel at max_target_speed for seconds on end, so
+        # a pinned estimate does not mean "fast hand", it means the own-motion
+        # subtraction in _update_velocity is wrong -- and the usual reason is
+        # that the jogs it is subtracting never actually executed. A joint held
+        # by a limit, blocked, or simply not keeping up produces exactly that:
+        # the node predicts image motion, none arrives, and the difference is
+        # booked as the target moving at enormous speed in the direction that
+        # makes the error look bigger. The lead then drives harder, which
+        # sustains the saturation. That feedback ran on real hardware with a
+        # joint1 that was not turning, and it turned a stuck axis into a
+        # runaway.
+        #
+        # So treat sustained saturation as a broken model rather than a fast
+        # target: drop the lead and say why. Tracking degrades to plain
+        # proportional, which is the correct behaviour when the thing the lead
+        # depends on cannot be trusted.
+        self.declare_parameter('velocity_saturation_limit', 8)
         # Ignore errors smaller than this (normalised). MediaPipe jitter and
         # hand tremor are both a few pixels; without a deadband the arm hunts
         # continuously and buzzes. 0.04 of a half-frame is a hand sitting
@@ -499,6 +524,9 @@ class VisualServoNode(Node):
             self.get_parameter('velocity_smoothing').value)
         self._max_target_speed = float(
             self.get_parameter('max_target_speed').value)
+        self._max_lead = float(self.get_parameter('max_lead').value)
+        self._vel_sat_limit = int(
+            self.get_parameter('velocity_saturation_limit').value)
         self._auto_sign = bool(self.get_parameter('auto_sign').value)
         self._auto_sign_samples = int(
             self.get_parameter('auto_sign_samples').value)
@@ -536,6 +564,11 @@ class VisualServoNode(Node):
         # restarts from nothing every few seconds is worse than none.
         self._vel = np.zeros(2, dtype=float)
         self._vel_prev: tuple[float, np.ndarray] | None = None
+        # Consecutive velocity estimates that came out pinned at
+        # max_target_speed, and whether the lead has been given up on as a
+        # result. See velocity_saturation_limit.
+        self._vel_saturated = 0
+        self._vel_untrusted = False
 
         # Rolling pipeline statistics, so "it lags" stops being a guess.
         self._lat_sum = 0.0
@@ -1305,6 +1338,37 @@ class VisualServoNode(Node):
         speed = float(np.linalg.norm(raw))
         if speed > self._max_target_speed:
             raw = raw * (self._max_target_speed / speed)
+            self._vel_saturated += 1
+        else:
+            # One clamped sample is a glitch and means nothing; it is only a
+            # RUN of them that indicts the model. So the counter resets on the
+            # first sane reading rather than decaying.
+            self._vel_saturated = 0
+            if self._vel_untrusted:
+                self._vel_untrusted = False
+                self.get_logger().info(
+                    'Hand speed estimate is plausible again -- leading the '
+                    'target once more.')
+
+        if (not self._vel_untrusted
+                and self._vel_saturated >= self._vel_sat_limit):
+            # Nothing physical moves this fast this long. The own-motion
+            # subtraction above must be crediting jogs that never executed,
+            # which is what a blocked or unresponsive joint looks like from
+            # here. Leading on that estimate amplifies the error and sustains
+            # the saturation, so stop.
+            self._vel_untrusted = True
+            self.get_logger().warn(
+                f'Hand speed has read at the {self._max_target_speed:.1f}/s '
+                f'ceiling for {self._vel_saturated} detections running. A '
+                'hand does not do that, so the jogs being subtracted here are '
+                'probably not reaching the arm -- check the driver log for a '
+                'joint whose commanded angle stops advancing. Dropping the '
+                'lead term; tracking continues proportional-only.')
+
+        if self._vel_untrusted:
+            self._vel = np.zeros(2, dtype=float)
+            return self._vel
 
         a = self._vel_smoothing
         self._vel = a * self._vel + (1.0 - a) * raw
@@ -1334,6 +1398,8 @@ class VisualServoNode(Node):
         # nothing ever was.
         self._vel = np.zeros(2, dtype=float)
         self._vel_prev = None
+        self._vel_saturated = 0
+        self._vel_untrusted = False
         self._stuck = [0, 0]
         self._best_abs_err = [float('inf'), float('inf')]
         self._prev_abs_err = None
@@ -1601,6 +1667,12 @@ class VisualServoNode(Node):
         # it -- in frame, never centred.
         velocity = self._update_velocity(stamp, measured)
         lead = velocity * self._lead_time
+        # Bounded for the same reason the compensator is: it is a prediction,
+        # and a prediction that can outweigh the measurement it is correcting
+        # stops being a refinement and becomes the input.
+        lead_mag = float(np.linalg.norm(lead))
+        if lead_mag > self._max_lead:
+            lead = lead * (self._max_lead / lead_mag)
         error = error + lead
 
         ce = float(np.linalg.norm(error))

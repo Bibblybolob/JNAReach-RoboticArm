@@ -745,11 +745,33 @@ class MyCobotHardwareNode(Node):
         # lead here means it never gets far enough to need that.
         meas = self._measured_angles_rad
         if meas is not None:
+            pinned = []
             for i, m in enumerate(meas):
                 m_deg = math.degrees(m)
-                target_deg[i] = max(m_deg - self._jog_max_divergence,
-                                    min(m_deg + self._jog_max_divergence,
-                                        target_deg[i]))
+                leashed = max(m_deg - self._jog_max_divergence,
+                              min(m_deg + self._jog_max_divergence,
+                                  target_deg[i]))
+                if abs(leashed - target_deg[i]) > 1e-6:
+                    pinned.append((self.JOINT_NAMES[i], m_deg, target_deg[i]))
+                target_deg[i] = leashed
+            if pinned:
+                # Say this out loud. When the leash binds, the commanded angle
+                # stops advancing no matter what the servo asks for, and from
+                # the servo's side that is indistinguishable from a joint that
+                # steers nothing -- it keeps commanding, the image never
+                # responds, and its lag compensation credits motion that never
+                # happened. Silently clamping here cost a debugging session
+                # spent tuning a control loop whose commands were being
+                # discarded a layer below it.
+                detail = ', '.join(
+                    f'{n} is at {m:.1f} but {t:.1f} was asked for'
+                    for n, m, t in pinned)
+                self.get_logger().warn(
+                    f'Jog target pinned to the measured pose: {detail}. The '
+                    f'arm is more than {self._jog_max_divergence:.0f}deg '
+                    'behind what has been commanded -- it is not keeping up, '
+                    'is blocked, or that joint is not moving at all.',
+                    throttle_duration_sec=2.0)
 
         # Where the arm is starting from, for sizing this jog's speed below.
         from_deg = list(target_deg)

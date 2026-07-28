@@ -113,6 +113,16 @@ frame, which is indistinguishable from a badly mounted camera.
   after a deliberate shutdown.
 - Port 9000 is single-client (`listen(1)`). Probe it by connecting and closing
   at once; anything that holds the slot locks out the driver.
+- **A joint that is commanded but does not move poisons everything above it.**
+  Both the lag compensator and the velocity feedforward subtract jogs they
+  assume executed. When one does not, the servo books the missing image motion
+  as the *target* moving fast, leads harder, and a stuck axis becomes a
+  runaway. The tells, in order of directness: the driver warning `Jog target
+  pinned to the measured pose`, a commanded angle that stops advancing in the
+  driver log (`-> [15.0, ...]` repeating), `vel=` pegged at 3.0/s in the servo
+  log, and `aim=` further from zero than `seen=`. The servo now gives up the
+  lead after 8 saturated readings and says so, but that is damage control —
+  find out why the joint is not turning.
 
 ## Known-unfinished
 

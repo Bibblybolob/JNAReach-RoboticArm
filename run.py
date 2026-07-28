@@ -125,8 +125,8 @@ def pi_files_stale():
     disconnect, rebuild the workspace, and change nothing at all about the
     robot's behaviour.
 
-    Returns a list of stale filenames, [] if in sync, or None if it could not
-    be determined (no ssh key, different layout).
+    Returns a list of stale filenames, [] if in sync, or a string explaining
+    why it could not be determined.
     """
     import hashlib
     user = os.environ.get('MYCOBOT_PI_USER', 'er')
@@ -139,15 +139,26 @@ def pi_files_stale():
             with open(p, 'rb') as fh:
                 local[f] = hashlib.md5(fh.read()).hexdigest()
     if not local:
-        return None
+        return f'no pi/ files found under {REPO}'
 
     remote_paths = ' '.join(f'{pidir}/{f}' for f in local)
+    # BatchMode=yes on purpose: a startup check must never block on a hidden
+    # password prompt. The cost is that it only works with key auth, which is
+    # far and away the usual reason this check comes back unknown.
     r = subprocess.run(
         ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5',
          f'{user}@{IP}', f'md5sum {remote_paths} 2>/dev/null'],
         capture_output=True, text=True)
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
+    if r.returncode != 0:
+        err = (r.stderr or '').lower()
+        if 'permission denied' in err or 'publickey' in err:
+            return f'no key-based ssh to {user}@{IP} (password auth only)'
+        if 'could not resolve' in err or 'connection' in err or 'timed out' in err:
+            return f'could not ssh to {user}@{IP}'
+        return f'ssh to {user}@{IP} failed: {(r.stderr or "").strip()[:120]}'
+    if not r.stdout.strip():
+        return (f'{pidir} not found on the Pi '
+                '(set MYCOBOT_PI_DIR if it lives elsewhere)')
 
     remote = {}
     for line in r.stdout.strip().splitlines():
@@ -159,8 +170,15 @@ def pi_files_stale():
 
 def check_pi_in_sync():
     stale = pi_files_stale()
-    if stale is None:
-        print(f'{DIM}    (could not verify the Pi is running current code){OFF}')
+    if isinstance(stale, str):
+        # Say why, and how to fix it. Left as a bare "could not verify" this
+        # reads as a shrug, and the Pi silently kept running old code for a
+        # whole debugging session because nobody knew the check was blind.
+        warn(f'Cannot check whether the Pi is running current code: {stale}.')
+        print(f'{DIM}    Fix with:  ssh-copy-id '
+              f'{os.environ.get("MYCOBOT_PI_USER", "er")}@{IP}{OFF}')
+        print(f'{DIM}    Until then, deploy pi/ changes yourself:  '
+              f'./scripts/redeploy_pi.sh{OFF}')
         return
     if not stale:
         say('Pi files in sync.')

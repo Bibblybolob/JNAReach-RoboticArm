@@ -31,8 +31,12 @@ trigger. To stop it at any point:
 
     ros2 service call /servo/enable std_srvs/srv/SetBool "{data: false}"
 
-The first time it finds a hand it runs a one-time orientation probe, twitching
-a few joints to learn how the camera is mounted -- hold your hand still for it.
+By default it starts tracking the moment it sees a hand, assuming the camera
+is mounted square on the flange. If the arm drives your hand OUT of frame
+instead of centring it, flip the offending axis with assumed_h_sign:=-1.0 or
+assumed_v_sign:=-1.0. Pass skip_probe:=false to measure the mounting instead,
+which is slower (a few seconds of twitching, hold your hand still) but correct
+for any orientation.
 
 Useful arguments:
     robot_ip:=192.168.0.15         Pi address
@@ -43,6 +47,9 @@ Useful arguments:
     approach_enabled:=false        centre only, do not close in
     search_sweep_seconds:=25.0     slower sweep, more chance to lock on
     search_range_deg:=90.0         narrower sweep (+45 to -45)
+    skip_probe:=false              measure the camera mounting first
+    assumed_h_sign:=-1.0           flip if it drives the hand out sideways
+    assumed_v_sign:=-1.0           flip if it drives the hand out vertically
     search_on_start:=true          start hunting without the trigger
     home_on_start:=false           do not home on startup
     show_window:=true              OpenCV window (needs a display)
@@ -116,6 +123,20 @@ def generate_launch_description():
         'search_range_deg', default_value='180.0',
         description='Total sweep travel, centred where the search began. '
                     'Home leaves joint5 at 0, so 180 swings +90 to -90')
+    skip_probe_arg = DeclareLaunchArgument(
+        'skip_probe', default_value='true',
+        description='Track a hand the moment it is seen, assuming the camera '
+                    'mounting instead of measuring it. false runs the '
+                    'orientation probe first, which is slower but correct for '
+                    'any mounting')
+    h_sign_arg = DeclareLaunchArgument(
+        'assumed_h_sign', default_value='1.0',
+        description='Flip to -1.0 if the arm drives the hand horizontally out '
+                    'of frame instead of centring it')
+    v_sign_arg = DeclareLaunchArgument(
+        'assumed_v_sign', default_value='1.0',
+        description='Flip to -1.0 if the arm drives the hand vertically out '
+                    'of frame instead of centring it')
     search_on_start_arg = DeclareLaunchArgument(
         'search_on_start', default_value='false',
         description='Begin hunting immediately instead of waiting for the '
@@ -170,6 +191,9 @@ def generate_launch_description():
             'search_on_start': LaunchConfiguration('search_on_start'),
             'search_sweep_seconds': LaunchConfiguration('search_sweep_seconds'),
             'search_range_deg': LaunchConfiguration('search_range_deg'),
+            'skip_probe': LaunchConfiguration('skip_probe'),
+            'assumed_h_sign': LaunchConfiguration('assumed_h_sign'),
+            'assumed_v_sign': LaunchConfiguration('assumed_v_sign'),
         }],
         output='screen',
         respawn=True,
@@ -193,6 +217,9 @@ def generate_launch_description():
         approach_enabled_arg,
         sweep_seconds_arg,
         search_range_arg,
+        skip_probe_arg,
+        h_sign_arg,
+        v_sign_arg,
         search_on_start_arg,
         robot,
         hand_tracker,

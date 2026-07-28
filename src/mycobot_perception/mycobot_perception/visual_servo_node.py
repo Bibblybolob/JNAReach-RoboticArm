@@ -156,6 +156,26 @@ class VisualServoNode(Node):
         # be a twitch.
         self.declare_parameter('probe_deg', 4.0)
         self.declare_parameter('probe_settle', 1.2)
+        # Start tracking the instant a hand is seen, instead of spending
+        # several seconds twitching joints to measure the camera mounting.
+        #
+        # The probe exists because a wrong sign drives the target OUT of
+        # frame. Skipping it means trusting the assumption below instead of
+        # measuring, so if the camera is mounted rotated the arm will move
+        # the wrong way -- recoverable, since losing the target homes after
+        # lost_timeout, but it will not track until the signs are right.
+        self.declare_parameter('skip_probe', True)
+        # Degrees of joint motion per unit of normalised image error, used
+        # only when the probe is skipped. This is what the probe would
+        # otherwise measure.
+        self.declare_parameter('assumed_deg_per_error', 8.0)
+        # Flip either of these if the arm drives the hand out of frame along
+        # that axis rather than centring it.
+        self.declare_parameter('assumed_h_sign', 1.0)
+        self.declare_parameter('assumed_v_sign', 1.0)
+        # +1 means extending the approach joint makes the hand look bigger.
+        # 0 disables closing in without disabling centring.
+        self.declare_parameter('assumed_approach_sign', 1.0)
 
         # --- Approach ---
         # Joint driven to close distance. joint3 (elbow) extends and retracts
@@ -218,6 +238,13 @@ class VisualServoNode(Node):
         self._max_step = float(self.get_parameter('max_step_deg').value)
         self._probe_deg = float(self.get_parameter('probe_deg').value)
         self._probe_settle = float(self.get_parameter('probe_settle').value)
+        self._skip_probe = bool(self.get_parameter('skip_probe').value)
+        self._assumed_deg = float(
+            self.get_parameter('assumed_deg_per_error').value)
+        self._assumed_h_sign = float(self.get_parameter('assumed_h_sign').value)
+        self._assumed_v_sign = float(self.get_parameter('assumed_v_sign').value)
+        self._assumed_approach_sign = float(
+            self.get_parameter('assumed_approach_sign').value)
 
         self._approach_joint = self.get_parameter('approach_joint').value
         self._approach_enabled = bool(self.get_parameter('approach_enabled').value)
@@ -334,11 +361,33 @@ class VisualServoNode(Node):
                 'Waiting for /arm/jog_enable (is the driver running?)...',
                 throttle_duration_sec=5.0)
             return
+        # Only report success, and only stop retrying, once the driver has
+        # actually answered. The previous version fired the request, logged
+        # "Armed", and cancelled the retry timer without ever looking at the
+        # result -- so if the driver was busy (homing used to block this
+        # service outright) the gate stayed shut while the log claimed
+        # otherwise, and every later jog was silently discarded. That is why
+        # jogging had to be switched on by hand.
         req = SetBool.Request()
         req.data = True
-        self._jog_enable_cli.call_async(req)
-        self.get_logger().info('Armed the driver jog gate (/arm/jog_enable).')
-        self._arm_timer.cancel()
+        future = self._jog_enable_cli.call_async(req)
+
+        def _armed(fut):
+            try:
+                res = fut.result()
+            except Exception as e:
+                self.get_logger().warn(
+                    f'/arm/jog_enable call failed ({e}); will retry.')
+                return
+            if res is not None and getattr(res, 'success', True):
+                self.get_logger().info(
+                    'Armed the driver jog gate (/arm/jog_enable).')
+                self._arm_timer.cancel()
+            else:
+                self.get_logger().warn(
+                    '/arm/jog_enable refused; will retry.')
+
+        future.add_done_callback(_armed)
 
     # ---- State machine ----
 
@@ -518,6 +567,31 @@ class VisualServoNode(Node):
                 f'joint may not move the camera along its view'
             )
         return (1.0 if change > 0 else -1.0), None
+
+    def _assume_orientation(self) -> None:
+        """Take the camera mounting on trust instead of measuring it.
+
+        Builds the same inverse Jacobian the probe would produce, but
+        diagonal and from parameters: horizontal image error drives the
+        horizontal joint, vertical drives the vertical one. That is correct
+        for a camera mounted square on the flange and wrong by a sign or an
+        axis swap for anything else, which is exactly what the probe exists
+        to discover. Skipping it buys immediate tracking at the cost of
+        that guarantee.
+        """
+        self._jinv = np.array(
+            [[self._assumed_deg * self._assumed_h_sign, 0.0],
+             [0.0, self._assumed_deg * self._assumed_v_sign]], dtype=float)
+        self._approach_sign = (
+            self._assumed_approach_sign if self._approach_enabled else 0.0)
+        self._probed = True
+        self.get_logger().info(
+            f'Tracking immediately without probing: assuming '
+            f'{self._assumed_deg:.0f}deg/error, h sign '
+            f'{self._assumed_h_sign:+.0f}, v sign {self._assumed_v_sign:+.0f}. '
+            'If the arm drives the hand out of frame, flip the matching sign '
+            '(assumed_h_sign / assumed_v_sign), or set skip_probe:=false to '
+            'measure it instead.')
 
     def _probe(self):
         """Measure the image Jacobian by moving each joint and watching.
@@ -739,7 +813,11 @@ class VisualServoNode(Node):
             if not visible:
                 self._search_sweep()
                 return
-            # Found one. Probe first if the camera orientation is still unknown.
+            # Found one. Probe first if the camera orientation is still
+            # unknown -- unless we have been told to take it on trust and
+            # start moving straight away.
+            if not self._probed and self._skip_probe:
+                self._assume_orientation()
             if not self._probed:
                 ok, detail = self._probe()
                 if not ok:

@@ -88,15 +88,17 @@ def generate_launch_description():
         'gain', default_value='4.5',
         description='Servo proportional gain; halve it if the arm oscillates')
     ki_arg = DeclareLaunchArgument(
-        'ki', default_value='1.2',
+        'ki', default_value='2.2',
         description='Integral gain; this is the term that actually centres '
                     'the target. Lower it if the arm overshoots and hunts')
     kd_arg = DeclareLaunchArgument(
         'kd', default_value='0.35',
         description='Derivative gain; damps the approach')
     deadband_arg = DeclareLaunchArgument(
-        'deadband', default_value='0.015',
-        description='Image error below which the arm holds still')
+        'deadband', default_value='0.006',
+        description='Image error below which the arm holds still. Small on '
+                    'purpose: the point is to hold the hand AT the centre, '
+                    'not merely in frame. Raise it if the arm buzzes')
     model_complexity_arg = DeclareLaunchArgument(
         'model_complexity', default_value='0',
         description='MediaPipe hand model: 0 is ~2x faster than 1. On a '

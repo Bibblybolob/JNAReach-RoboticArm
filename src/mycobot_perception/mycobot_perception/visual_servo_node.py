@@ -24,7 +24,9 @@ Then it runs a state machine:
     HOMING    returning to the home pose, then back to IDLE
 
 Losing the target briefly holds position -- a hand that blinked out is usually
-about to reappear. Past resume_search_after (2s) it goes back to sweeping, and
+about to reappear, and the integral decays rather than resetting so the
+accumulated centring push survives the blink. Past resume_search_after (4s) it
+goes back to sweeping, and
 only after lost_timeout (15s) without any sighting does it give up and home. A
 search that has never seen a hand keeps sweeping rather than homing: it was
 asked to hunt. Call /servo/enable false to stop it at any point.
@@ -130,7 +132,7 @@ class VisualServoNode(Node):
         # Integral accumulates the error that proportional leaves behind and
         # keeps pushing until it is actually gone. This is the term that
         # centres the target. Too high and it overshoots and oscillates.
-        self.declare_parameter('ki', 1.2)
+        self.declare_parameter('ki', 2.2)
         # Derivative damps the approach, which buys room to raise the other two
         # without ringing. Computed on the error signal, which is already
         # smoothed upstream in the tracker.
@@ -139,18 +141,18 @@ class VisualServoNode(Node):
         # arm cannot reduce the error -- target out of reach, joint at a limit,
         # jogging disabled -- and then unloads all at once as a lurch when
         # motion resumes.
-        self.declare_parameter('integral_limit', 0.8)
+        self.declare_parameter('integral_limit', 1.2)
         # Ignore errors smaller than this (normalised). MediaPipe jitter and
         # hand tremor are both a few pixels; without a deadband the arm hunts
         # continuously and buzzes. Tighter than before now that the integral
         # term can actually close the remaining gap.
-        self.declare_parameter('deadband', 0.015)
+        self.declare_parameter('deadband', 0.006)
         # Loop rate. The driver rate-limits jogs to its command_interval
         # (0.06s, ~16Hz), so going much above that just discards commands.
         self.declare_parameter('rate', 15.0)
         # Stop if the target has not been seen for this long. Without it, the
         # arm keeps acting on a stale position after the hand leaves frame.
-        self.declare_parameter('target_timeout', 0.5)
+        self.declare_parameter('target_timeout', 0.9)
         # Cap per cycle. 3.0 matches the driver's own max_jog_deg, so this is
         # as decisive as a single jog is allowed to be.
         self.declare_parameter('max_step_deg', 3.0)
@@ -207,7 +209,7 @@ class VisualServoNode(Node):
         # else -- and with skip_probe a single spurious detection is enough
         # to enter TRACKING, so without this the sweep froze a degree in and
         # sat there until lost_timeout expired.
-        self.declare_parameter('resume_search_after', 2.0)
+        self.declare_parameter('resume_search_after', 4.0)
         # Sweep the wrist pitch while looking for a hand. joint5 tilts the
         # flange-mounted camera through its whole vertical arc, so a single
         # sweep covers far more of the room than panning the base does.
@@ -972,10 +974,21 @@ class VisualServoNode(Node):
                 return
             # Hold position during a brief dropout rather than sweeping away
             # from a hand that is probably about to reappear.
+            #
+            # Decay the integral rather than wiping it. Detections drop out
+            # for a few tenths of a second constantly while the arm moves, and
+            # clearing the integral on each of those meant the ONE term that
+            # removes a standing offset never survived long enough to build.
+            # Proportional alone always stalls short of centre, which is
+            # precisely "keeps the hand in view but not in the middle". A slow
+            # decay keeps the accumulated push across a blink while still
+            # washing it out over a genuinely long gap.
             self.get_logger().info(
                 f'Target lost {lost_for:.1f}s ago; holding',
                 throttle_duration_sec=2.0)
-            self._reset_pid()
+            self._integral *= 0.97
+            self._prev_error = None
+            self._prev_time = None
             return
 
         if self._jinv is None:
@@ -986,7 +999,10 @@ class VisualServoNode(Node):
 
         err = self._current_error()
         if err is None:
-            self._reset_pid()
+            # Same reasoning as the dropout branch above: decay, do not wipe.
+            self._integral *= 0.97
+            self._prev_error = None
+            self._prev_time = None
             return
         ex, ey = err
         self._check_sign(ex, ey)

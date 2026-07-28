@@ -27,6 +27,7 @@ Keep a hand on the e-stop. Ctrl-C stops the script but NOT the arm mid-move.
 """
 
 import argparse
+import os
 import statistics
 import sys
 import time
@@ -108,7 +109,9 @@ def measure_joint_speed(mc, start, sweep_deg, speed, settle=3.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--ip', default='192.168.0.15')
+    ap.add_argument(
+        '--ip', default=os.environ.get('MYCOBOT_IP', '192.168.0.15'),
+        help='Pi address; defaults to $MYCOBOT_IP, then 192.168.0.15')
     ap.add_argument('--port', type=int, default=9000)
     ap.add_argument('--sweep', type=float, default=40.0,
                     help='degrees to sweep joint1 (default 40)')

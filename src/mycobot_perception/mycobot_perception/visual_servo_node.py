@@ -23,9 +23,11 @@ Then it runs a state machine:
     TRACKING  centring the hand and closing in on it
     HOMING    returning to the home pose, then back to IDLE
 
-If the hand goes out of view for lost_timeout seconds (default 15) it gives up
-and homes. Call /servo/search again to restart, or /servo/enable false to stop
-immediately at any point.
+Losing the target briefly holds position -- a hand that blinked out is usually
+about to reappear. Past resume_search_after (2s) it goes back to sweeping, and
+only after lost_timeout (15s) without any sighting does it give up and home. A
+search that has never seen a hand keeps sweeping rather than homing: it was
+asked to hunt. Call /servo/enable false to stop it at any point.
 
 Jogging is armed automatically at startup -- the node calls /arm/jog_enable
 itself -- so no manual service calls are needed beyond the search trigger.
@@ -196,6 +198,14 @@ class VisualServoNode(Node):
         # --- Search / idle behaviour ---
         # Seconds without a sighting before giving up and homing.
         self.declare_parameter('lost_timeout', 15.0)
+        # Seconds of a lost target to tolerate before going back to sweeping.
+        # Below this it holds still, since a hand that blinked out is usually
+        # about to reappear in the same place. Above it, holding is just
+        # standing still while the thing you are looking for is somewhere
+        # else -- and with skip_probe a single spurious detection is enough
+        # to enter TRACKING, so without this the sweep froze a degree in and
+        # sat there until lost_timeout expired.
+        self.declare_parameter('resume_search_after', 2.0)
         # Sweep the wrist pitch while looking for a hand. joint5 tilts the
         # flange-mounted camera through its whole vertical arc, so a single
         # sweep covers far more of the room than panning the base does.
@@ -255,6 +265,12 @@ class VisualServoNode(Node):
             self.get_parameter('max_approach_step_deg').value)
 
         self._lost_timeout = float(self.get_parameter('lost_timeout').value)
+        self._resume_search_after = float(
+            self.get_parameter('resume_search_after').value)
+        # Whether a lock has ever been held. A fresh search sweeps until it
+        # finds something; only after having had a target and lost it does
+        # the lost_timeout homing apply.
+        self._had_lock = False
         self._search_joint = self.get_parameter('search_joint').value
         self._search_range = float(self.get_parameter('search_range_deg').value)
         self._sweep_seconds = float(
@@ -811,6 +827,17 @@ class VisualServoNode(Node):
 
         if self._state == SEARCHING:
             if not visible:
+                # Give up only if we had a target and lost it. A search that
+                # has never seen anything keeps sweeping -- it was asked to
+                # hunt, and homing after 15s of an empty room is not that.
+                if (self._had_lock
+                        and self._target_age() > self._lost_timeout):
+                    self.get_logger().info(
+                        f'No sighting for {self._lost_timeout:.0f}s -- '
+                        'going home.')
+                    self._set_state(HOMING)
+                    self._go_home()
+                    return
                 self._search_sweep()
                 return
             # Found one. Probe first if the camera orientation is still
@@ -826,6 +853,7 @@ class VisualServoNode(Node):
                     self._set_state(HOMING)
                     self._go_home()
                     return
+            self._had_lock = True
             self._set_state(TRACKING)
             return
 
@@ -838,11 +866,18 @@ class VisualServoNode(Node):
                 self._set_state(HOMING)
                 self._go_home()
                 return
+            if lost_for >= self._resume_search_after:
+                # Long enough that it is not coming back on its own. Sweep
+                # again rather than standing still until lost_timeout.
+                self.get_logger().info(
+                    f'Target lost {lost_for:.1f}s ago -- resuming search.')
+                self._reset_pid()
+                self._set_state(SEARCHING)
+                return
             # Hold position during a brief dropout rather than sweeping away
             # from a hand that is probably about to reappear.
             self.get_logger().info(
-                f'Target lost {lost_for:.1f}s ago; holding '
-                f'({self._lost_timeout - lost_for:.0f}s until home)',
+                f'Target lost {lost_for:.1f}s ago; holding',
                 throttle_duration_sec=2.0)
             self._reset_pid()
             return

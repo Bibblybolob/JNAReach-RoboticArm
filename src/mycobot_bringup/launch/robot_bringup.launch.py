@@ -43,6 +43,12 @@ def generate_launch_description():
                     'raise this if the stream reconnects during brief Wi-Fi '
                     'or server stalls that would otherwise recover on their own',
     )
+    home_on_start_arg = DeclareLaunchArgument(
+        'home_on_start', default_value='true',
+        description='Drive to the home pose once on startup so the arm always '
+                    'begins from a known position. Set false to leave it '
+                    'wherever it was',
+    )
     robot_ip = LaunchConfiguration('robot_ip')
     robot_port = LaunchConfiguration('robot_port')
     camera_port = LaunchConfiguration('camera_port')
@@ -83,8 +89,9 @@ def generate_launch_description():
             'adaptive_speed': True,
             'speed_at_100_deg_s': 120.0,
             'speed_headroom': 1.3,
-            'home_angles_deg': [0.0, 90.0, -90.0, -90.0, 0.0, 0.0],
+            'home_angles_deg': [0.0, 90.0, -90.0, 0.0, 0.0, 0.0],
             'home_speed': 30,
+            'home_on_start': LaunchConfiguration('home_on_start'),
         }],
         output='screen',
         respawn=True,
@@ -118,6 +125,7 @@ def generate_launch_description():
         robot_port_arg,
         camera_port_arg,
         stream_read_timeout_arg,
+        home_on_start_arg,
         robot_state_publisher,
         hardware_node,
         camera_node,

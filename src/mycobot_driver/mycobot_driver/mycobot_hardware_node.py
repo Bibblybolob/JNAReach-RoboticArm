@@ -105,16 +105,26 @@ class MyCobotHardwareNode(Node):
         # --- Homing ---
         # Fixed joint-angle home pose, in degrees.
         # Kept in sync with the "home" group_state in mycobot_280pi.srdf
-        # ([0, 1.5708, -1.5708, -1.5708, 0, 0] rad) — change both together or
+        # ([0, 1.5708, -1.5708, 0, 0, 0] rad) — change both together or
         # RViz's named "home" and this service will disagree.
         self.declare_parameter(
-            'home_angles_deg', [0.0, 90.0, -90.0, -90.0, 0.0, 0.0]
+            'home_angles_deg', [0.0, 90.0, -90.0, 0.0, 0.0, 0.0]
         )
         # Homing runs slower than normal motion on purpose: it is commanded
         # from an arbitrary unknown starting pose, which makes it the single
         # most dangerous move the arm makes.
         self.declare_parameter('home_speed', 30)
         self.declare_parameter('home_timeout', 15.0)
+        # Drive to home once, shortly after connecting, so the arm always
+        # starts from a known pose instead of wherever it was left.
+        #
+        # Off by default here on purpose: this moves the arm from an
+        # arbitrary unknown position as a side effect of starting a node,
+        # which is not something a driver should decide on its own. The
+        # bringup launch turns it on, because there the operator is
+        # deliberately starting the whole stack and expects the arm to
+        # settle at home before anything else happens.
+        self.declare_parameter('home_on_start', False)
 
         # --- Jogging (visual servoing) ---
         # Largest displacement honoured in a single JointJog, in degrees. A
@@ -178,6 +188,9 @@ class MyCobotHardwareNode(Node):
         )
         self._home_speed = self.get_parameter('home_speed').get_parameter_value().integer_value
         self._home_timeout = self.get_parameter('home_timeout').get_parameter_value().double_value
+        self._home_on_start = self.get_parameter(
+            'home_on_start').get_parameter_value().bool_value
+        self._start_homed = False
         if len(self._home_angles) != 6:
             self.get_logger().warn(
                 f'home_angles_deg has {len(self._home_angles)} entries, expected 6. '
@@ -290,6 +303,15 @@ class MyCobotHardwareNode(Node):
             2.0, self._keepalive, callback_group=service_cb_group,
         )
 
+        if self._home_on_start:
+            # A timer rather than a call in __init__: homing blocks for up to
+            # home_timeout, and the arm may not even be connected yet. This
+            # waits for a connection, homes once, then cancels itself.
+            self._start_home_timer = self.create_timer(
+                1.0, self._home_on_start_once,
+                callback_group=service_cb_group,
+            )
+
         if self._mc is None:
             self.get_logger().warn(
                 'myCobot hardware node ready but NOT CONNECTED. Services and '
@@ -401,6 +423,28 @@ class MyCobotHardwareNode(Node):
     # decoding failure rather than a pose. Kept well clear of joint6's +/-180
     # so a real reading is never mistaken for garbage.
     SANITY_LIMIT_DEG = 200.0
+
+    def _home_on_start_once(self) -> None:
+        """Drive to home once, as soon as the arm is actually reachable.
+
+        Waits rather than giving up if the arm is not connected yet -- at
+        startup the driver may still be retrying, and homing is exactly what
+        should happen the moment it succeeds.
+        """
+        if self._start_homed:
+            self._start_home_timer.cancel()
+            return
+        if self._mc is None:
+            return  # not connected yet; try again on the next tick
+
+        self._start_homed = True
+        self._start_home_timer.cancel()
+        self.get_logger().info(
+            f'Homing on startup to {self._home_angles} '
+            '(set home_on_start:=false to skip)')
+        # Reuse the service path so startup homing and /arm/home cannot drift
+        # apart in behaviour.
+        self._home_callback(SetBool.Request(), SetBool.Response())
 
     def _angles_plausible(self, angles_deg) -> bool:
         """Reject a reading that cannot be a real pose at all.

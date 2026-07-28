@@ -15,8 +15,12 @@ MoveIt entirely -- it jogs joints directly from image error -- so planning is
 dead weight here, and it is a lot of dead weight on a VM. Use
 moveit_bringup.launch.py when you want planning.
 
-Servoing and jogging are armed automatically. The arm still sits idle at home
-until you ask it to hunt:
+On startup the arm drives to its home pose ([0, 90, -90, 0, 0, 0] degrees) so
+it always begins from a known position rather than wherever it was left. Pass
+home_on_start:=false to skip that.
+
+Servoing and jogging are armed automatically. The arm then sits at home until
+you ask it to hunt:
 
     ros2 service call /servo/search std_srvs/srv/Trigger
 
@@ -37,6 +41,7 @@ Useful arguments:
     target_size_fraction:=0.55     closer approach (0.45 default)
     approach_enabled:=false        centre only, do not close in
     search_on_start:=true          start hunting without the trigger
+    home_on_start:=false           do not home on startup
     show_window:=true              OpenCV window (needs a display)
 """
 
@@ -65,6 +70,10 @@ def generate_launch_description():
         description='Seconds without a new MJPEG frame before reconnecting. '
                     'Generous on purpose: a loaded host can stall for tens of '
                     'seconds, and reconnecting mid-stall makes it worse')
+    home_on_start_arg = DeclareLaunchArgument(
+        'home_on_start', default_value='true',
+        description='Drive to the home pose once on startup, so the arm sits '
+                    'at a known position until you trigger a hunt')
     gain_arg = DeclareLaunchArgument(
         'gain', default_value='3.0',
         description='Servo proportional gain; halve it if the arm oscillates')
@@ -113,6 +122,7 @@ def generate_launch_description():
             'robot_port': LaunchConfiguration('robot_port'),
             'camera_port': LaunchConfiguration('camera_port'),
             'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
+            'home_on_start': LaunchConfiguration('home_on_start'),
         }.items(),
     )
 
@@ -158,6 +168,7 @@ def generate_launch_description():
         robot_port_arg,
         camera_port_arg,
         stream_read_timeout_arg,
+        home_on_start_arg,
         gain_arg,
         ki_arg,
         kd_arg,

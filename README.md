@@ -63,7 +63,7 @@ echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && source ~/.bashrc
 ## 2. Install Python dependencies
 
 ```bash
-pip install pymycobot mediapipe opencv-python requests numpy
+pip install -r requirements.txt
 ```
 
 `ultralytics` is only needed for the YOLO food/object detector, which the
@@ -326,6 +326,22 @@ grep -rn "192.168" ~/mycobot_project/install/*/lib/python3*/site-packages/*/came
 **"Waiting for /arm/jog_enable (is the driver running?)"**
 The driver could not reach the arm. It now stays up and retries every 5s
 instead of dying, and prints the address it failed on.
+
+**A node dies on import: `_ARRAY_API not found`, `KeyError: 16`, or
+`module 'mediapipe' has no attribute 'solutions'`.**
+Python dependency versions, not ROS. `pip` installs into `~/.local`, which
+shadows the system packages ROS 2 Humble's compiled extensions were built
+against — so upgrading numpy, opencv or mediapipe breaks nodes that worked,
+with errors that point at ROS instead of at the upgrade. `cv_bridge` is the
+usual casualty, and it takes both `camera_node` and `hand_tracker_node` with
+it. Fix:
+
+```bash
+pip install -r requirements.txt
+```
+
+That pins `numpy<2`, `mediapipe<1.0` and `opencv-contrib-python<5`. The
+reasoning for each bound is in the file.
 
 **Repeated "Lost connection to the arm ... Broken pipe" and camera read
 timeouts.**

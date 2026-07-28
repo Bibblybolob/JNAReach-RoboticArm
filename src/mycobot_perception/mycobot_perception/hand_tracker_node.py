@@ -63,9 +63,21 @@ try:
     import mediapipe as mp
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
-        'mediapipe not installed. On the Jetson/desktop:\n'
-        '    pip install mediapipe\n'
+        'mediapipe not installed:\n'
+        '    pip install -r requirements.txt\n'
         f'(import error: {exc})'
+    )
+
+# MediaPipe 1.0 dropped the legacy solutions API this node is built on, and
+# `pip install mediapipe` now gets you 1.x. Caught here rather than left to
+# fail deeper in as "module 'mediapipe' has no attribute 'solutions'", which
+# reads like a broken install rather than the wrong major version.
+if not hasattr(mp, 'solutions'):
+    raise SystemExit(
+        f'mediapipe {getattr(mp, "__version__", "?")} has no .solutions -- '
+        'that API was removed in 1.0, and this node uses it.\n'
+        '    pip install "mediapipe<1.0"\n'
+        'See requirements.txt; the version bounds there are load-bearing.'
     )
 
 

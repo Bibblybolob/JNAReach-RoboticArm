@@ -1,0 +1,36 @@
+# Python dependencies for the desktop/VM side of the stack.
+#
+#     pip install -r requirements.txt
+#
+# EVERY UPPER BOUND HERE IS LOAD-BEARING. ROS 2 Humble ships compiled
+# extensions -- cv_bridge above all -- built against the versions Ubuntu
+# 22.04 packages. pip installs into ~/.local, which SHADOWS those, so a
+# routine `pip install -U` can break nodes that were working, with errors
+# that point at ROS rather than at the upgrade.
+#
+# The three that have actually bitten this project:
+#
+#   numpy>=2      cv_bridge is a C extension compiled against NumPy 1.x.
+#                 Importing it under NumPy 2 raises
+#                 "AttributeError: _ARRAY_API not found", which kills
+#                 camera_node and hand_tracker_node alike -- both import
+#                 cv_bridge before they do anything else.
+#
+#   mediapipe>=1  MediaPipe 1.0 removed the legacy mp.solutions API.
+#                 hand_tracker_node uses mp.solutions.hands.Hands, so 1.x
+#                 fails with "module 'mediapipe' has no attribute
+#                 'solutions'". Moving to the Tasks API is a rewrite of the
+#                 tracker, not a version bump.
+#
+#   opencv>=5     cv_bridge maps OpenCV 4 type codes. Under OpenCV 5,
+#                 cv2_to_imgmsg raises "KeyError: 16" on a perfectly valid
+#                 bgr8 frame.
+#
+# If a node dies on import after you have upgraded something, check these
+# first -- `pip list | grep -Ei "numpy|mediapipe|opencv"`.
+
+numpy<2
+mediapipe<1.0
+opencv-contrib-python<5
+pymycobot
+requests

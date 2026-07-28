@@ -239,6 +239,40 @@ def preflight():
     time.sleep(1)
 
 
+def check_workspace():
+    """Refuse to launch packages belonging to a different workspace.
+
+    `ros2 launch` resolves packages through AMENT_PREFIX_PATH, not through
+    this file's location. If another workspace with the same package names is
+    sourced -- an older clone, say -- then pulling, rebuilding and relaunching
+    here changes nothing, because a different copy is what actually runs.
+    That is invisible from the outside and indistinguishable from "my fix did
+    not work", so check it rather than let it waste an afternoon.
+    """
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share = get_package_share_directory('mycobot_bringup')
+    except Exception as e:
+        die(f'mycobot_bringup is not on AMENT_PREFIX_PATH ({e}).\n'
+            f'  Build and source it:\n'
+            f'    cd {REPO} && colcon build --symlink-install\n'
+            f'    source {REPO}/install/setup.bash')
+
+    if os.path.realpath(share).startswith(os.path.realpath(REPO)):
+        return
+
+    print(f'\n{RED}{"=" * 70}{OFF}')
+    print(f'{RED}  WRONG WORKSPACE{OFF}')
+    print(f'  This script lives in : {BOLD}{REPO}{OFF}')
+    print(f'  but mycobot_bringup  : {BOLD}{share}{OFF}')
+    print()
+    print('  Launching would run that other copy, so changes here would have')
+    print('  no effect. Source this workspace last (or drop the other one):')
+    print(f'    source {REPO}/install/setup.bash')
+    print(f'{RED}{"=" * 70}{OFF}')
+    sys.exit(1)
+
+
 def ensure_built():
     if not os.path.isfile(os.path.join(REPO, 'install', 'setup.bash')):
         say('No build found, running colcon build (first run only)...')
@@ -512,6 +546,9 @@ def main():
         return 0
 
     ensure_built()
+    # Before anything else: make sure the packages we are about to launch are
+    # the ones in this repo, not another workspace's copy of the same names.
+    check_workspace()
 
     rclpy.init()
     panel = Panel()

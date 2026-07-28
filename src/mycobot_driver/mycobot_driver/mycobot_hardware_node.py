@@ -114,7 +114,12 @@ class MyCobotHardwareNode(Node):
         # from an arbitrary unknown starting pose, which makes it the single
         # most dangerous move the arm makes.
         self.declare_parameter('home_speed', 30)
-        self.declare_parameter('home_timeout', 15.0)
+        # Long enough for the worst case, which is most of a joint's travel at
+        # home_speed. 15s was not: homing from joint3 near 0 to -90 timed out
+        # and reported failure, then "completed" on the next attempt purely
+        # because the arm had kept moving in the meantime. A homing move that
+        # works should not have to be asked for twice.
+        self.declare_parameter('home_timeout', 40.0)
         # Drive to home once, shortly after connecting, so the arm always
         # starts from a known pose instead of wherever it was left.
         #
@@ -642,7 +647,15 @@ class MyCobotHardwareNode(Node):
                 throttle_duration_sec=2.0)
             return
 
-        if self._mc is None:
+        # Take a local reference and use it for the whole callback. Checking
+        # self._mc and then calling through self._mc later is a race: another
+        # thread's _handle_link_error can clear it in between, and the send
+        # then raises AttributeError on None -- which surfaced as the useless
+        # "jog rejected: 'NoneType' object has no attribute 'send_angles'".
+        # Holding the reference means a dying link fails as an OSError, which
+        # is the path that actually knows what to do about it.
+        mc = self._mc
+        if mc is None:
             self.get_logger().warn(
                 'Ignoring jog: not connected to the arm.',
                 throttle_duration_sec=5.0)
@@ -715,7 +728,7 @@ class MyCobotHardwareNode(Node):
 
         try:
             with self._lock:
-                self._mc.send_angles(target_deg, speed)
+                mc.send_angles(target_deg, speed)
             self._last_tx_time = time.monotonic()
             self.get_logger().info(
                 f'jog -> {[round(d, 1) for d in target_deg]}',

@@ -71,7 +71,7 @@ def generate_launch_description():
             # Fixed home pose, degrees. Override for your workspace.
             'home_angles_deg': home_angles,
             'home_speed': 30,
-            'home_timeout': 15.0,
+            'home_timeout': 40.0,
         }],
         output='screen',
     )

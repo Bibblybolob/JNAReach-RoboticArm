@@ -263,6 +263,12 @@ class MyCobotHardwareNode(Node):
         # preventing the 20Hz timer from starving the service/action callbacks.
         action_cb_group = ReentrantCallbackGroup()
         service_cb_group = MutuallyExclusiveCallbackGroup()
+        # Homing gets its own group. It blocks for as long as the move takes
+        # -- up to home_timeout -- and on a MutuallyExclusive group that
+        # stalls everything sharing it. Sharing with /arm/jog_enable meant
+        # arming the jog gate during a home timed out, which reads as the
+        # driver having died. Nothing else belongs in here.
+        home_cb_group = MutuallyExclusiveCallbackGroup()
 
         self._action_server = ActionServer(
             self,
@@ -280,7 +286,7 @@ class MyCobotHardwareNode(Node):
         # side effect of launching the driver.
         self._home_srv = self.create_service(
             SetBool, 'arm/home', self._home_callback,
-            callback_group=service_cb_group,
+            callback_group=home_cb_group,
         )
 
         # Jogging: relative joint moves for visual servoing. Gated behind
@@ -314,7 +320,7 @@ class MyCobotHardwareNode(Node):
             # waits for a connection, homes once, then cancels itself.
             self._start_home_timer = self.create_timer(
                 1.0, self._home_on_start_once,
-                callback_group=service_cb_group,
+                callback_group=home_cb_group,
             )
 
         if self._mc is None:

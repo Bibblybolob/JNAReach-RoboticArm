@@ -24,9 +24,10 @@ you ask it to hunt:
 
     ros2 service call /servo/search std_srvs/srv/Trigger
 
-It then sweeps to find a hand, centres on it, and closes in. After 15s with no
-sighting it returns home and waits for the next trigger. To stop it at any
-point:
+It then sweeps joint5 (wrist pitch) through +90 to -90 over 15s looking for a
+hand, centres on it, and closes in until the palm fills the target fraction of
+the frame. After 15s with no sighting it returns home and waits for the next
+trigger. To stop it at any point:
 
     ros2 service call /servo/enable std_srvs/srv/SetBool "{data: false}"
 
@@ -40,6 +41,8 @@ Useful arguments:
     lost_timeout:=30.0             longer grace before homing
     target_size_fraction:=0.55     closer approach (0.45 default)
     approach_enabled:=false        centre only, do not close in
+    search_sweep_seconds:=25.0     slower sweep, more chance to lock on
+    search_range_deg:=90.0         narrower sweep (+45 to -45)
     search_on_start:=true          start hunting without the trigger
     home_on_start:=false           do not home on startup
     show_window:=true              OpenCV window (needs a display)
@@ -105,6 +108,14 @@ def generate_launch_description():
     approach_enabled_arg = DeclareLaunchArgument(
         'approach_enabled', default_value='true',
         description='Close in on the hand as well as centring it')
+    sweep_seconds_arg = DeclareLaunchArgument(
+        'search_sweep_seconds', default_value='15.0',
+        description='Seconds for one traverse of the search sweep. Slower '
+                    'gives MediaPipe more clean frames to lock on')
+    search_range_arg = DeclareLaunchArgument(
+        'search_range_deg', default_value='180.0',
+        description='Total sweep travel, centred where the search began. '
+                    'Home leaves joint5 at 0, so 180 swings +90 to -90')
     search_on_start_arg = DeclareLaunchArgument(
         'search_on_start', default_value='false',
         description='Begin hunting immediately instead of waiting for the '
@@ -157,6 +168,8 @@ def generate_launch_description():
             'target_size_fraction': LaunchConfiguration('target_size_fraction'),
             'approach_enabled': LaunchConfiguration('approach_enabled'),
             'search_on_start': LaunchConfiguration('search_on_start'),
+            'search_sweep_seconds': LaunchConfiguration('search_sweep_seconds'),
+            'search_range_deg': LaunchConfiguration('search_range_deg'),
         }],
         output='screen',
         respawn=True,
@@ -178,6 +191,8 @@ def generate_launch_description():
         lost_timeout_arg,
         target_size_arg,
         approach_enabled_arg,
+        sweep_seconds_arg,
+        search_range_arg,
         search_on_start_arg,
         robot,
         hand_tracker,

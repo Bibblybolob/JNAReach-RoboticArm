@@ -176,10 +176,24 @@ class VisualServoNode(Node):
         # --- Search / idle behaviour ---
         # Seconds without a sighting before giving up and homing.
         self.declare_parameter('lost_timeout', 15.0)
-        # Sweep the base joint while looking for a hand.
-        self.declare_parameter('search_joint', 'joint1')
-        self.declare_parameter('search_step_deg', 1.2)
-        self.declare_parameter('search_range_deg', 60.0)
+        # Sweep the wrist pitch while looking for a hand. joint5 tilts the
+        # flange-mounted camera through its whole vertical arc, so a single
+        # sweep covers far more of the room than panning the base does.
+        self.declare_parameter('search_joint', 'joint5')
+        # Total travel, centred on wherever the sweep began. The home pose
+        # leaves joint5 at 0, and search follows homing, so 180 means the
+        # camera really does swing +90 to -90.
+        self.declare_parameter('search_range_deg', 180.0)
+        # Seconds for one traverse of that range. The step size is derived
+        # from this and the measured time since the last tick rather than
+        # being a fixed number of degrees per loop -- on a host that stalls,
+        # a fixed step makes the sweep take however long the stalls add up
+        # to, which is why the old sweep crawled. Pacing against the clock
+        # keeps the sweep honest whatever the loop rate does.
+        self.declare_parameter('search_sweep_seconds', 15.0)
+        # Never let one catch-up step become a lunge after a stall. The
+        # driver clamps to max_jog_deg anyway; this keeps intent local.
+        self.declare_parameter('search_max_step_deg', 2.5)
         # Begin searching as soon as the node starts, instead of waiting for
         # the trigger. Off by default: launching a file should not set the arm
         # hunting around the room.
@@ -215,8 +229,11 @@ class VisualServoNode(Node):
 
         self._lost_timeout = float(self.get_parameter('lost_timeout').value)
         self._search_joint = self.get_parameter('search_joint').value
-        self._search_step = float(self.get_parameter('search_step_deg').value)
         self._search_range = float(self.get_parameter('search_range_deg').value)
+        self._sweep_seconds = float(
+            self.get_parameter('search_sweep_seconds').value)
+        self._search_max_step = float(
+            self.get_parameter('search_max_step_deg').value)
 
         # Sign of d(palm size)/d(approach joint), learned by the probe. Without
         # it we would not know whether extending the joint moves the camera
@@ -232,6 +249,9 @@ class VisualServoNode(Node):
         # Sweep direction and accumulated travel while SEARCHING.
         self._search_dir = 1.0
         self._search_travel = 0.0
+        # Wall-clock of the previous sweep tick, so each step can be sized
+        # from real elapsed time instead of assuming the loop ran on time.
+        self._last_sweep_time: float | None = None
 
         # Frame size, learned from the first image. Needed to normalise pixel
         # error; we do not assume 640x480.
@@ -331,6 +351,9 @@ class VisualServoNode(Node):
         self._reset_pid()
         if state == SEARCHING:
             self._search_travel = 0.0
+            # Drop the previous tick's timestamp too, or the first step of a
+            # new sweep is sized from however long the node sat in IDLE.
+            self._last_sweep_time = None
 
     def _search_cb(self, request, response):
         if not self._enabled:
@@ -633,13 +656,34 @@ class VisualServoNode(Node):
         self._acted_point_time = 0.0
 
     def _search_sweep(self) -> None:
-        """Pan the base joint back and forth looking for a hand.
+        """Tilt the wrist through its arc looking for a hand.
 
-        Deliberately slow: MediaPipe needs a few clean frames to lock on, and
-        sweeping faster than it can detect means panning straight past a hand
-        that was in view the whole time.
+        Paced against the wall clock, not the loop counter: the step is
+        whatever covers search_range_deg in search_sweep_seconds given the
+        time that actually elapsed since the last tick. A fixed
+        degrees-per-tick step silently stretches the sweep by however long
+        the host stalled, which is how a sweep meant to take 15s ended up
+        crawling a few degrees over a minute.
+
+        Deliberately slow regardless: MediaPipe needs a few clean frames to
+        lock on, and sweeping faster than it can detect means panning
+        straight past a hand that was in view the whole time.
         """
-        step = self._search_step * self._search_dir
+        now = time.monotonic()
+        if self._last_sweep_time is None:
+            # First tick of this sweep -- no elapsed time to work from yet.
+            self._last_sweep_time = now
+            return
+        dt = now - self._last_sweep_time
+        self._last_sweep_time = now
+
+        deg_per_sec = self._search_range / max(self._sweep_seconds, 0.1)
+        step = deg_per_sec * dt * self._search_dir
+        # After a stall dt is large; cap the catch-up so the arm eases back
+        # into the sweep rather than lunging.
+        step = max(-self._search_max_step,
+                   min(self._search_max_step, step))
+
         self._send_jog(self._search_joint, step)
         self._search_travel += step
 
@@ -651,7 +695,8 @@ class VisualServoNode(Node):
                 f'Search sweep reversing at {self._search_travel:+.0f}deg')
 
         self.get_logger().info(
-            f'Searching... {self._search_joint} at {self._search_travel:+.0f}deg',
+            f'Searching... {self._search_joint} at {self._search_travel:+.0f}deg '
+            f'({deg_per_sec:.0f}deg/s)',
             throttle_duration_sec=3.0)
 
     def _approach_step(self) -> float:

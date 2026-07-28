@@ -12,8 +12,9 @@ HOW IT IS PUT TOGETHER
 
 The launch output would drown a menu sharing the same terminal, so the stack
 is started detached with its console redirected to a log file, and the menu
-runs in the foreground. The log is still one keypress away -- 'l' tails it
-live -- because that output is how you actually diagnose this system.
+runs in the foreground. The log stays one keypress away -- 'l' prints the
+last 40 lines and comes straight back, 'f' follows it live -- because that
+output is how you actually diagnose this system.
 
 Service calls go through a single long-lived node rather than shelling out to
 `ros2 service call`, which spins up a node, discovers the graph, calls, and
@@ -443,19 +444,42 @@ class Panel(Node):
 
 # --------------------------------------------------------------------------
 
-def tail_log():
-    print(f'{DIM}--- {LOG} (Ctrl-C to return to the menu) ---{OFF}')
-    p = subprocess.Popen(['tail', '-n', '40', '-f', LOG])
+def show_log(lines=40):
+    """Print the tail of the log and return to the menu immediately.
+
+    Deliberately not `tail -f`: following blocks the menu, and getting back
+    out meant Ctrl-C, which the terminal delivers to the whole foreground
+    process group -- killing the stack along with the tail. A snapshot you
+    can take repeatedly is more useful than a stream you cannot leave.
+    """
+    print(f'{DIM}--- last {lines} lines of {LOG} ---{OFF}')
+    try:
+        subprocess.run(['tail', '-n', str(lines), LOG])
+    except Exception as e:
+        print(f'{RED}could not read {LOG}: {e}{OFF}')
+    print(f'{DIM}--- end (press l again to refresh, f to follow live) ---{OFF}\n')
+
+
+def follow_log():
+    """Stream the log until Ctrl-C, then return to the menu.
+
+    tail runs in its own session so the terminal's Ctrl-C reaches only this
+    process. Without that the signal goes to the entire foreground group and
+    takes the stack down with it.
+    """
+    print(f'{DIM}--- following {LOG} (Ctrl-C returns to the menu) ---{OFF}')
+    p = subprocess.Popen(['tail', '-n', '20', '-f', LOG],
+                         start_new_session=True)
     try:
         p.wait()
     except KeyboardInterrupt:
-        pass
+        print(f'\n{DIM}--- stopped following ---{OFF}')
     finally:
         p.terminate()
         try:
             p.wait(timeout=2)
         except Exception:
-            pass
+            p.kill()
     print()
 
 
@@ -474,7 +498,8 @@ def menu(attached):
   {CYAN}7{OFF}) Status                 {DIM}nodes + joint angles{OFF}
   {CYAN}8{OFF}) Pipeline rates         {DIM}camera vs detection Hz{OFF}
   {CYAN}9{OFF}) Health check           {DIM}Pi ping + ports 9000/8080{OFF}
-  {CYAN}l{OFF}) Live log               {DIM}tail the stack output{OFF}
+  {CYAN}l{OFF}) Show log               {DIM}last 40 lines, returns straight back{OFF}
+  {CYAN}f{OFF}) Follow log             {DIM}live stream, Ctrl-C to come back{OFF}
 
   {CYAN}q{OFF}) {quit_note}
 """
@@ -518,7 +543,8 @@ def main():
         '7': panel.status,
         '8': panel.rates,
         '9': panel.health,
-        'l': tail_log,
+        'l': show_log,
+        'f': follow_log,
     }
 
     try:

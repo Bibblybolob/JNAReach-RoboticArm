@@ -105,10 +105,10 @@ class MyCobotHardwareNode(Node):
         # --- Homing ---
         # Fixed joint-angle home pose, in degrees.
         # Kept in sync with the "home" group_state in mycobot_280pi.srdf
-        # ([0, 1.5708, -1.5708, 0, 0, 0] rad) — change both together or
+        # ([0, 1.5708, 0, 0, 0, 0] rad) — change both together or
         # RViz's named "home" and this service will disagree.
         self.declare_parameter(
-            'home_angles_deg', [0.0, 90.0, -90.0, 0.0, 0.0, 0.0]
+            'home_angles_deg', [0.0, 90.0, 0.0, 0.0, 0.0, 0.0]
         )
         # Homing runs slower than normal motion on purpose: it is commanded
         # from an arbitrary unknown starting pose, which makes it the single
@@ -368,6 +368,10 @@ class MyCobotHardwareNode(Node):
             return True
         except Exception as e:
             self._mc = None
+            # Throttled: the reconnect timer retries every 5s, and repeating
+            # this six-line block that often buries everything else in the
+            # log and makes the terminal crawl. The first one prints
+            # immediately; after that it is a reminder, not news.
             self.get_logger().error(
                 f'Cannot reach the arm at {self._ip}:{self._port} -- {e}\n'
                 '  The node is running but every command will be refused '
@@ -375,7 +379,8 @@ class MyCobotHardwareNode(Node):
                 f'    - the Pi is powered and on the network (ping {self._ip})\n'
                 '    - server.py is running on it (port 9000)\n'
                 '    - nothing else holds the connection; Server.py accepts '
-                'ONE client, so a stray script or a second driver locks it out'
+                'ONE client, so a stray script or a second driver locks it out',
+                throttle_duration_sec=30.0,
             )
             return False
 

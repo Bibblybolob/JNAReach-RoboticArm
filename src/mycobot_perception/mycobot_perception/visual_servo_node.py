@@ -42,26 +42,53 @@ its own time to actually move the arm. Several tenths of a second pass between
 that". Meanwhile detections keep arriving reporting the *old* error, because
 the correction has not landed yet.
 
-That is what makes gain the whole game here. Each update commands some
-fraction of the motion that would fully centre the target. If that fraction
-times the number of updates that elapse during the dead time comes out above
-1.0, the loop commands more correction than the error deserves, sails past
-centre, and does the same thing coming back: a steady oscillation that never
-settles. Adding an integral term to "finish the job" makes it strictly worse,
-because the integral keeps winding up during exactly the interval when the
-correction is in flight but not yet visible. The previous version of this node
-did that, with an effective fraction near 1.4, and it flicked back and forth
-without ever converging.
+Each update commands some fraction of the motion that would fully centre the
+target. If that fraction times the number of updates that elapse during the
+dead time comes out above 1.0, the loop commands more correction than the
+error deserves, sails past centre, and does the same thing coming back: a
+steady oscillation that never settles. Adding an integral term to "finish the
+job" makes it strictly worse, because the integral winds up during exactly the
+interval when the correction is in flight but not yet visible. An early
+version of this node did that, at an effective fraction near 1.4, and it
+flicked back and forth without ever converging.
 
-So: `gain` is the fraction of the full correction to apply per detection
-(0.3 -- roughly a third of the way to centre each time), `assumed_deg_per_error`
-is what a full correction is (about half the camera's field of view, since
-rotating the camera by half the FOV moves a frame-edge target to the centre),
-and nothing accumulates between updates. Error shrinks geometrically, ~30% per
-detection, and the loop is stable even when the pipeline is slow.
+Backing the fraction off to 0.3 fixes the oscillation but buys stability with
+speed, and the arm then visibly trails a moving hand. So instead of tiptoeing
+around the dead time, the loop MODELS it. Every jog is remembered with the
+time it was sent. When a detection arrives, the node adds back the image
+motion produced by jogs that this frame is too old to show yet, giving an
+estimate of where the hand is NOW rather than where it was. Correcting that
+estimate means never re-commanding a correction already on its way -- and
+without that duplication, the fraction can be 0.7 instead of 0.3.
 
-If it feels sluggish, raise `gain` toward 0.5. If it starts hunting around
-centre, lower it toward 0.2. That single number is the tuning.
+Simulating the whole pipeline (0.25s true lag, 8 detections/s, 5 deg cap):
+
+    gain 1.44, no compensation     oscillates forever   <- the original PID
+    gain 0.30, no compensation     settles in 1.3s
+    gain 0.70, no compensation     oscillates forever
+    gain 0.70, with compensation   settles in 0.7s
+
+The one thing to be careful with is `command_lag`, and it is asymmetric. Too
+LOW is harmless -- some in-flight motion goes uncounted and the loop corrects
+slightly harder than it needs to. Too HIGH is not: the window then sweeps in
+jogs that have already landed and are already visible in the measurement, the
+compensator counts them twice, decides it has overshot, and reverses. That
+reversal is a flicking oscillation, which is the thing being fixed. So it sits
+at 0.15 against a true lag nearer 0.25, deliberately.
+
+The remaining knobs, in the order worth touching them:
+
+    gain                0.7   fraction of the full correction per detection
+    max_step_deg        5.0   ceiling on one jog; with the detection rate,
+                              this sets the top speed the camera can slew
+    command_lag        0.15   see above; lower is safe, higher is not
+    assumed_deg_per_error 25  geometry, not tuning -- half the camera FOV
+
+And the signs no longer need guessing at the command line. `auto_sign`
+correlates what each jog was predicted to do to the image against what it
+actually did, and flips an axis that turns out to be wired backwards, saying
+so in the log. Same answer the probe gives, obtained from ordinary tracking
+motion instead of a twitching calibration phase.
 
 Jogging is armed automatically at startup -- the node calls /arm/jog_enable
 itself -- so no manual service calls are needed beyond the search trigger.
@@ -155,30 +182,72 @@ class VisualServoNode(Node):
         # Error is normalised to half-frames: 1.0 means the target sits at the
         # frame edge.
         #
-        # This is a FRACTION, not degrees. 0.3 means "each time you see the
-        # hand, move a third of the way to having it centred". See the module
-        # docstring for why a fraction well under 1.0 is what keeps this loop
-        # stable given how much dead time the camera pipeline adds -- the short
-        # version is that several detections arrive still reporting the old
-        # error while a correction is in flight, so anything near 1.0 commands
-        # the same correction several times over and oscillates.
-        self.declare_parameter('gain', 0.3)
+        # This is a FRACTION, not degrees. 0.7 means "each time you see the
+        # hand, move seventy percent of the way to having it centred".
+        #
+        # A fraction this close to 1.0 is only safe because of the lag
+        # compensation below. Without it, corrections still in flight get
+        # re-commanded by every detection that arrives before they land, and
+        # anything above about 0.35 oscillates. With it, the loop subtracts
+        # what it has already asked for and can afford to be decisive.
+        self.declare_parameter('gain', 0.7)
+        # --- Lag compensation ---
+        # The one change that lets this track fast instead of carefully.
+        #
+        # Corrections take time to appear: the arm has to move, the Pi has to
+        # capture and encode a frame showing it moved, and MediaPipe has to
+        # find the hand in that frame. Detections arriving during that window
+        # report the error as it was BEFORE the correction, so a naive loop
+        # commands the same motion again, and again, and overshoots by however
+        # many detections fit in the gap. That is the entire reason the old
+        # build flicked left and right.
+        #
+        # So keep every jog sent, and when a measurement arrives, add back the
+        # image motion the not-yet-visible jogs are about to produce. What is
+        # left is an estimate of where the hand actually is NOW rather than
+        # where it was, and the loop corrects that instead.
+        self.declare_parameter('lag_compensation', True)
+        # Seconds from publishing a jog to that motion showing up in a frame's
+        # timestamp: arm response plus capture, JPEG, network and MediaPipe.
+        #
+        # DELIBERATELY SET BELOW THE TRUE LAG. The two directions of error are
+        # not symmetric, and the asymmetry is sharp. Set it too high and the
+        # window sweeps in jogs that have ALREADY landed and are already in
+        # the measurement; the compensator counts them twice, concludes it has
+        # overshot, and reverses -- which is a flicking oscillation, the exact
+        # failure this exists to remove. Set it too low and some genuinely
+        # in-flight motion goes uncounted, so the loop corrects slightly more
+        # than it should, which at these gains merely converges a little
+        # faster.
+        #
+        # Simulating the pipeline at a true lag of 0.25s: gains from 0.5 to
+        # 1.1 all settle in ~0.7s at command_lag 0.10-0.15, while 0.35 and
+        # above oscillate at every gain above 0.3. One notch back from that
+        # cliff is the right place to sit, so 0.15 -- and raising it is the
+        # wrong response to a slow pipeline. Fix the pipeline instead.
+        self.declare_parameter('command_lag', 0.15)
+        # Never let the compensator invent more than this much error. It is an
+        # open-loop prediction; if the arm did not actually execute a jog (link
+        # dropped, joint at a limit, driver rejected it) the prediction is
+        # wrong, and an unbounded wrong prediction is a runaway.
+        self.declare_parameter('max_compensation', 0.8)
         # Ignore errors smaller than this (normalised). MediaPipe jitter and
         # hand tremor are both a few pixels; without a deadband the arm hunts
-        # continuously and buzzes. 0.05 of a half-frame is a hand sitting
-        # comfortably in the middle of the picture -- close enough to call it
-        # centred, and chasing anything tighter than that with a pipeline this
-        # slow buys buzzing rather than precision.
-        self.declare_parameter('deadband', 0.05)
+        # continuously and buzzes. 0.04 of a half-frame is a hand sitting
+        # comfortably in the middle of the picture.
+        self.declare_parameter('deadband', 0.04)
         # Loop rate. The driver rate-limits jogs to its command_interval
         # (0.06s, ~16Hz), so going much above that just discards commands.
         self.declare_parameter('rate', 15.0)
         # Stop if the target has not been seen for this long. Without it, the
         # arm keeps acting on a stale position after the hand leaves frame.
         self.declare_parameter('target_timeout', 0.9)
-        # Cap per cycle. 3.0 matches the driver's own max_jog_deg, so this is
-        # as decisive as a single jog is allowed to be.
-        self.declare_parameter('max_step_deg', 3.0)
+        # Cap per cycle, and the thing that sets top tracking speed: at roughly
+        # 8 detections a second, 5 deg a step is about 40 deg/s of camera slew.
+        # Matches the driver's max_jog_deg, which was raised to suit. Below
+        # about 4 the arm simply cannot keep up with a hand moving at any pace,
+        # which reads as "it follows but always lags behind".
+        self.declare_parameter('max_step_deg', 5.0)
 
         # Probe settings. probe_deg is how far each joint is nudged to measure
         # its effect; big enough to produce clear image motion, small enough to
@@ -207,6 +276,24 @@ class VisualServoNode(Node):
         # that axis rather than centring it.
         self.declare_parameter('assumed_h_sign', 1.0)
         self.declare_parameter('assumed_v_sign', 1.0)
+        # Check those assumed signs against reality while tracking, and flip
+        # one if it is provably backwards.
+        #
+        # This is the probe's job done without the probe. Every jog is a tiny
+        # experiment whose result shows up in the next detection: we asked the
+        # image to move left by this much, did it? Correlating what was
+        # commanded against what was observed answers the sign question from
+        # the tracking motion itself, with no twitching phase and no guessing
+        # at the command line -- which is what you were doing by hand with
+        # assumed_h_sign:=-1.0.
+        #
+        # It also measures how far off assumed_deg_per_error is, and reports
+        # that, because a mounting can be the right way round and still be
+        # twice as responsive as assumed.
+        self.declare_parameter('auto_sign', True)
+        # Correlation samples to gather before trusting the verdict. Each
+        # sample is one detection, so ~25 is about three seconds of tracking.
+        self.declare_parameter('auto_sign_samples', 25)
         # +1 means extending the approach joint makes the hand look bigger.
         # 0 disables closing in without disabling centring.
         self.declare_parameter('assumed_approach_sign', 1.0)
@@ -273,6 +360,44 @@ class VisualServoNode(Node):
         self._gain = float(self.get_parameter('gain').value)
         self._deadband = float(self.get_parameter('deadband').value)
         self._rate = float(self.get_parameter('rate').value)
+        self._lag_comp = bool(self.get_parameter('lag_compensation').value)
+        self._command_lag = float(self.get_parameter('command_lag').value)
+        self._max_comp = float(self.get_parameter('max_compensation').value)
+        self._auto_sign = bool(self.get_parameter('auto_sign').value)
+        self._auto_sign_samples = int(
+            self.get_parameter('auto_sign_samples').value)
+
+        # Jogs published but not yet visible in a detection, as
+        # (ros_time_seconds, np.array([d_horizontal, d_vertical])). Kept in ROS
+        # time, not monotonic, because they get compared against image
+        # timestamps, which camera_node writes from the ROS clock.
+        self._sent: list[tuple[float, np.ndarray]] = []
+
+        # Forward image Jacobian: joint degrees -> image error. The inverse of
+        # _jinv, cached because the control law needs _jinv and the lag
+        # compensator needs this one, every cycle.
+        self._jfwd: np.ndarray | None = None
+
+        # Correlation accumulators for auto_sign, per axis:
+        #   _corr[i] = sum(predicted_change * observed_change)
+        #   _pmag[i] = sum(predicted_change ** 2)
+        # The ratio _corr/_pmag is a least-squares estimate of how much of the
+        # predicted image motion actually happened. Near +1 means the model is
+        # right; near -1 means that axis is inverted; near 0 means the joint is
+        # not steering that image direction at all.
+        self._corr = np.zeros(2, dtype=float)
+        self._pmag = np.zeros(2, dtype=float)
+        self._corr_n = 0
+        self._sign_verdict = [False, False]
+        # Previous accepted measurement, for computing observed image motion
+        # between one detection and the next: (ros_stamp, error array).
+        self._prev_meas: tuple[float, np.ndarray] | None = None
+
+        # Rolling pipeline statistics, so "it lags" stops being a guess.
+        self._lat_sum = 0.0
+        self._lat_n = 0
+        self._det_first = 0.0
+        self._det_count = 0
         self._timeout = float(self.get_parameter('target_timeout').value)
         self._max_step = float(self.get_parameter('max_step_deg').value)
         self._probe_deg = float(self.get_parameter('probe_deg').value)
@@ -335,6 +460,9 @@ class VisualServoNode(Node):
 
         self._last_point: tuple[float, float] | None = None
         self._last_point_time = 0.0
+        # ROS-clock timestamp of the frame the last detection came from, as
+        # opposed to _last_point_time, which is when the message arrived here.
+        self._last_point_stamp = 0.0
         # Timestamp of the measurement the control loop last acted on. The
         # loop runs faster than detections arrive, so without this it re-uses
         # the same reading for several iterations -- and since each correction
@@ -526,6 +654,25 @@ class VisualServoNode(Node):
         self._last_size_px = msg.point.z if msg.point.z > 0 else None
         self._last_point_time = time.monotonic()
 
+        # The frame's own timestamp, carried through by the tracker. This is
+        # what the lag compensator reasons in: it has to know WHEN the scene
+        # in this measurement was, not when the message showed up.
+        now_ros = self._ros_now()
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        # A zero or wildly-off stamp means nothing upstream is stamping
+        # properly; fall back to now, which degrades to no compensation
+        # rather than to nonsense compensation.
+        if not (0.0 < now_ros - stamp < 5.0):
+            stamp = now_ros
+        self._last_point_stamp = stamp
+
+        self._lat_sum += now_ros - stamp
+        self._lat_n += 1
+        if self._det_count == 0:
+            self._det_first = now_ros
+        self._det_count += 1
+        self._report_pipeline(now_ros)
+
     def _enable_cb(self, request, response):
         """Master on/off. Probing now happens on the SEARCHING -> TRACKING
         transition instead of here, so this is purely a kill switch: disabling
@@ -576,6 +723,66 @@ class VisualServoNode(Node):
                 return self._last_point
             time.sleep(0.05)
         return None
+
+    def _ros_now(self) -> float:
+        """ROS clock in seconds.
+
+        The lag compensator compares command times against image timestamps,
+        and camera_node stamps images from the ROS clock, so both sides of
+        that comparison have to live in the same clock. monotonic() is used
+        elsewhere for plain elapsed-time checks where it does not matter.
+        """
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _report_pipeline(self, now_ros: float) -> None:
+        """Say, in numbers, how fresh the data driving the arm actually is.
+
+        Everything about how hard this loop can push comes down to two
+        figures: how often a detection arrives, and how old it is when it
+        does. Tuning gain without knowing them is guesswork, and "it lags"
+        is not a measurement.
+        """
+        if self._det_count < 40:
+            return
+        span = now_ros - self._det_first
+        rate = self._det_count / span if span > 0 else 0.0
+        latency = self._lat_sum / max(self._lat_n, 1)
+        note = ''
+        # Note what is NOT suggested here: raising command_lag to match. A
+        # command_lag above the true lag makes the compensator double-count
+        # corrections that have already landed and reverse, which oscillates.
+        # Latency is a pipeline problem and wants a pipeline fix.
+        if rate < 6.0:
+            note = (' -- too few detections to track a moving hand; '
+                    'model_complexity:=0 and a smaller camera frame '
+                    'help most')
+        elif latency > 0.35:
+            note = (' -- stale enough to limit how fast the arm can safely '
+                    'follow; the fix is a faster pipeline, not a bigger '
+                    'command_lag')
+        self.get_logger().info(
+            f'pipeline: {rate:.1f} detections/s, frames {latency * 1000:.0f}ms '
+            f'old when acted on{note}')
+        self._det_count = 0
+        self._lat_sum = 0.0
+        self._lat_n = 0
+
+    def _record_sent(self, stamp: float, dh: float, dv: float) -> None:
+        """Remember a jog so the compensator knows it is still in flight."""
+        self._sent.append((stamp, np.array([dh, dv], dtype=float)))
+        # Anything older than a couple of lags has certainly landed and been
+        # seen; keeping it would just make the list grow without bound.
+        cutoff = stamp - max(2.0 * self._command_lag, 1.0)
+        if len(self._sent) > 4:
+            self._sent = [s for s in self._sent if s[0] >= cutoff]
+
+    def _sent_between(self, t0: float, t1: float) -> np.ndarray:
+        """Total commanded motion issued in (t0, t1]."""
+        total = np.zeros(2, dtype=float)
+        for when, delta in self._sent:
+            if t0 < when <= t1:
+                total += delta
+        return total
 
     def _send_jog(self, joint: str, delta_deg: float) -> None:
         msg = JointJog()
@@ -648,9 +855,9 @@ class VisualServoNode(Node):
         to discover. Skipping it buys immediate tracking at the cost of
         that guarantee.
         """
-        self._jinv = np.array(
+        self._set_jacobian(np.array(
             [[self._assumed_deg * self._assumed_h_sign, 0.0],
-             [0.0, self._assumed_deg * self._assumed_v_sign]], dtype=float)
+             [0.0, self._assumed_deg * self._assumed_v_sign]], dtype=float))
         self._approach_sign = (
             self._assumed_approach_sign if self._approach_enabled else 0.0)
         self._probed = True
@@ -756,7 +963,7 @@ class VisualServoNode(Node):
                 )
 
             # Scale to per-degree, since the probe used probe_deg steps.
-            self._jinv = np.linalg.inv(j) * self._probe_deg
+            self._set_jacobian(np.linalg.inv(j) * self._probe_deg)
 
             # Learn which way the approach joint changes apparent size. Only
             # the sign is needed: the magnitude varies with distance and pose,
@@ -786,6 +993,134 @@ class VisualServoNode(Node):
 
     # ---- Control loop ----
 
+    def _set_jacobian(self, jinv: np.ndarray) -> None:
+        """Install the image Jacobian and cache its forward direction.
+
+        _jinv answers "what joint motion corrects this image error", which is
+        what the control law wants. The lag compensator wants the opposite
+        question -- "what will this joint motion do to the image" -- and asking
+        it every cycle means inverting the same matrix fifteen times a second
+        forever. Invert once, here.
+        """
+        self._jinv = jinv
+        try:
+            self._jfwd = np.linalg.inv(jinv)
+        except np.linalg.LinAlgError:
+            self._jfwd = None
+            self.get_logger().warn(
+                'Image Jacobian is not invertible; lag compensation and the '
+                'sign check are both off for this lock.')
+        self._reset_sign_estimate()
+
+    def _reset_sign_estimate(self) -> None:
+        self._corr[:] = 0.0
+        self._pmag[:] = 0.0
+        self._corr_n = 0
+        self._prev_meas = None
+
+    def _update_sign_estimate(self, stamp: float, error: np.ndarray) -> None:
+        """Score what the last jog was predicted to do against what it did.
+
+        Each detection closes the loop on the jogs issued one command_lag
+        before it: those are the ones whose effect this frame is the first to
+        show. Regressing observed image motion on predicted image motion gives
+        a scale factor per axis -- about +1 if the model is right, about -1 if
+        that axis is wired backwards, about 0 if the joint does not move the
+        image that way at all.
+
+        Hand motion is the noise here, and it is not small. That is why this
+        accumulates over dozens of detections before saying anything: over a
+        few seconds the commanded motion correlates with the image and a
+        waving hand does not.
+        """
+        prev = self._prev_meas
+        self._prev_meas = (stamp, error.copy())
+        if prev is None or self._jfwd is None:
+            return
+        prev_stamp, prev_error = prev
+        # Jogs that landed between the two frames, shifted by the lag.
+        commanded = self._sent_between(prev_stamp - self._command_lag,
+                                       stamp - self._command_lag)
+        if not np.any(commanded):
+            return
+        predicted = self._jfwd @ commanded
+        observed = error - prev_error
+
+        self._corr += predicted * observed
+        self._pmag += predicted * predicted
+        self._corr_n += 1
+
+        if self._corr_n < self._auto_sign_samples:
+            return
+
+        for i, (axis, param) in enumerate(
+                (('horizontal', 'assumed_h_sign'),
+                 ('vertical', 'assumed_v_sign'))):
+            if self._pmag[i] < 1e-6 or self._sign_verdict[i]:
+                continue
+            ratio = self._corr[i] / self._pmag[i]
+            if ratio < -0.25:
+                # Backwards, and confidently so. Flip it and carry on rather
+                # than printing an instruction and continuing to misbehave --
+                # the whole point of measuring is not having to relaunch.
+                flip = np.array([1.0, 1.0])
+                flip[i] = -1.0
+                self._set_jacobian(self._jinv * flip[:, None])
+                self._sign_verdict[i] = True
+                self.get_logger().warn(
+                    f'The {axis} axis is inverted (measured response '
+                    f'{ratio:+.2f}x of predicted over {self._corr_n} '
+                    f'detections) -- flipping it now. Launch with '
+                    f'{param}:={-(self._assumed_v_sign if i else self._assumed_h_sign):+.0f} '
+                    f'to start out correct next time.')
+                return
+            if abs(ratio) < 0.15:
+                self.get_logger().warn(
+                    f'The {axis} axis barely responds to its joint (measured '
+                    f'{ratio:+.2f}x of predicted). Either the camera is '
+                    f'mounted rotated, so the two axes are swapped, or that '
+                    f'joint cannot move from this pose. skip_probe:=false '
+                    f'measures the mounting properly.',
+                    throttle_duration_sec=20.0)
+            elif not 0.6 < ratio < 1.6:
+                suggested = self._assumed_deg / max(ratio, 0.2)
+                self.get_logger().info(
+                    f'The {axis} axis responds {ratio:.2f}x as strongly as '
+                    f'assumed -- tracking works but is '
+                    f'{"under" if ratio < 1 else "over"}-damped. '
+                    f'assumed_deg_per_error:={suggested:.0f} would match it.',
+                    throttle_duration_sec=30.0)
+        self._reset_sign_estimate()
+
+    def _compensate(self, stamp: float, error: np.ndarray) -> np.ndarray:
+        """Estimate the error NOW from a measurement of the error THEN.
+
+        This measurement describes the scene at `stamp`. Every jog published
+        since `stamp - command_lag` is motion the arm is making, or is about
+        to make, that this frame cannot possibly show yet. Predict what those
+        will do to the image and add it in; what comes out is where the hand
+        will be by the time the next correction could act on it.
+
+        Without this the loop re-commands corrections that are already on
+        their way, which is overshoot by construction and shows up as the arm
+        flicking back and forth past the target.
+        """
+        if not self._lag_comp or self._jfwd is None:
+            return error
+        in_flight = self._sent_between(stamp - self._command_lag,
+                                       float('inf'))
+        if not np.any(in_flight):
+            return error
+        adjust = self._jfwd @ in_flight
+        # Bounded, because this is open loop. If a jog was clamped by the
+        # driver, rejected while the link was down, or blocked by a joint
+        # limit, the prediction is simply wrong, and a wrong prediction with
+        # no ceiling drives the arm off on its own.
+        norm = float(np.linalg.norm(adjust))
+        if norm > self._max_comp:
+            adjust = adjust * (self._max_comp / norm)
+        return error + adjust
+
     def _reset_tracking(self) -> None:
         """Drop the diagnostics that only mean anything within one lock.
 
@@ -795,8 +1130,15 @@ class VisualServoNode(Node):
         convergence history behind the sign/axis warnings: carrying it across
         a lost target would compare errors from two different attempts and
         report a runaway that never happened.
+
+        The in-flight command list goes too. Between one lock and the next the
+        arm may have swept, homed, or sat still for a minute; predicting the
+        image effect of jogs from before all that is worse than not predicting
+        at all.
         """
         self._growing = [0, 0]
+        self._sent.clear()
+        self._prev_meas = None
         self._stuck = [0, 0]
         self._best_abs_err = [float('inf'), float('inf')]
         self._prev_abs_err = None
@@ -1034,13 +1376,35 @@ class VisualServoNode(Node):
         # reading three times running answers "no" three times over, which is
         # how the old build reported a stuck axis on a loop that was tracking
         # fine. One sighting, one verdict.
-        self._check_sign(ex, ey)
+        #
+        # Skipped entirely when auto_sign is doing the same job properly.
+        # These heuristics infer a bad sign from the error failing to shrink,
+        # which a hand moving away from the arm also produces; the correlation
+        # check measures the response directly. Running both means two
+        # verdicts that can disagree, and the weaker one shouting first.
+        if not (self._auto_sign and self._skip_probe):
+            self._check_sign(ex, ey)
 
-        if math.hypot(ex, ey) < self._deadband:
+        measured = np.array([ex, ey], dtype=float)
+        stamp = self._last_point_stamp
+
+        # Score the last jog against what the image actually did, and flip an
+        # axis if it turns out to be wired backwards. Only meaningful when the
+        # mounting was assumed: after a real probe the Jacobian is measured,
+        # off-diagonal, and this per-axis pairing no longer holds.
+        if self._auto_sign and self._skip_probe:
+            self._update_sign_estimate(stamp, measured)
+
+        # Correct for where the hand will be once the jogs already in flight
+        # have landed, not where it was when this frame was captured.
+        error = self._compensate(stamp, measured)
+        ce = float(np.linalg.norm(error))
+
+        if ce < self._deadband:
             # Being centred is success, not a fault -- but it looks identical
             # to a dead loop from outside, so say so.
             self.get_logger().info(
-                f'On target (error {math.hypot(ex, ey):.3f} < deadband '
+                f'On target (error {ce:.3f} < deadband '
                 f'{self._deadband}); holding.',
                 throttle_duration_sec=5.0)
             # Centred is NOT done. Approach runs on its own axis and its own
@@ -1058,14 +1422,22 @@ class VisualServoNode(Node):
         # Proportional, and only proportional. _jinv maps a unit image error
         # to the joint motion that would fully correct it -- either measured by
         # the probe or assumed from the camera geometry -- and gain takes a
-        # fraction of that so the loop converges without overshooting through
-        # its own dead time. Negated because we drive the error toward zero.
-        error = np.array([ex, ey], dtype=float)
+        # fraction of that. `error` here is already lag-compensated, which is
+        # what lets the fraction be large enough to feel responsive instead of
+        # small enough to survive its own delay. Negated because we drive the
+        # error toward zero.
         delta = self._jinv @ (self._gain * error) * -1.0
         dh, dv = float(delta[0]), float(delta[1])
 
         dh = max(-self._max_step, min(self._max_step, dh))
         dv = max(-self._max_step, min(self._max_step, dv))
+
+        # Record the CLAMPED values, and record them before publishing. These
+        # are what the arm will actually be asked to do, so these are what the
+        # next compensation has to subtract; logging the unclamped intent here
+        # would have the compensator predicting motion that never happens and
+        # steadily under-driving the arm.
+        self._record_sent(self._ros_now(), dh, dv)
 
         names = [self._h_joint, self._v_joint]
         deltas = [dh, dv]
@@ -1091,10 +1463,20 @@ class VisualServoNode(Node):
             frac = self._last_size_px / float(self._width)
             size_note = f' size={frac:.2f}/{self._target_size:.2f}'
 
+        # Both errors, because the difference between them is the whole story
+        # when tracking misbehaves: `seen` is what the camera reported, `now`
+        # is that corrected for jogs still in flight. If they are far apart the
+        # arm is chasing a lot of stale motion and command_lag matters; if they
+        # are identical the compensator is doing nothing and something upstream
+        # (image timestamps, a dead link) is why.
+        comp_note = ''
+        if self._lag_comp and not np.allclose(error, (ex, ey), atol=1e-3):
+            comp_note = f' now=({error[0]:+.3f},{error[1]:+.3f})'
+
         # If this logs but the arm does not move, the jog is being rejected by
         # the driver -- check the driver's console, which now says why.
         self.get_logger().info(
-            f'err=({ex:+.3f},{ey:+.3f}){size_note} -> '
+            f'seen=({ex:+.3f},{ey:+.3f}){comp_note}{size_note} -> '
             + ' '.join(f'{n}{d:+.2f}' for n, d in zip(names, deltas)),
             throttle_duration_sec=2.0)
 

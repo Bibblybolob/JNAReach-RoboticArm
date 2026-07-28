@@ -134,7 +134,13 @@ class MyCobotHardwareNode(Node):
         # --- Jogging (visual servoing) ---
         # Largest displacement honoured in a single JointJog, in degrees. A
         # spurious detection should nudge the arm, not fling it.
-        self.declare_parameter('max_jog_deg', 3.0)
+        #
+        # It is also the hard ceiling on visual tracking speed, which is why
+        # it is 5 and not 3: the servo can only send one jog per detection,
+        # so at ~8 detections a second this cap times that rate is the fastest
+        # the camera can ever slew. At 3 that was 24 deg/s, slower than a hand
+        # moves casually, and the arm could not do anything but trail behind.
+        self.declare_parameter('max_jog_deg', 5.0)
         self.declare_parameter('jog_speed', 40)
         # Size each jog's speed to the size of that jog, exactly as trajectory
         # streaming does. A fixed speed is wrong here for the same reason it is
@@ -152,7 +158,13 @@ class MyCobotHardwareNode(Node):
         # jogs used before adaptive speed existed, and a joint holding the
         # camera against gravity simply does not move at 15. Keep the floor
         # at what used to work and let adaptive only ever speed things up.
-        self.declare_parameter('min_jog_speed', 40)
+        #
+        # Raised to 60 for visual tracking. This floor sets how long a jog
+        # takes to complete, and that time is dead time in the servo loop --
+        # the arm is still travelling while the next detections come in
+        # describing a scene it has already left. Finishing each step sooner
+        # is a direct reduction in the lag the servo has to predict around.
+        self.declare_parameter('min_jog_speed', 60)
         # Seconds of no jogging before the jog base is resynced from a hardware
         # read. Jogs chain off the *commanded* pose so they compound; a
         # measurement taken while the arm is still travelling to the last

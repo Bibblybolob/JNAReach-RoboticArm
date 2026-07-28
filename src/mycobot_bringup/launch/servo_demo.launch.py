@@ -38,22 +38,38 @@ assumed_v_sign:=-1.0. Pass skip_probe:=false to measure the mounting instead,
 which is slower (a few seconds of twitching, hold your hand still) but correct
 for any orientation.
 
-Tracking is plain proportional control: each sighting moves the camera a
-fixed FRACTION of the way to having the hand centred, and nothing accumulates
-between sightings. `gain` IS that fraction (0.3 by default, not degrees), and
-it is the only tuning knob that matters. The camera pipeline is slow enough
-that a correction is still in flight when the next two or three detections
-arrive reporting the old error, so a gain near 1.0 commands the same
-correction repeatedly and oscillates -- which is exactly what the previous PID
-version did.
+Tracking is proportional control with lag compensation, and no PID. Each
+sighting moves the camera a FRACTION of the way to having the hand centred --
+`gain`, 0.7 by default, not degrees. On its own a fraction that large would
+oscillate, because the camera pipeline is slow enough that two or three more
+detections arrive reporting the old error while a correction is still in
+flight, and the loop would re-command it every time. So the node remembers
+every jog it sends and adds back the image motion those jogs have not
+produced yet, correcting where the hand WILL be rather than where it was.
+That is what makes 0.7 safe where the old PID at an effective 1.4 flicked
+back and forth forever.
+
+Signs are worked out automatically now: auto_sign correlates what each jog was
+predicted to do to the image against what it did, and flips an inverted axis
+on its own. assumed_h_sign / assumed_v_sign are still there, but you should
+not have to reach for them.
 
 Closing in on the hand is OFF by default while tracking is being tuned. Turn
 it back on with approach_enabled:=true.
 
+If it still lags, watch the two report lines -- `tracker:` and `pipeline:` --
+which give detections per second and how stale each one is. Below ~6/s
+nothing tuned in the servo will help; use model_complexity:=0 and a smaller
+camera frame.
+
 Useful arguments:
     robot_ip:=192.168.0.15         Pi address
-    gain:=0.45                     follow harder (0.3 default); 0.2 if it hunts
-    deadband:=0.03                 sit nearer dead centre (0.05 default)
+    gain:=0.9                      follow harder still (0.7 default)
+    max_step_deg:=7.0              raise the top slew speed
+    command_lag:=0.10              if it overshoots; NEVER raise it far
+    lag_compensation:=false        back to plain P (then use gain:=0.3)
+    deadband:=0.02                 sit nearer dead centre (0.04 default)
+    target_landmark:=8             steer at the index fingertip, not the palm
     lost_timeout:=30.0             longer grace before homing
     approach_enabled:=true         close in as well as centring
     target_size_fraction:=0.55     closer approach (0.45 default)
@@ -97,12 +113,34 @@ def generate_launch_description():
         description='Drive to the home pose once on startup, so the arm sits '
                     'at a known position until you trigger a hunt')
     gain_arg = DeclareLaunchArgument(
-        'gain', default_value='0.3',
+        'gain', default_value='0.7',
         description='Fraction of the full centring correction to apply each '
-                    'time the hand is seen. Not degrees: 0.3 means "move a '
-                    'third of the way to centred". Raise toward 0.5 if it '
-                    'feels sluggish, lower toward 0.2 if it hunts. This is '
-                    'the only gain -- there is no PID any more')
+                    'time the hand is seen. Not degrees: 0.7 means "move '
+                    'seventy percent of the way to centred". Safe this high '
+                    'only because of lag compensation; turn that off and '
+                    'anything above 0.35 oscillates')
+    command_lag_arg = DeclareLaunchArgument(
+        'command_lag', default_value='0.15',
+        description='Seconds from sending a jog to seeing it in a frame. '
+                    'Keep BELOW the true lag: too low just corrects a little '
+                    'harder, too high makes the compensator double-count '
+                    'landed jogs and reverse, which is the flicking it '
+                    'exists to prevent')
+    lag_comp_arg = DeclareLaunchArgument(
+        'lag_compensation', default_value='true',
+        description='Predict where the hand will be once jogs already sent '
+                    'have landed, instead of correcting where it was. If you '
+                    'turn this off, drop gain to 0.3 as well')
+    max_step_arg = DeclareLaunchArgument(
+        'max_step_deg', default_value='5.0',
+        description='Biggest single jog. Times the detection rate, this is '
+                    'the top speed the camera can slew, so it is the cap on '
+                    'how fast a moving hand can be followed')
+    auto_sign_arg = DeclareLaunchArgument(
+        'auto_sign', default_value='true',
+        description='Work out from the tracking motion itself whether an '
+                    'axis is inverted, and flip it. Replaces guessing at '
+                    'assumed_h_sign / assumed_v_sign by hand')
     deg_per_error_arg = DeclareLaunchArgument(
         'assumed_deg_per_error', default_value='25.0',
         description='Degrees of joint motion that would fully centre a target '
@@ -110,7 +148,7 @@ def generate_launch_description():
                     'view. Geometry, not tuning; change it only if the lens '
                     'is unusually wide or narrow')
     deadband_arg = DeclareLaunchArgument(
-        'deadband', default_value='0.05',
+        'deadband', default_value='0.04',
         description='Image error below which the arm holds still. 0.05 is a '
                     'hand comfortably in the middle of the picture. Raise it '
                     'if the arm buzzes, lower it to sit nearer dead centre')
@@ -120,6 +158,19 @@ def generate_launch_description():
                     'CPU-bound host fresher detections smooth the servo loop '
                     'more than extra landmark precision does. Use 1 if you '
                     'have GPU inference')
+    target_landmark_arg = DeclareLaunchArgument(
+        'target_landmark', default_value='9',
+        description='MediaPipe landmark to steer at. 9 is the middle-finger '
+                    'knuckle, i.e. the centre of the palm, and is the '
+                    'steadiest point on a hand because it does not move when '
+                    'fingers flex. 8 is the index fingertip -- more precise '
+                    'to point with, but it makes the arm chase finger jitter')
+    max_frame_age_arg = DeclareLaunchArgument(
+        'max_frame_age', default_value='0.12',
+        description='Drop camera frames already older than this instead of '
+                    'tracking on them. A stale detection describes a place '
+                    'the hand has left; skipping it costs one detection and '
+                    'recovers the whole delay. 0 disables')
     show_window_arg = DeclareLaunchArgument(
         'show_window', default_value='false',
         description='Open an OpenCV window from the tracker (needs a display)')
@@ -190,6 +241,8 @@ def generate_launch_description():
             # you are actually looking at the window.
             'publish_annotated': LaunchConfiguration('show_window'),
             'model_complexity': LaunchConfiguration('model_complexity'),
+            'target_landmark': LaunchConfiguration('target_landmark'),
+            'max_frame_age': LaunchConfiguration('max_frame_age'),
         }],
         output='screen',
         respawn=True,
@@ -204,6 +257,10 @@ def generate_launch_description():
             'gain': LaunchConfiguration('gain'),
             'assumed_deg_per_error': LaunchConfiguration('assumed_deg_per_error'),
             'deadband': LaunchConfiguration('deadband'),
+            'lag_compensation': LaunchConfiguration('lag_compensation'),
+            'command_lag': LaunchConfiguration('command_lag'),
+            'max_step_deg': LaunchConfiguration('max_step_deg'),
+            'auto_sign': LaunchConfiguration('auto_sign'),
             'lost_timeout': LaunchConfiguration('lost_timeout'),
             'target_size_fraction': LaunchConfiguration('target_size_fraction'),
             'approach_enabled': LaunchConfiguration('approach_enabled'),
@@ -226,9 +283,15 @@ def generate_launch_description():
         stream_read_timeout_arg,
         home_on_start_arg,
         gain_arg,
+        command_lag_arg,
+        lag_comp_arg,
+        max_step_arg,
+        auto_sign_arg,
         deg_per_error_arg,
         deadband_arg,
         model_complexity_arg,
+        target_landmark_arg,
+        max_frame_age_arg,
         show_window_arg,
         lost_timeout_arg,
         target_size_arg,

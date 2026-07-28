@@ -126,6 +126,23 @@ class HandTrackerNode(Node):
         # model -- fresher data beats more accurate stale data in a control
         # loop. Raise to 1 if you have GPU inference or a fast host.
         self.declare_parameter('model_complexity', 1)
+        # Skip frames that are already stale by the time we get to them.
+        #
+        # MediaPipe on a CPU is slower than the camera, so frames queue up
+        # behind it. Processing a queued frame produces a detection that was
+        # true a third of a second ago, and a servo loop acting on that is
+        # correcting a position the hand has already left. Dropping it and
+        # taking the next one costs a detection and buys back the whole delay:
+        # in a control loop, fresher beats more.
+        #
+        # Set to 0 to disable, and watch the 'tracker:' line to see how many
+        # frames this is actually discarding.
+        self.declare_parameter('max_frame_age', 0.12)
+        # ...but never starve the loop. If every frame is arriving stale --
+        # a badly overloaded host, or clocks that disagree -- dropping them
+        # all means publishing nothing at all, which is far worse than
+        # publishing something late. Process one regardless after this long.
+        self.declare_parameter('starvation_timeout', 0.4)
 
         self._image_topic = self.get_parameter('image_topic').value
         self._info_topic = self.get_parameter('camera_info_topic').value
@@ -157,6 +174,17 @@ class HandTrackerNode(Node):
         self._warned_no_intrinsics = False
 
         self._smoothed_px: tuple[float, float] | None = None
+
+        self._max_frame_age = float(self.get_parameter('max_frame_age').value)
+        self._starvation = float(self.get_parameter('starvation_timeout').value)
+        self._last_processed = 0.0
+        # Rolling counters for the periodic 'tracker:' report.
+        self._n_seen = 0
+        self._n_dropped = 0
+        self._n_processed = 0
+        self._age_sum = 0.0
+        self._proc_sum = 0.0
+        self._report_since = 0.0
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -234,7 +262,58 @@ class HandTrackerNode(Node):
 
     # ---- Main callback ----
 
+    def _now(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _report(self, now: float) -> None:
+        """Publish the numbers that decide how fast the servo can track.
+
+        Detection rate and frame age are the two limits on the whole system,
+        and neither is visible from anywhere else. Without them, "it lags" is
+        a feeling; with them it is either a slow camera, a slow model, or a
+        slow arm, and those have different fixes.
+        """
+        if self._report_since == 0.0:
+            self._report_since = now
+            return
+        span = now - self._report_since
+        if span < 10.0:
+            return
+        rate = self._n_processed / span
+        age = self._age_sum / max(self._n_processed, 1)
+        proc = self._proc_sum / max(self._n_processed, 1)
+        note = ''
+        if rate < 6.0:
+            note = (' -- too slow to track a moving hand; try '
+                    'model_complexity:=0, or a smaller camera frame')
+        self.get_logger().info(
+            f'tracker: {rate:.1f} detections/s, {proc * 1000:.0f}ms per frame, '
+            f'{age * 1000:.0f}ms old on arrival, dropped {self._n_dropped} '
+            f'stale of {self._n_seen}{note}')
+        self._report_since = now
+        self._n_seen = self._n_dropped = self._n_processed = 0
+        self._age_sum = self._proc_sum = 0.0
+
     def _image_cb(self, msg: Image) -> None:
+        now = self._now()
+        self._n_seen += 1
+        self._report(now)
+
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        age = now - stamp
+        # A negative or absurd age means the stamp is not usable -- treat the
+        # frame as fresh rather than dropping every frame forever on the
+        # strength of a bad clock.
+        if not (0.0 <= age < 5.0):
+            age = 0.0
+        if (self._max_frame_age > 0.0
+                and age > self._max_frame_age
+                and now - self._last_processed < self._starvation):
+            self._n_dropped += 1
+            return
+        self._last_processed = now
+        self._age_sum += age
+
         try:
             frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
@@ -245,7 +324,10 @@ class HandTrackerNode(Node):
         # MediaPipe wants RGB; mark the buffer read-only so it can avoid a copy.
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
+        t0 = self._now()
         results = self._hands.process(rgb)
+        self._proc_sum += self._now() - t0
+        self._n_processed += 1
 
         annotated = frame if self._publish_annotated or self._show_window else None
 

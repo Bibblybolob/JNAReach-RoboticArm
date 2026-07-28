@@ -213,26 +213,67 @@ Useful overrides:
 
 | Argument | Default | Effect |
 |---|---|---|
-| `gain` | 0.3 | **fraction** of the full centring correction per sighting, not degrees; raise toward 0.5 to follow harder, lower toward 0.2 if it hunts |
-| `deadband` | 0.05 | image error it stops correcting below; lower to sit nearer dead centre |
+| `gain` | 0.7 | **fraction** of the full centring correction per sighting, not degrees; raise toward 0.9 to follow harder |
+| `max_step_deg` | 5.0 | biggest single jog; times the detection rate, this caps how fast the camera can slew |
+| `command_lag` | 0.15 | seconds from sending a jog to seeing it; **keep below the true lag** — see below |
+| `lag_compensation` | true | predict where the hand will be once sent jogs land; turn off only with `gain:=0.3` |
+| `auto_sign` | true | detect and flip an inverted axis from the tracking motion itself |
+| `deadband` | 0.04 | image error it stops correcting below; lower to sit nearer dead centre |
 | `assumed_deg_per_error` | 25.0 | degrees that would fully centre a frame-edge target ≈ half the camera FOV; geometry, not tuning |
+| `target_landmark` | 9 | palm centre; `8` steers at the index fingertip instead |
+| `max_frame_age` | 0.12 | drop camera frames already staler than this rather than tracking on them |
 | `lost_timeout` | 15.0 | seconds before giving up and homing |
 | `target_size_fraction` | 0.45 | how close to get; higher is closer |
 | `approach_enabled` | false | set true to close in as well as centring |
 | `search_on_start` | false | start hunting without the trigger |
 | `show_window` | false | OpenCV window from the tracker |
 
-**There is no PID.** Tracking is plain proportional control: each time the hand
-is seen, the camera moves a fixed fraction of the way to having it centred, and
-nothing carries over between sightings. That is deliberate. The pipeline —
-capture on the Pi, JPEG over the network, decode, MediaPipe on CPU, then a jog
-the arm takes time to execute — puts several tenths of a second between an
-observation and the camera finishing its response to it. During that gap
-detections keep arriving reporting the *old* error. An integral term winds up
-across exactly that interval, and any gain near 1.0 commands the same
-correction two or three times over: the arm sails past centre, comes back, and
-oscillates without ever settling. Keeping the per-sighting fraction well under
-1.0 and holding no state is what makes it converge.
+**There is no PID.** Tracking is proportional control plus a model of the
+loop's own delay. Each time the hand is seen, the camera moves a fixed
+*fraction* of the way to having it centred; nothing accumulates between
+sightings.
+
+The reason is dead time. Capture on the Pi, JPEG over the network, decode,
+MediaPipe on CPU, then a jog the arm takes time to execute — several tenths of
+a second pass between an observation and the camera finishing its response to
+it, and detections keep arriving during that gap still reporting the *old*
+error. Re-commanding a correction that is already on its way is overshoot by
+construction: the arm sails past centre, comes back, and oscillates. An
+integral term winds up across exactly that interval and makes it worse.
+
+Backing the gain off to 0.3 stops the oscillation but makes the arm trail a
+moving hand. So instead the node remembers every jog it sends and, on each
+detection, adds back the image motion those jogs have not produced yet —
+correcting where the hand *will* be rather than where it was. Simulating the
+pipeline (`src/mycobot_perception/test/`, and the notes in
+`visual_servo_node.py`):
+
+| | settles |
+|---|---|
+| gain 1.44, no compensation — the original PID | never |
+| gain 0.30, no compensation | 1.3 s |
+| gain 0.70, no compensation | never |
+| gain 0.70, with compensation | 0.7 s |
+
+**`command_lag` is asymmetric — set it low.** Too low is harmless: some
+in-flight motion goes uncounted and the loop corrects a little harder than
+needed. Too high is not: the window sweeps in jogs that have *already* landed
+and are already visible in the measurement, the compensator counts them twice,
+decides it overshot, and reverses — which is the flicking it exists to
+prevent. In simulation, 0.35 s and above oscillates at every gain above 0.3,
+while 0.10–0.15 is stable from gain 0.5 to 1.1. A slow pipeline is not a
+reason to raise it; it is a reason to fix the pipeline.
+
+**If it still lags,** read the two report lines rather than guessing:
+
+```
+tracker:  8.4 detections/s, 91ms per frame, 40ms old on arrival, dropped 12 stale of 118
+pipeline: 8.4 detections/s, frames 63ms old when acted on
+```
+
+Below ~6 detections/s nothing tuned in the servo will help — the arm simply
+is not being told where the hand is often enough. `model_complexity:=0` and a
+smaller camera frame are the two things that move that number.
 
 ### MoveIt2 planning and RViz
 

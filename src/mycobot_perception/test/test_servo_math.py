@@ -141,6 +141,44 @@ def test_a_flipped_sign_reverses_the_correction():
     assert np.allclose(a, -b)
 
 
+# --- Gain profile -----------------------------------------------------------
+#
+# "Faster the farther out, slower as it closes in". The far half of that is
+# not available -- max_step_deg clamps every error past 0.29 -- so the shape
+# that matters is the near half backing off.
+
+def _eff(gain, k, err):
+    return gain * (1.0 + k * abs(err))
+
+
+def test_the_gain_rises_with_distance_from_centre():
+    for near, far in ((0.05, 0.15), (0.15, 0.29), (0.29, 0.8)):
+        assert _eff(0.45, 2.0, near) < _eff(0.45, 2.0, far)
+
+
+def test_the_profile_meets_the_old_flat_gain_where_the_clamp_starts():
+    """The far field must be unchanged from the flat 0.7 it replaced: past
+    the clamp point the step is capped anyway, so any difference there is
+    cosmetic, and below it the profile must be GENTLER, not hotter."""
+    clamp_err = 5.0 / (0.7 * DEG)          # 0.286
+    assert abs(_eff(0.45, 2.0, clamp_err) - 0.7) < 0.02
+    assert _eff(0.45, 2.0, 0.05) < 0.7
+    assert _eff(0.45, 2.0, 0.15) < 0.7
+
+
+def test_zero_progressive_gain_is_a_flat_gain():
+    for e in (0.0, 0.1, 0.5, 1.0):
+        assert _eff(0.6, 0.0, e) == 0.6
+
+
+def test_the_step_is_still_monotonic_in_the_error():
+    """Superlinear must not mean non-monotonic: a hand farther out must never
+    get a SMALLER jog than one closer in."""
+    steps = [min(_eff(0.45, 2.0, e) * e * DEG, 5.0)
+             for e in np.arange(0.0, 1.01, 0.01)]
+    assert all(b >= a - 1e-9 for a, b in zip(steps, steps[1:]))
+
+
 # --- Per-axis correction scale ----------------------------------------------
 #
 # assumed_deg_per_error was one number for both axes. It should not be: the

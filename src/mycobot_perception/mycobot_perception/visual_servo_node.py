@@ -134,11 +134,43 @@ compensator counts them twice, decides it has overshot, and reverses. That
 reversal is a flicking oscillation, which is the thing being fixed. So it sits
 at 0.15 against a true lag nearer 0.25, deliberately.
 
+THE GAIN IS A PROFILE, NOT A NUMBER
+
+"Move faster the farther the hand is from centre, slower as it closes in" is
+what proportional control already does -- but only out to error 0.29, because
+max_step_deg caps the step at 5 degrees and every error past 91px of a
+640-wide frame (69px vertically) commands that same maximum. The far half of
+that ask is not available: the arm's own joint speed binds before the clamp
+does, and the error falls 0.80, 0.60, 0.40, 0.20 over the first half second at
+every gain and every clamp setting tried.
+
+The half that IS available is backing off near the centre, and it turns out to
+be worth more than the far half would have been. `gain` is now the gain at the
+centre (0.45) and `progressive_gain` (2.0) raises it with distance, meeting
+0.7 -- the old flat value -- exactly where the clamp takes over:
+
+     10px from centre   eff gain 0.47   0.4 deg
+     64px               0.62            3.1
+     91px               0.70            5.0   <- clamp from here out
+    256px               1.16            5.0
+
+Against that flat 0.7, from a hand appearing at error 0.8: acquisition
+1.18s -> 0.67s, residual 6px -> 2px, and the error stops changing sign in the
+tail altogether (8.9 reversals -> 0). Faster and steadier at once, because the
+loop no longer arrives at the centre carrying more speed than it can shed
+inside the dead time.
+
+It costs a little on a hand moving steadily -- 50px -> 56px at a moderate
+pace, since the near field it damps is where a tracked hand sits. `lead_time`
+is the term for moving hands; this one is for arriving and staying.
+
 The remaining knobs, in the order worth touching them:
 
     lead_time          0.15   how far ahead of a moving hand to aim; the one
                               that decides centred vs merely in frame
-    gain                0.7   fraction of the full correction per detection
+    gain               0.45   fraction of the full correction, AT THE CENTRE
+    progressive_gain    2.0   how fast that fraction grows with distance;
+                              keep gain * (1 + this * 0.29) near 0.7
     max_step_deg        5.0   ceiling on one jog; with the detection rate,
                               this sets the top speed the camera can slew,
                               and must not exceed the driver's max_jog_deg.
@@ -254,33 +286,49 @@ class VisualServoNode(Node):
         # re-commanded by every detection that arrives before they land, and
         # anything above about 0.35 oscillates. With it, the loop subtracts
         # what it has already asked for and can afford to be decisive.
-        self.declare_parameter('gain', 0.7)
+        # NOT the whole gain any more -- this is the gain at the CENTRE, and
+        # progressive_gain below raises it with distance. 0.45 here with
+        # progressive_gain 2.0 gives an effective 0.7 at the point where
+        # max_step_deg starts clamping, so the far field is unchanged from
+        # when this was a flat 0.7 and only the endgame is gentler.
+        self.declare_parameter('gain', 0.45)
         # Make the correction grow FASTER than the error does:
         #
         #     effective gain = gain * (1 + progressive_gain * |error|)
         #
-        # 0 is plain proportional, which is already "the farther out, the
-        # bigger the jog" -- the step is linear in the error. This makes it
-        # superlinear, so a hand at the frame edge is chased proportionally
-        # harder than one just off centre.
+        # 0 is plain proportional. That is already "farther out means a bigger
+        # jog" -- the step is linear in the error -- but only out to error
+        # 0.29 (91px of a 640-wide frame, 69px vertically), because
+        # max_step_deg clamps the step at 5 degrees and everything beyond that
+        # commands the same maximum. So the useful half of "far fast, near
+        # slow" is not the far half. It is the near half.
         #
-        # It defaults to 0 because measurement says it does not help, and the
-        # reason is worth knowing before turning it on. At gain 0.7 and 25
-        # deg/unit the loop asks for 17.5 * error degrees, and max_step_deg
-        # clamps that at 5 -- so everything past error 0.29 (91px of a 640
-        # frame) is ALREADY commanding the maximum. Simulated from a hand
-        # appearing at error 0.8, the error falls 0.80, 0.60, 0.40, 0.20 for
-        # the first half-second at every gain and every progressive_gain
-        # setting tried, because the whole far-field approach is clamp- and
-        # arm-rate-limited rather than gain-limited. What changes is the
-        # endgame: at k=1 and above the loop arrives carrying more speed than
-        # it can shed inside the dead time and rings instead of settling,
-        # turning a 0.8s acquisition into one that never converges.
+        # At the defaults the profile runs:
         #
-        # Left in because a simulation is not hardware and this is cheap to
-        # try: raise it, watch whether `seen=` settles or starts alternating
-        # sign, and trust the arm over the model.
-        self.declare_parameter('progressive_gain', 0.0)
+        #     10px from centre   eff gain 0.47   0.4 deg
+        #     32px               0.53            1.3
+        #     64px               0.62            3.1
+        #     91px               0.70            5.0  <- clamp from here out
+        #    256px               1.16            5.0
+        #
+        # Measured from a hand appearing at error 0.8, against the flat
+        # gain 0.7 this replaces: acquisition 1.18s -> 0.67s, residual 6px ->
+        # 2px, and the sign of the error stops alternating altogether (8.9
+        # reversals in the tail -> 0). Faster AND steadier, because the loop
+        # no longer arrives at the centre carrying more speed than it can shed
+        # inside the dead time.
+        #
+        # An earlier pass concluded this did not help. That pass added the
+        # curve ON TOP of gain 0.7 rather than reprofiling around it, so the
+        # near field got hotter instead of cooler and it rang -- the opposite
+        # of the point. Keep gain * (1 + progressive_gain * 0.29) near 0.7
+        # when changing either number.
+        #
+        # It costs a little on a hand that is moving steadily: mean offset
+        # 50px -> 56px at a moderate pace, because the near field it damps is
+        # exactly where a tracked hand sits. lead_time is the term that
+        # addresses moving hands; this one addresses arriving and staying.
+        self.declare_parameter('progressive_gain', 2.0)
         # --- Lag compensation ---
         # The one change that lets this track fast instead of carefully.
         #

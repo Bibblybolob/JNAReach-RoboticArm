@@ -40,7 +40,11 @@ for any orientation.
 
 Tracking is proportional control with lag compensation, and no PID. Each
 sighting moves the camera a FRACTION of the way to having the hand centred --
-`gain`, 0.7 by default, not degrees. On its own a fraction that large would
+`gain`, not degrees. That fraction is not flat: it is 0.45 at the centre of
+the frame and rises with distance (`progressive_gain`), reaching 0.7 at the
+point where the step clamp takes over, so the arm is gentle when the hand is
+nearly centred and at full authority when it is not. On its own a fraction
+that large would
 oscillate, because the camera pipeline is slow enough that two or three more
 detections arrive reporting the old error while a correction is still in
 flight, and the loop would re-command it every time. So the node remembers
@@ -77,15 +81,19 @@ which give detections per second and how stale each one is. Below ~6/s
 nothing tuned in the servo will help; use model_complexity:=0 and a smaller
 camera frame.
 
-If the arm seems not to chase a far-out hand any harder than a nearly-centred
-one, that is the step clamp rather than the gain. The loop asks for
-gain * error * assumed_deg_per_error degrees and max_step_deg caps it at 5, so
-everything past error 0.29 -- 91px of a 640-wide frame -- is already commanding
-the maximum, and every jog reads `+5.00`. Raising the cap does not speed up
-acquisition either, because the arm's own top joint speed binds first: in
-simulation the error falls 0.80, 0.60, 0.40, 0.20 over the first half second
-at every gain and every clamp tried. What a higher gain does change is the
-endgame, where it rings instead of settling.
+"Move faster the farther the hand is from centre, slower as it gets close"
+is what the gain profile does, but the useful half of it is the near half.
+The loop asks for gain * error * assumed_deg_per_error degrees and
+max_step_deg caps that at 5, so everything past error 0.29 -- 91px of a
+640-wide frame, 69px vertically -- already commands the maximum and every jog
+reads `+5.00`. Raising the cap does not speed up acquisition either, because
+the arm's own top joint speed binds first: the error falls 0.80, 0.60, 0.40,
+0.20 over the first half second at every gain and every clamp tried. So the
+far field cannot go faster, and the win is in backing OFF near the centre.
+The shipped profile does exactly that -- 0.4 deg at 10px out, 3.1 at 64px,
+the full 5.0 from 91px -- and against a flat 0.7 it acquires a hand in 0.67s
+rather than 1.18s, holds it 2px from centre rather than 6, and stops the error
+alternating sign entirely.
 
 If tilting works less well than panning, suspect the model before the tuning.
 `assumed_deg_per_error` was one number for both axes, but the frame is wider
@@ -100,7 +108,8 @@ Useful arguments:
     robot_ip:=192.168.0.15         Pi address
     lead_time:=0.25                sit on a moving hand, not behind it (0.15)
     lead_time:=0.0                 back to proportional only
-    gain:=0.9                      follow harder still (0.7 default)
+    gain:=0.6                      hotter near the centre (0.45 default)
+    progressive_gain:=0.0          flat gain, ignoring distance (2.0 default)
     command_lag:=0.10              if it overshoots; NEVER raise it far
     lag_compensation:=false        back to plain P (then use gain:=0.3)
     deadband:=0.02                 sit nearer dead centre (0.04 default)
@@ -112,7 +121,6 @@ Useful arguments:
     search_range_deg:=90.0         narrower sweep (+45 to -45)
     skip_probe:=false              measure the camera mounting first
     assumed_v_deg_per_error:=19.0  if tilting is weaker than panning
-    progressive_gain:=1.0          chase a far-out hand superlinearly
     assumed_h_sign:=-1.0           flip if it drives the hand out sideways
     assumed_v_sign:=-1.0           flip if it drives the hand out vertically
     search_on_start:=true          start hunting without the trigger
@@ -150,12 +158,12 @@ def generate_launch_description():
         description='Drive to the home pose once on startup, so the arm sits '
                     'at a known position until you trigger a hunt')
     gain_arg = DeclareLaunchArgument(
-        'gain', default_value='0.7',
-        description='Fraction of the full centring correction to apply each '
-                    'time the hand is seen. Not degrees: 0.7 means "move '
-                    'seventy percent of the way to centred". Safe this high '
-                    'only because of lag compensation; turn that off and '
-                    'anything above 0.35 oscillates')
+        'gain', default_value='0.45',
+        description='Fraction of the full centring correction applied at the '
+                    'CENTRE of the frame. Not degrees: 0.45 means "move '
+                    'forty-five percent of the way to centred". '
+                    'progressive_gain raises it with distance, reaching 0.7 '
+                    'where the step clamp takes over')
     command_lag_arg = DeclareLaunchArgument(
         'command_lag', default_value='0.15',
         description='Seconds from sending a jog to seeing it in a frame. '
@@ -194,14 +202,14 @@ def generate_launch_description():
                     'axis is inverted, and flip it. Replaces guessing at '
                     'assumed_h_sign / assumed_v_sign by hand')
     progressive_gain_arg = DeclareLaunchArgument(
-        'progressive_gain', default_value='0.0',
-        description='Make the correction grow faster than the error does '
-                    '(effective gain = gain * (1 + k * |error|)). Plain '
-                    'proportional is already linear in the error; this makes '
-                    'it superlinear. 0 because measurement says it does not '
-                    'help -- past 91px from centre max_step_deg is already '
-                    'commanding the maximum, so this only adds ringing near '
-                    'the centre. Try it and watch whether seen= settles')
+        'progressive_gain', default_value='2.0',
+        description='Scale the gain with distance from centre: effective '
+                    'gain = gain * (1 + k * |error|). Gentle close in, full '
+                    'authority far out. Against a flat gain 0.7 this acquires '
+                    'a hand in 0.67s instead of 1.18s, holds it 2px from '
+                    'centre instead of 6, and stops the error alternating '
+                    'sign. Keep gain * (1 + k * 0.29) near 0.7 if you change '
+                    'either number; 0 restores flat proportional')
     v_deg_per_error_arg = DeclareLaunchArgument(
         'assumed_v_deg_per_error', default_value='0.0',
         description='assumed_deg_per_error for the vertical axis only; 0 '

@@ -77,15 +77,18 @@ Two traps:
   that already landed, double-counts them, concludes it overshot, and
   reverses — reproducing the flicking. A slow pipeline is a reason to fix the
   pipeline, not to raise this.
-- **The step clamp binds long before the gain does.** The loop asks for
-  `gain * error * assumed_deg_per_error` degrees and `max_step_deg` caps it at
-  5, so every error past 0.29 (91px of a 640 frame) already commands the
-  maximum and every jog logs `+5.00`. "It does not chase a far hand any harder
-  than a near one" is that clamp, not the gain, and neither raising the clamp
-  nor `progressive_gain` fixes it: the arm's own top joint speed binds first,
-  and in simulation the error falls 0.80, 0.60, 0.40, 0.20 over the first half
-  second at every gain and clamp tried. More aggression only changes the
-  endgame, where it rings instead of settling.
+- **The gain is a profile, and the useful half is the near half.** `gain`
+  (0.45) is the gain at the *centre*; `progressive_gain` (2.0) raises it with
+  distance, meeting 0.7 exactly where `max_step_deg` starts clamping (error
+  0.29 = 91px of a 640 frame, 69px vertically). Past that point every error
+  commands the same 5° and every jog logs `+5.00`, so "chase a far hand
+  harder" is not available — the arm's own joint speed binds before the clamp
+  does. Backing off near the centre is, and it is worth more: against the old
+  flat 0.7, acquisition 1.18s → 0.67s, residual 6px → 2px, sign reversals in
+  the tail 8.9 → 0. **If you retune either number keep `gain * (1 +
+  progressive_gain * 0.29)` near 0.7**, or the far field changes too. Adding
+  the curve on top of 0.7 instead of reprofiling around it makes the near
+  field hotter and rings — that mistake was made once already.
 - **The vertical axis is not the horizontal one.** Error is normalised per
   axis, so a unit error means "at the edge" both ways, but on a 640x480 sensor
   those edges are ~25 and ~19 degrees away — hence `assumed_v_deg_per_error`

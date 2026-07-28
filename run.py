@@ -568,7 +568,10 @@ def main():
     # the ones in this repo, not another workspace's copy of the same names.
     check_workspace()
 
-    rclpy.init()
+    # args=[] so rclpy does not parse OUR command line. Launch arguments
+    # like gain:=2.5 look exactly like ROS remap rules to it, and it warns
+    # about every one of them -- noise that reads like a real problem.
+    rclpy.init(args=[])
     panel = Panel()
     ex = MultiThreadedExecutor(num_threads=2)
     ex.add_node(panel)

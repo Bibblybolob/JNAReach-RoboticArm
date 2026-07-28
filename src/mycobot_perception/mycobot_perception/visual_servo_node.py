@@ -320,6 +320,13 @@ class VisualServoNode(Node):
         # it is pushing the target out of frame, which on this rig means the
         # assumed camera orientation has a sign inverted.
         self._growing = [0, 0]
+        # Consecutive updates spent far from centre without improving. A
+        # growing error means the wrong sign; an error that simply refuses to
+        # shrink while the joint travels means that axis is not steering the
+        # image at all -- a swapped axis rather than a flipped one. Both look
+        # like "it will not centre", so both need naming.
+        self._stuck = [0, 0]
+        self._best_abs_err = [float('inf'), float('inf')]
         self._prev_abs_err: tuple[float, float] | None = None
         # Distinguishes "the tracker has never said anything" (wrong topic, node
         # not running, MediaPipe not detecting) from "the hand is momentarily
@@ -760,6 +767,10 @@ class VisualServoNode(Node):
         self._integral[:] = 0.0
         self._prev_error = None
         self._prev_time = None
+        self._growing = [0, 0]
+        self._stuck = [0, 0]
+        self._best_abs_err = [float('inf'), float('inf')]
+        self._prev_abs_err = None
         # Let the next measurement through immediately rather than waiting for
         # one newer than whatever we last acted on before the reset.
         self._acted_point_time = 0.0
@@ -825,6 +836,28 @@ class VisualServoNode(Node):
                 elif cur[i] < self._prev_abs_err[i]:
                     self._growing[i] = 0
         self._prev_abs_err = cur
+
+        for i in (0, 1):
+            # Well outside the deadband and no better than it has ever been.
+            if cur[i] > 0.25 and cur[i] >= self._best_abs_err[i] - 0.02:
+                self._stuck[i] += 1
+            else:
+                self._stuck[i] = 0
+            self._best_abs_err[i] = min(self._best_abs_err[i], cur[i])
+
+        for i, (axis, joint_param) in enumerate(
+                (('horizontal', 'horizontal_joint'),
+                 ('vertical', 'vertical_joint'))):
+            if self._stuck[i] >= 25:
+                self.get_logger().warn(
+                    f'The {axis} error has sat at {cur[i]:.2f} for '
+                    f'{self._stuck[i]} updates without improving, while the '
+                    f'joint kept moving -- that axis does not appear to steer '
+                    f'the image at all. Either {joint_param} is the wrong '
+                    f'joint for this camera mounting, or the two axes are '
+                    f'swapped. skip_probe:=false measures it properly.',
+                    throttle_duration_sec=10.0)
+                self._stuck[i] = 0
 
         for i, (axis, param) in enumerate(
                 (('horizontal', 'assumed_h_sign'),

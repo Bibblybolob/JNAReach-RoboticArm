@@ -144,6 +144,15 @@ class MyCobotHardwareNode(Node):
         # the dominant source of visible jerk. Set false to go back to a fixed
         # jog_speed.
         self.declare_parameter('adaptive_jog_speed', True)
+        # Floor for adaptive jog speed. Sizing speed to the step is right for
+        # trajectories, where steps vary; for jogs the step is always small,
+        # so the adaptive result always lands on the floor -- which means the
+        # floor IS the jog speed in practice. min_speed (15) is far too low
+        # for that: a 0.8deg search step computes 15, against the fixed 40
+        # jogs used before adaptive speed existed, and a joint holding the
+        # camera against gravity simply does not move at 15. Keep the floor
+        # at what used to work and let adaptive only ever speed things up.
+        self.declare_parameter('min_jog_speed', 40)
         # Seconds of no jogging before the jog base is resynced from a hardware
         # read. Jogs chain off the *commanded* pose so they compound; a
         # measurement taken while the arm is still travelling to the last
@@ -227,6 +236,8 @@ class MyCobotHardwareNode(Node):
         self._jog_speed = self.get_parameter('jog_speed').get_parameter_value().integer_value
         self._adaptive_jog_speed = self.get_parameter(
             'adaptive_jog_speed').get_parameter_value().bool_value
+        self._min_jog_speed = self.get_parameter(
+            'min_jog_speed').get_parameter_value().integer_value
         self._jog_resync_after = self.get_parameter(
             'jog_resync_after').get_parameter_value().double_value
         self._jog_max_divergence = self.get_parameter(
@@ -731,13 +742,24 @@ class MyCobotHardwareNode(Node):
             from_deg, target_deg, self._cmd_interval,
             enabled=self._adaptive_jog_speed, fallback=self._jog_speed,
         )
+        # Adaptive may raise the speed for a big step, never lower it below
+        # what moved the arm reliably before.
+        speed = max(speed, self._min_jog_speed)
 
         try:
             with self._lock:
                 mc.send_angles(target_deg, speed)
             self._last_tx_time = time.monotonic()
+            # Name the requested joint and its delta, not just the resulting
+            # target vector. Without that there is no way to tell "the jog
+            # never arrived" from "it arrived and the arm ignored it", which
+            # are completely different faults.
+            asked = ' '.join(
+                f'{n}{float(d):+.2f}' for n, d in zip(names, deltas)
+                if n in self.JOINT_NAMES)
             self.get_logger().info(
-                f'jog -> {[round(d, 1) for d in target_deg]}',
+                f'jog [{asked}] speed={speed} -> '
+                f'{[round(d, 1) for d in target_deg]}',
                 throttle_duration_sec=2.0)
             self._last_jog_time = now
             # Track the commanded pose so successive jogs compound instead of

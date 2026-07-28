@@ -1066,6 +1066,31 @@ class MyCobotHardwareNode(Node):
         self.get_logger().info('Trajectory execution complete')
         return result
 
+    def destroy_node(self):
+        """Halt the arm before going away.
+
+        send_angles is a move, not a teleport: when the node dies the arm is
+        still travelling to whatever it was last told, and nothing on the Pi
+        cancels that. So killing the stack mid-jog left the robot carrying on
+        by itself for a second or two afterwards, which is alarming and, near
+        anything solid, worse than alarming.
+        """
+        mc = self._mc
+        if mc is not None:
+            try:
+                # Do not wait on the lock: a shutdown that hangs behind a
+                # blocking read is worse than one that skips the stop.
+                got = self._lock.acquire(timeout=1.0)
+                try:
+                    mc.stop()
+                    self.get_logger().info('Stopped the arm.')
+                finally:
+                    if got:
+                        self._lock.release()
+            except Exception as e:
+                self.get_logger().warn(f'Could not stop the arm on exit: {e}')
+        super().destroy_node()
+
     # ---- Homing ----
 
     def _home_callback(self, request, response):

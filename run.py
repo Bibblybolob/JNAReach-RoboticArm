@@ -28,7 +28,9 @@ client slot.
 Requires ROS 2 sourced, which the README setup puts in your .bashrc.
 """
 
+import difflib
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -288,6 +290,42 @@ def check_workspace():
     print('  no effect. Source this workspace last (or drop the other one):')
     print(f'    source {REPO}/install/setup.bash')
     print(f'{RED}{"=" * 70}{OFF}')
+    sys.exit(1)
+
+
+def check_launch_args(args):
+    """Reject launch arguments the launch file does not declare.
+
+    A mistyped name is not an error to ros2 launch -- it is quietly taken as
+    something else and the default is used, so the run looks normal and
+    behaves as though you never passed the argument. assumed_h_signs cost
+    three runs that way, each looking like the fix had simply not worked.
+    """
+    names = [a.split(':=', 1)[0] for a in args if ':=' in a]
+    if not names:
+        return
+    r = subprocess.run(
+        ['ros2', 'launch', 'mycobot_bringup', 'servo_demo.launch.py',
+         '--show-args'],
+        capture_output=True, text=True, cwd=REPO)
+    if r.returncode != 0:
+        return  # cannot verify; do not block on it
+    declared = set(re.findall(r"^\s*'([A-Za-z0-9_]+)':", r.stdout, re.M))
+    if not declared:
+        return
+    unknown = [n for n in names if n not in declared]
+    if not unknown:
+        return
+
+    print(f'\n{RED}{"=" * 66}{OFF}')
+    print(f'{RED}  UNKNOWN LAUNCH ARGUMENT{OFF}')
+    for n in unknown:
+        near = difflib.get_close_matches(n, sorted(declared), n=2, cutoff=0.6)
+        hint = f'   did you mean {BOLD}{near[0]}{OFF}?' if near else ''
+        print(f'  {BOLD}{n}{OFF}{hint}')
+    print('  ros2 launch would silently ignore it and use the default,')
+    print('  so the run would look fine and behave as if you passed nothing.')
+    print(f'{RED}{"=" * 66}{OFF}')
     sys.exit(1)
 
 
@@ -564,6 +602,7 @@ def main():
         return 0
 
     ensure_built()
+    check_launch_args(args)
     # Before anything else: make sure the packages we are about to launch are
     # the ones in this repo, not another workspace's copy of the same names.
     check_workspace()

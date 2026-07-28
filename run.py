@@ -526,7 +526,36 @@ def main():
                    for n in ('mycobot_hardware_node', 'visual_servo_node'))
     stack = None
     if attached:
-        say('Stack already running -- attaching to it.')
+        # Attaching is convenient, but silently talking to nodes that started
+        # before your last build is how you rebuild, relaunch, and still see
+        # the old behaviour -- the running process does not reload anything.
+        # Say so loudly and offer to replace it.
+        print(f'\n{YELLOW}{"=" * 66}{OFF}')
+        print(f'{YELLOW}  A stack is ALREADY RUNNING -- these nodes were not '
+              f'started by this run.{OFF}')
+        print('  If you have rebuilt since it launched, it is still running '
+              'the OLD code.')
+        print(f'{YELLOW}{"=" * 66}{OFF}')
+        try:
+            ans = input('Restart it with the current build? [y/N] ').strip().lower()
+        except EOFError:
+            ans = 'n'
+        if ans in ('y', 'yes'):
+            say('Stopping the existing stack...')
+            for pat in ('servo_demo.launch.py', 'mycobot_hardware_node',
+                        'visual_servo_node', 'hand_tracker_node',
+                        'camera_node', 'robot_state_publisher'):
+                subprocess.run(['pkill', '-f', pat],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            time.sleep(3)  # let the arm's single client slot be released
+            attached = False
+            preflight()
+            stack = Stack(args)
+            stack.start()
+            panel.wait_for_nodes()
+        else:
+            warn('Attaching to the existing stack as-is.')
     else:
         preflight()
         stack = Stack(args)

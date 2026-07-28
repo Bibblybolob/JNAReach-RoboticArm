@@ -796,8 +796,20 @@ class VisualServoNode(Node):
         if approach is off, the probe could not determine a direction, or the
         hand already fills the target fraction of the frame.
         """
-        if (not self._approach_enabled or self._approach_sign == 0.0
-                or self._last_size_px is None or self._width is None):
+        if not self._approach_enabled:
+            return 0.0
+        if self._approach_sign == 0.0:
+            self.get_logger().warn(
+                'Not closing in: no approach direction known (the approach '
+                'probe could not tell which way moves the camera nearer). '
+                'Set assumed_approach_sign, or skip_probe:=false to measure.',
+                throttle_duration_sec=10.0)
+            return 0.0
+        if self._last_size_px is None or self._width is None:
+            self.get_logger().warn(
+                'Not closing in: the tracker is not reporting palm size, so '
+                'there is no range proxy to close against.',
+                throttle_duration_sec=10.0)
             return 0.0
 
         current = self._last_size_px / float(self._width)
@@ -912,6 +924,16 @@ class VisualServoNode(Node):
             # Bleed the integral off while on target so it does not carry a
             # stale push into the next correction.
             self._integral *= 0.9
+            # Centred is NOT done. Approach runs on its own axis and its own
+            # error, so returning here meant the arm centred the hand and
+            # then sat there forever -- the deadband on the centring error
+            # silently gated the closing-in as well.
+            da = self._approach_step()
+            if da != 0.0:
+                self._send_jog(self._approach_joint, da)
+                self.get_logger().info(
+                    f'Centred; closing in {self._approach_joint}{da:+.2f}deg',
+                    throttle_duration_sec=2.0)
             return
 
         now = time.monotonic()

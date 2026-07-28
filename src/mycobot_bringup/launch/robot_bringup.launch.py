@@ -94,8 +94,14 @@ def generate_launch_description():
             'home_on_start': LaunchConfiguration('home_on_start'),
         }],
         output='screen',
-        respawn=True,
-        respawn_delay=3.0,
+        # Deliberately NOT respawned, unlike the other nodes. Two reasons,
+        # both specific to this one: it holds the arm's single client slot,
+        # so a respawn racing the dying instance can lock itself out; and
+        # with home_on_start every respawn drives the arm to home, which
+        # means a crash silently moves the robot. A driver restarting itself
+        # into motion is worse than a driver that stays down and says so.
+        # It already survives losing the arm on its own -- see the 5s
+        # reconnect timer -- so respawn was buying very little here.
     )
 
     camera_node = Node(

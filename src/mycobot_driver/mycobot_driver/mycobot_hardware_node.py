@@ -436,7 +436,7 @@ class MyCobotHardwareNode(Node):
         startup the driver may still be retrying, and homing is exactly what
         should happen the moment it succeeds.
         """
-        if self._start_homed:
+        if self._start_homed or not rclpy.ok():
             self._start_home_timer.cancel()
             return
         if self._mc is None:
@@ -770,7 +770,11 @@ class MyCobotHardwareNode(Node):
         if self._mc is None:
             return False
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        # rclpy.ok() so Ctrl-C is not ignored for up to home_timeout while the
+        # arm crawls toward a pose nobody is waiting for any more. Without it,
+        # shutting down mid-home kept commanding the arm for another 15s,
+        # which reads as the stack refusing to die.
+        while time.monotonic() < deadline and rclpy.ok():
             try:
                 with self._lock:
                     current = self._mc.get_angles()

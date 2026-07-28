@@ -77,6 +77,23 @@ Two traps:
   that already landed, double-counts them, concludes it overshot, and
   reverses — reproducing the flicking. A slow pipeline is a reason to fix the
   pipeline, not to raise this.
+- **The step clamp binds long before the gain does.** The loop asks for
+  `gain * error * assumed_deg_per_error` degrees and `max_step_deg` caps it at
+  5, so every error past 0.29 (91px of a 640 frame) already commands the
+  maximum and every jog logs `+5.00`. "It does not chase a far hand any harder
+  than a near one" is that clamp, not the gain, and neither raising the clamp
+  nor `progressive_gain` fixes it: the arm's own top joint speed binds first,
+  and in simulation the error falls 0.80, 0.60, 0.40, 0.20 over the first half
+  second at every gain and clamp tried. More aggression only changes the
+  endgame, where it rings instead of settling.
+- **The vertical axis is not the horizontal one.** Error is normalised per
+  axis, so a unit error means "at the edge" both ways, but on a 640x480 sensor
+  those edges are ~25 and ~19 degrees away — hence `assumed_v_deg_per_error`
+  (0 = use the horizontal number). If tilting under-shoots where panning does
+  not, that is the knob; if the camera is mounted rotated the axes are
+  cross-coupled and no per-axis scalar helps, so measure the real 2x2 with
+  `skip_probe:=false`. The `responds Nx as strongly as assumed` line says
+  which case you are in.
 - **Detection rate is the real ceiling.** Below ~6/s nothing tuned in the
   servo helps. Read the `tracker:` and `pipeline:` log lines before touching
   any gain; `model_complexity:=0` and a smaller camera frame move that number

@@ -255,6 +255,32 @@ class VisualServoNode(Node):
         # anything above about 0.35 oscillates. With it, the loop subtracts
         # what it has already asked for and can afford to be decisive.
         self.declare_parameter('gain', 0.7)
+        # Make the correction grow FASTER than the error does:
+        #
+        #     effective gain = gain * (1 + progressive_gain * |error|)
+        #
+        # 0 is plain proportional, which is already "the farther out, the
+        # bigger the jog" -- the step is linear in the error. This makes it
+        # superlinear, so a hand at the frame edge is chased proportionally
+        # harder than one just off centre.
+        #
+        # It defaults to 0 because measurement says it does not help, and the
+        # reason is worth knowing before turning it on. At gain 0.7 and 25
+        # deg/unit the loop asks for 17.5 * error degrees, and max_step_deg
+        # clamps that at 5 -- so everything past error 0.29 (91px of a 640
+        # frame) is ALREADY commanding the maximum. Simulated from a hand
+        # appearing at error 0.8, the error falls 0.80, 0.60, 0.40, 0.20 for
+        # the first half-second at every gain and every progressive_gain
+        # setting tried, because the whole far-field approach is clamp- and
+        # arm-rate-limited rather than gain-limited. What changes is the
+        # endgame: at k=1 and above the loop arrives carrying more speed than
+        # it can shed inside the dead time and rings instead of settling,
+        # turning a 0.8s acquisition into one that never converges.
+        #
+        # Left in because a simulation is not hardware and this is cheap to
+        # try: raise it, watch whether `seen=` settles or starts alternating
+        # sign, and trust the arm over the model.
+        self.declare_parameter('progressive_gain', 0.0)
         # --- Lag compensation ---
         # The one change that lets this track fast instead of carefully.
         #
@@ -428,6 +454,24 @@ class VisualServoNode(Node):
         # camera's field of view. ~50 deg horizontal FOV on a typical webcam
         # puts that at 25. `gain` then applies a fraction of it.
         self.declare_parameter('assumed_deg_per_error', 25.0)
+        # Same number for the VERTICAL axis, when it differs. 0 means "use
+        # assumed_deg_per_error for both", which is the old behaviour.
+        #
+        # It usually does differ, because the frame is not square. The error is
+        # normalised per axis -- horizontal by width/2, vertical by height/2 --
+        # so a unit error means "at the edge" in both directions, but the edges
+        # are different angular distances away. A 640x480 sensor with ~50 deg
+        # horizontal FOV has only ~38 vertical, which puts the honest vertical
+        # number nearer 19 than 25.
+        #
+        # Raise this to make the vertical axis move LESS per unit error, lower
+        # it to make it move more. If tilting consistently under-shoots where
+        # panning does not, this is the knob -- but check the `responds Nx as
+        # strongly as assumed` log line first, which measures the ratio rather
+        # than guessing it, and consider skip_probe:=false, since a camera
+        # mounted rotated needs off-diagonal Jacobian terms that no per-axis
+        # scalar can express.
+        self.declare_parameter('assumed_v_deg_per_error', 0.0)
         # Flip either of these if the arm drives the hand out of frame along
         # that axis rather than centring it.
         self.declare_parameter('assumed_h_sign', 1.0)
@@ -514,6 +558,8 @@ class VisualServoNode(Node):
         self._h_joint = self.get_parameter('horizontal_joint').value
         self._v_joint = self.get_parameter('vertical_joint').value
         self._gain = float(self.get_parameter('gain').value)
+        self._progressive_gain = float(
+            self.get_parameter('progressive_gain').value)
         self._deadband = float(self.get_parameter('deadband').value)
         self._rate = float(self.get_parameter('rate').value)
         self._lag_comp = bool(self.get_parameter('lag_compensation').value)
@@ -582,6 +628,12 @@ class VisualServoNode(Node):
         self._skip_probe = bool(self.get_parameter('skip_probe').value)
         self._assumed_deg = float(
             self.get_parameter('assumed_deg_per_error').value)
+        # 0 is the "same as horizontal" sentinel, so the single-number case
+        # keeps working untouched.
+        self._assumed_v_deg = float(
+            self.get_parameter('assumed_v_deg_per_error').value)
+        if self._assumed_v_deg <= 0.0:
+            self._assumed_v_deg = self._assumed_deg
         self._assumed_h_sign = float(self.get_parameter('assumed_h_sign').value)
         self._assumed_v_sign = float(self.get_parameter('assumed_v_sign').value)
         self._assumed_approach_sign = float(
@@ -1034,13 +1086,14 @@ class VisualServoNode(Node):
         """
         self._set_jacobian(np.array(
             [[self._assumed_deg * self._assumed_h_sign, 0.0],
-             [0.0, self._assumed_deg * self._assumed_v_sign]], dtype=float))
+             [0.0, self._assumed_v_deg * self._assumed_v_sign]], dtype=float))
         self._approach_sign = (
             self._assumed_approach_sign if self._approach_enabled else 0.0)
         self._probed = True
         self.get_logger().info(
             f'Tracking immediately without probing: a full correction is '
-            f'{self._assumed_deg:.0f}deg per unit error, h sign '
+            f'{self._assumed_deg:.0f}deg horizontally and '
+            f'{self._assumed_v_deg:.0f}deg vertically per unit error, h sign '
             f'{self._assumed_h_sign:+.0f}, v sign {self._assumed_v_sign:+.0f}, '
             f'applying {self._gain * 100:.0f}% of it per sighting '
             f'({self._assumed_deg * self._gain:.1f}deg at the frame edge). '
@@ -1260,12 +1313,19 @@ class VisualServoNode(Node):
                     f'measures the mounting properly.',
                     throttle_duration_sec=20.0)
             elif not 0.6 < ratio < 1.6:
-                suggested = self._assumed_deg / max(ratio, 0.2)
+                # Name the per-axis parameter, because the two axes genuinely
+                # differ -- the frame is wider than it is tall, so the vertical
+                # edge is a smaller angle away -- and pointing both at
+                # assumed_deg_per_error meant fixing one by breaking the other.
+                current = self._assumed_v_deg if i else self._assumed_deg
+                knob = ('assumed_v_deg_per_error' if i
+                        else 'assumed_deg_per_error')
+                suggested = current / max(ratio, 0.2)
                 self.get_logger().info(
                     f'The {axis} axis responds {ratio:.2f}x as strongly as '
                     f'assumed -- tracking works but is '
                     f'{"under" if ratio < 1 else "over"}-damped. '
-                    f'assumed_deg_per_error:={suggested:.0f} would match it.',
+                    f'{knob}:={suggested:.0f} would match it.',
                     throttle_duration_sec=30.0)
         self._reset_sign_estimate()
 
@@ -1703,7 +1763,12 @@ class VisualServoNode(Node):
         # what lets the fraction be large enough to feel responsive instead of
         # small enough to survive its own delay. Negated because we drive the
         # error toward zero.
-        delta = self._jinv @ (self._gain * error) * -1.0
+        # progressive_gain (0 by default) makes this superlinear in the error;
+        # see the parameter for why that is off and what it costs when on.
+        # Keyed on the norm rather than per-axis so a hand far out diagonally
+        # is chased as one target, not harder in x than in y.
+        eff_gain = self._gain * (1.0 + self._progressive_gain * ce)
+        delta = self._jinv @ (eff_gain * error) * -1.0
         dh, dv = float(delta[0]), float(delta[1])
 
         dh = max(-self._max_step, min(self._max_step, dh))

@@ -77,6 +77,25 @@ which give detections per second and how stale each one is. Below ~6/s
 nothing tuned in the servo will help; use model_complexity:=0 and a smaller
 camera frame.
 
+If the arm seems not to chase a far-out hand any harder than a nearly-centred
+one, that is the step clamp rather than the gain. The loop asks for
+gain * error * assumed_deg_per_error degrees and max_step_deg caps it at 5, so
+everything past error 0.29 -- 91px of a 640-wide frame -- is already commanding
+the maximum, and every jog reads `+5.00`. Raising the cap does not speed up
+acquisition either, because the arm's own top joint speed binds first: in
+simulation the error falls 0.80, 0.60, 0.40, 0.20 over the first half second
+at every gain and every clamp tried. What a higher gain does change is the
+endgame, where it rings instead of settling.
+
+If tilting works less well than panning, suspect the model before the tuning.
+`assumed_deg_per_error` was one number for both axes, but the frame is wider
+than it is tall, so the vertical edge is a smaller angle away --
+`assumed_v_deg_per_error:=19.0` is the honest figure for a 640x480 sensor.
+And if the camera is mounted rotated at all, the two axes are cross-coupled,
+which a diagonal model cannot express at any scale: use skip_probe:=false to
+measure the real 2x2. The `responds Nx as strongly as assumed` log line tells
+you which case you are in.
+
 Useful arguments:
     robot_ip:=192.168.0.15         Pi address
     lead_time:=0.25                sit on a moving hand, not behind it (0.15)
@@ -92,6 +111,8 @@ Useful arguments:
     search_sweep_seconds:=25.0     slower sweep, more chance to lock on
     search_range_deg:=90.0         narrower sweep (+45 to -45)
     skip_probe:=false              measure the camera mounting first
+    assumed_v_deg_per_error:=19.0  if tilting is weaker than panning
+    progressive_gain:=1.0          chase a far-out hand superlinearly
     assumed_h_sign:=-1.0           flip if it drives the hand out sideways
     assumed_v_sign:=-1.0           flip if it drives the hand out vertically
     search_on_start:=true          start hunting without the trigger
@@ -172,6 +193,22 @@ def generate_launch_description():
         description='Work out from the tracking motion itself whether an '
                     'axis is inverted, and flip it. Replaces guessing at '
                     'assumed_h_sign / assumed_v_sign by hand')
+    progressive_gain_arg = DeclareLaunchArgument(
+        'progressive_gain', default_value='0.0',
+        description='Make the correction grow faster than the error does '
+                    '(effective gain = gain * (1 + k * |error|)). Plain '
+                    'proportional is already linear in the error; this makes '
+                    'it superlinear. 0 because measurement says it does not '
+                    'help -- past 91px from centre max_step_deg is already '
+                    'commanding the maximum, so this only adds ringing near '
+                    'the centre. Try it and watch whether seen= settles')
+    v_deg_per_error_arg = DeclareLaunchArgument(
+        'assumed_v_deg_per_error', default_value='0.0',
+        description='assumed_deg_per_error for the vertical axis only; 0 '
+                    'means use the same value for both. The frame is wider '
+                    'than it is tall, so the vertical edge is a smaller angle '
+                    'away -- ~19 against 25 on a 640x480 sensor. Raise to '
+                    'make tilting move less per unit error, lower for more')
     deg_per_error_arg = DeclareLaunchArgument(
         'assumed_deg_per_error', default_value='25.0',
         description='Degrees of joint motion that would fully centre a target '
@@ -286,7 +323,10 @@ def generate_launch_description():
         name='visual_servo_node',
         parameters=[{
             'gain': LaunchConfiguration('gain'),
+            'progressive_gain': LaunchConfiguration('progressive_gain'),
             'assumed_deg_per_error': LaunchConfiguration('assumed_deg_per_error'),
+            'assumed_v_deg_per_error': LaunchConfiguration(
+                'assumed_v_deg_per_error'),
             'deadband': LaunchConfiguration('deadband'),
             'lag_compensation': LaunchConfiguration('lag_compensation'),
             'command_lag': LaunchConfiguration('command_lag'),
@@ -323,6 +363,8 @@ def generate_launch_description():
         velocity_smoothing_arg,
         auto_sign_arg,
         deg_per_error_arg,
+        v_deg_per_error_arg,
+        progressive_gain_arg,
         deadband_arg,
         model_complexity_arg,
         target_landmark_arg,

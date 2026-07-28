@@ -93,6 +93,7 @@ def make(h=1.0, v=1.0, lag=0.15, max_comp=0.8, samples=25,
     s._prev_meas = None
     s._auto_sign_samples = samples
     s._assumed_deg = DEG
+    s._assumed_v_deg = DEG
     s._assumed_h_sign = h
     s._assumed_v_sign = v
     s.get_logger = _Log
@@ -138,6 +139,36 @@ def test_a_flipped_sign_reverses_the_correction():
     a = make(h=1.0)._jinv @ np.array([0.5, 0.0])
     b = make(h=-1.0)._jinv @ np.array([0.5, 0.0])
     assert np.allclose(a, -b)
+
+
+# --- Per-axis correction scale ----------------------------------------------
+#
+# assumed_deg_per_error was one number for both axes. It should not be: the
+# error is normalised per axis, so a unit error means "at the edge" in both
+# directions, but on a 640x480 sensor those edges are ~25 and ~19 degrees away.
+
+def test_the_two_axes_can_be_scaled_separately():
+    s = _Servo()
+    s._jinv = None
+    s.get_logger = _Log
+    s._reset_sign_estimate = lambda: None
+    s._set_jacobian(np.array([[25.0, 0.0], [0.0, 19.0]]))
+    # A full correction of a unit error costs 25deg horizontally, 19 vertically.
+    assert np.allclose(s._jinv @ np.array([1.0, 0.0]), [25.0, 0.0])
+    assert np.allclose(s._jinv @ np.array([0.0, 1.0]), [0.0, 19.0])
+
+
+def test_a_weaker_vertical_axis_gets_a_bigger_correction():
+    """Lowering the vertical number makes tilting move MORE per unit error,
+    which is the fix when tilting under-shoots where panning does not."""
+    strong = _Servo(); strong._jinv = None; strong.get_logger = _Log
+    strong._reset_sign_estimate = lambda: None
+    strong._set_jacobian(np.array([[25.0, 0.0], [0.0, 25.0]]))
+    weak = _Servo(); weak._jinv = None; weak.get_logger = _Log
+    weak._reset_sign_estimate = lambda: None
+    weak._set_jacobian(np.array([[25.0, 0.0], [0.0, 19.0]]))
+    err = np.array([0.0, 0.5])
+    assert abs((weak._jinv @ err)[1]) < abs((strong._jinv @ err)[1])
 
 
 # --- Lag compensation -------------------------------------------------------

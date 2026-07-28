@@ -24,12 +24,44 @@ Then it runs a state machine:
     HOMING    returning to the home pose, then back to IDLE
 
 Losing the target briefly holds position -- a hand that blinked out is usually
-about to reappear, and the integral decays rather than resetting so the
-accumulated centring push survives the blink. Past resume_search_after (4s) it
-goes back to sweeping, and
+about to reappear. Past resume_search_after (4s) it goes back to sweeping, and
 only after lost_timeout (15s) without any sighting does it give up and home. A
 search that has never seen a hand keeps sweeping rather than homing: it was
 asked to hunt. Call /servo/enable false to stop it at any point.
+
+
+THE CONTROL LAW IS DELIBERATELY JUST PROPORTIONAL
+
+There is no integral and no derivative term, and that is not an omission.
+
+This loop has a lot of dead time in it. A frame is captured on the Pi, JPEG
+encoded, pushed over the network, decoded, run through MediaPipe on a CPU, and
+smoothed, before the servo ever sees it -- and then the jog it produces takes
+its own time to actually move the arm. Several tenths of a second pass between
+"the hand is 40% left of centre" and "the camera has finished responding to
+that". Meanwhile detections keep arriving reporting the *old* error, because
+the correction has not landed yet.
+
+That is what makes gain the whole game here. Each update commands some
+fraction of the motion that would fully centre the target. If that fraction
+times the number of updates that elapse during the dead time comes out above
+1.0, the loop commands more correction than the error deserves, sails past
+centre, and does the same thing coming back: a steady oscillation that never
+settles. Adding an integral term to "finish the job" makes it strictly worse,
+because the integral keeps winding up during exactly the interval when the
+correction is in flight but not yet visible. The previous version of this node
+did that, with an effective fraction near 1.4, and it flicked back and forth
+without ever converging.
+
+So: `gain` is the fraction of the full correction to apply per detection
+(0.3 -- roughly a third of the way to centre each time), `assumed_deg_per_error`
+is what a full correction is (about half the camera's field of view, since
+rotating the camera by half the FOV moves a frame-edge target to the centre),
+and nothing accumulates between updates. Error shrinks geometrically, ~30% per
+detection, and the loop is stable even when the pipeline is slow.
+
+If it feels sluggish, raise `gain` toward 0.5. If it starts hunting around
+centre, lower it toward 0.2. That single number is the tuning.
 
 Jogging is armed automatically at startup -- the node calls /arm/jog_enable
 itself -- so no manual service calls are needed beyond the search trigger.
@@ -119,34 +151,25 @@ class VisualServoNode(Node):
         self.declare_parameter('horizontal_joint', 'joint1')
         self.declare_parameter('vertical_joint', 'joint5')
 
-        # --- PID gains ---
+        # --- Proportional gain (the only gain) ---
         # Error is normalised to half-frames: 1.0 means the target sits at the
-        # frame edge. Gains are in degrees of joint motion per unit of error.
+        # frame edge.
         #
-        # Proportional alone cannot centre the target. It produces motion in
-        # proportion to error, so as error shrinks so does the correction, and
-        # it stalls wherever the remaining push is too small to overcome
-        # stiction, gravity sag, or the deadband. That standing offset is why
-        # the hand ends up near the centre rather than at it.
-        self.declare_parameter('gain', 4.5)
-        # Integral accumulates the error that proportional leaves behind and
-        # keeps pushing until it is actually gone. This is the term that
-        # centres the target. Too high and it overshoots and oscillates.
-        self.declare_parameter('ki', 2.2)
-        # Derivative damps the approach, which buys room to raise the other two
-        # without ringing. Computed on the error signal, which is already
-        # smoothed upstream in the tracker.
-        self.declare_parameter('kd', 0.35)
-        # Anti-windup. Without a cap the integral keeps growing whenever the
-        # arm cannot reduce the error -- target out of reach, joint at a limit,
-        # jogging disabled -- and then unloads all at once as a lurch when
-        # motion resumes.
-        self.declare_parameter('integral_limit', 1.2)
+        # This is a FRACTION, not degrees. 0.3 means "each time you see the
+        # hand, move a third of the way to having it centred". See the module
+        # docstring for why a fraction well under 1.0 is what keeps this loop
+        # stable given how much dead time the camera pipeline adds -- the short
+        # version is that several detections arrive still reporting the old
+        # error while a correction is in flight, so anything near 1.0 commands
+        # the same correction several times over and oscillates.
+        self.declare_parameter('gain', 0.3)
         # Ignore errors smaller than this (normalised). MediaPipe jitter and
         # hand tremor are both a few pixels; without a deadband the arm hunts
-        # continuously and buzzes. Tighter than before now that the integral
-        # term can actually close the remaining gap.
-        self.declare_parameter('deadband', 0.006)
+        # continuously and buzzes. 0.05 of a half-frame is a hand sitting
+        # comfortably in the middle of the picture -- close enough to call it
+        # centred, and chasing anything tighter than that with a pipeline this
+        # slow buys buzzing rather than precision.
+        self.declare_parameter('deadband', 0.05)
         # Loop rate. The driver rate-limits jogs to its command_interval
         # (0.06s, ~16Hz), so going much above that just discards commands.
         self.declare_parameter('rate', 15.0)
@@ -171,10 +194,15 @@ class VisualServoNode(Node):
         # the wrong way -- recoverable, since losing the target homes after
         # lost_timeout, but it will not track until the signs are right.
         self.declare_parameter('skip_probe', True)
-        # Degrees of joint motion per unit of normalised image error, used
-        # only when the probe is skipped. This is what the probe would
-        # otherwise measure.
-        self.declare_parameter('assumed_deg_per_error', 8.0)
+        # Degrees of joint motion for a FULL correction of a unit image error,
+        # used only when the probe is skipped. This is what the probe would
+        # otherwise measure, and it is a geometry number rather than a tuning
+        # knob: with the camera on the flange, rotating the steering joint by
+        # X degrees swings the view by about X degrees, so bringing a target
+        # at the frame edge (error 1.0) to the centre takes about half the
+        # camera's field of view. ~50 deg horizontal FOV on a typical webcam
+        # puts that at 25. `gain` then applies a fraction of it.
+        self.declare_parameter('assumed_deg_per_error', 25.0)
         # Flip either of these if the arm drives the hand out of frame along
         # that axis rather than centring it.
         self.declare_parameter('assumed_h_sign', 1.0)
@@ -190,7 +218,12 @@ class VisualServoNode(Node):
         # measures its actual effect on apparent size, so a poor choice shows
         # up as a failed probe rather than as wrong motion.
         self.declare_parameter('approach_joint', 'joint3')
-        self.declare_parameter('approach_enabled', True)
+        # Off by default. Closing in is a second control loop, on a second
+        # axis, driven by a range proxy (apparent palm size) that is far
+        # noisier than the position error -- and it moves the camera, which
+        # perturbs the centring loop it shares the arm with. Get tracking
+        # solid first, then turn this on.
+        self.declare_parameter('approach_enabled', False)
         # Stop closing in when palm width reaches this fraction of frame width.
         # Higher gets closer; too high and MediaPipe loses the hand because it
         # no longer fits in frame, which ends the approach abruptly.
@@ -238,15 +271,7 @@ class VisualServoNode(Node):
         self._h_joint = self.get_parameter('horizontal_joint').value
         self._v_joint = self.get_parameter('vertical_joint').value
         self._gain = float(self.get_parameter('gain').value)
-        self._ki = float(self.get_parameter('ki').value)
-        self._kd = float(self.get_parameter('kd').value)
-        self._integral_limit = float(self.get_parameter('integral_limit').value)
         self._deadband = float(self.get_parameter('deadband').value)
-
-        # PID state, in normalised image-error units.
-        self._integral = np.zeros(2, dtype=float)
-        self._prev_error: np.ndarray | None = None
-        self._prev_time: float | None = None
         self._rate = float(self.get_parameter('rate').value)
         self._timeout = float(self.get_parameter('target_timeout').value)
         self._max_step = float(self.get_parameter('max_step_deg').value)
@@ -312,10 +337,10 @@ class VisualServoNode(Node):
         self._last_point_time = 0.0
         # Timestamp of the measurement the control loop last acted on. The
         # loop runs faster than detections arrive, so without this it re-uses
-        # the same reading for several iterations -- integrating the identical
-        # error each time, which inflates the integral term and unloads as a
-        # lurch when the arm finally moves. Acting once per measurement keeps
-        # the integral honest.
+        # the same reading for several iterations -- and since each correction
+        # is a fraction of the error it sees, re-using one reading commands
+        # that fraction two or three times for a single observation, which is
+        # over-correction by another name. One sighting, one command.
         self._acted_point_time = 0.0
         # Consecutive updates on which the error GREW on each axis. A control
         # law with the right sign shrinks the error; one that only ever grows
@@ -433,7 +458,7 @@ class VisualServoNode(Node):
         self.get_logger().info(f'{self._state} -> {state}')
         self._state = state
         self._state_since = time.monotonic()
-        self._reset_pid()
+        self._reset_tracking()
         if state == SEARCHING:
             # Only a hunt started from scratch sweeps from zero. Resuming
             # after a lost lock keeps its progress: zeroing it there meant
@@ -507,9 +532,9 @@ class VisualServoNode(Node):
         stops the arm immediately, wherever it is in the state machine.
         """
         want = bool(request.data)
-        # Clean PID state either way: on enable so a stale integral cannot
-        # lurch the arm, on disable so it does not sit accumulating.
-        self._reset_pid()
+        # Clear the convergence diagnostics either way, so a warning about the
+        # previous attempt cannot fire against the next one.
+        self._reset_tracking()
         self._enabled = want
 
         if not want:
@@ -630,9 +655,11 @@ class VisualServoNode(Node):
             self._assumed_approach_sign if self._approach_enabled else 0.0)
         self._probed = True
         self.get_logger().info(
-            f'Tracking immediately without probing: assuming '
-            f'{self._assumed_deg:.0f}deg/error, h sign '
-            f'{self._assumed_h_sign:+.0f}, v sign {self._assumed_v_sign:+.0f}. '
+            f'Tracking immediately without probing: a full correction is '
+            f'{self._assumed_deg:.0f}deg per unit error, h sign '
+            f'{self._assumed_h_sign:+.0f}, v sign {self._assumed_v_sign:+.0f}, '
+            f'applying {self._gain * 100:.0f}% of it per sighting '
+            f'({self._assumed_deg * self._gain:.1f}deg at the frame edge). '
             'If the arm drives the hand out of frame, flip the matching sign '
             '(assumed_h_sign / assumed_v_sign), or set skip_probe:=false to '
             'measure it instead.')
@@ -759,16 +786,16 @@ class VisualServoNode(Node):
 
     # ---- Control loop ----
 
-    def _reset_pid(self) -> None:
-        """Drop accumulated PID state.
+    def _reset_tracking(self) -> None:
+        """Drop the diagnostics that only mean anything within one lock.
 
-        Called whenever the loop stops acting on a continuous error signal --
-        target lost, servo disabled, probe run. Keeping the integral across a
-        gap means unloading a correction for an error that may no longer exist.
+        The control law itself is stateless -- each correction comes purely
+        from the error in front of it, which is the point -- so there is no
+        accumulated term to unwind here. What does need clearing is the
+        convergence history behind the sign/axis warnings: carrying it across
+        a lost target would compare errors from two different attempts and
+        report a runaway that never happened.
         """
-        self._integral[:] = 0.0
-        self._prev_error = None
-        self._prev_time = None
         self._growing = [0, 0]
         self._stuck = [0, 0]
         self._best_abs_err = [float('inf'), float('inf')]
@@ -969,26 +996,16 @@ class VisualServoNode(Node):
                 # again rather than standing still until lost_timeout.
                 self.get_logger().info(
                     f'Target lost {lost_for:.1f}s ago -- resuming search.')
-                self._reset_pid()
+                self._reset_tracking()
                 self._set_state(SEARCHING)
                 return
             # Hold position during a brief dropout rather than sweeping away
-            # from a hand that is probably about to reappear.
-            #
-            # Decay the integral rather than wiping it. Detections drop out
-            # for a few tenths of a second constantly while the arm moves, and
-            # clearing the integral on each of those meant the ONE term that
-            # removes a standing offset never survived long enough to build.
-            # Proportional alone always stalls short of centre, which is
-            # precisely "keeps the hand in view but not in the middle". A slow
-            # decay keeps the accumulated push across a blink while still
-            # washing it out over a genuinely long gap.
+            # from a hand that is probably about to reappear. Nothing to wind
+            # down: the control law carries no state between updates, so
+            # holding is genuinely just doing nothing.
             self.get_logger().info(
                 f'Target lost {lost_for:.1f}s ago; holding',
                 throttle_duration_sec=2.0)
-            self._integral *= 0.97
-            self._prev_error = None
-            self._prev_time = None
             return
 
         if self._jinv is None:
@@ -999,21 +1016,25 @@ class VisualServoNode(Node):
 
         err = self._current_error()
         if err is None:
-            # Same reasoning as the dropout branch above: decay, do not wipe.
-            self._integral *= 0.97
-            self._prev_error = None
-            self._prev_time = None
             return
         ex, ey = err
-        self._check_sign(ex, ey)
 
         # Only act once per measurement. The timer runs at `rate` (15Hz) but
-        # detections arrive slower, so without this the same reading would be
-        # integrated repeatedly. Holding the previous command until new data
-        # arrives is both smoother and more correct than acting on a duplicate.
+        # detections arrive slower than that, so without this the same reading
+        # would be acted on several times over -- and since each correction is
+        # sized as a fraction of the error it sees, repeating one reading means
+        # commanding that fraction two or three times for a single observation.
+        # That is precisely the over-correction the gain is chosen to avoid.
         if self._last_point_time <= self._acted_point_time:
             return
         self._acted_point_time = self._last_point_time
+
+        # Deliberately after that gate. These counters ask "is the error
+        # improving between one sighting and the next"; feeding them the same
+        # reading three times running answers "no" three times over, which is
+        # how the old build reported a stuck axis on a loop that was tracking
+        # fine. One sighting, one verdict.
+        self._check_sign(ex, ey)
 
         if math.hypot(ex, ey) < self._deadband:
             # Being centred is success, not a fault -- but it looks identical
@@ -1022,9 +1043,6 @@ class VisualServoNode(Node):
                 f'On target (error {math.hypot(ex, ey):.3f} < deadband '
                 f'{self._deadband}); holding.',
                 throttle_duration_sec=5.0)
-            # Bleed the integral off while on target so it does not carry a
-            # stale push into the next correction.
-            self._integral *= 0.9
             # Centred is NOT done. Approach runs on its own axis and its own
             # error, so returning here meant the arm centred the hand and
             # then sat there forever -- the deadband on the centring error
@@ -1037,31 +1055,13 @@ class VisualServoNode(Node):
                     throttle_duration_sec=2.0)
             return
 
-        now = time.monotonic()
+        # Proportional, and only proportional. _jinv maps a unit image error
+        # to the joint motion that would fully correct it -- either measured by
+        # the probe or assumed from the camera geometry -- and gain takes a
+        # fraction of that so the loop converges without overshooting through
+        # its own dead time. Negated because we drive the error toward zero.
         error = np.array([ex, ey], dtype=float)
-        dt = (now - self._prev_time) if self._prev_time else (1.0 / self._rate)
-        # Guard against a stalled loop producing a huge dt, which would make
-        # the integral jump and the derivative explode.
-        dt = max(1e-3, min(dt, 0.5))
-
-        self._integral += error * dt
-        # Clamp per-axis so one saturated axis cannot poison the other.
-        np.clip(self._integral, -self._integral_limit, self._integral_limit,
-                out=self._integral)
-
-        derivative = np.zeros(2, dtype=float)
-        if self._prev_error is not None:
-            derivative = (error - self._prev_error) / dt
-
-        self._prev_error = error
-        self._prev_time = now
-
-        # PID in image space, then map through the inverse Jacobian to joints.
-        # Negated because we drive the error toward zero.
-        control = (self._gain * error
-                   + self._ki * self._integral
-                   + self._kd * derivative)
-        delta = self._jinv @ control * -1.0
+        delta = self._jinv @ (self._gain * error) * -1.0
         dh, dv = float(delta[0]), float(delta[1])
 
         dh = max(-self._max_step, min(self._max_step, dh))

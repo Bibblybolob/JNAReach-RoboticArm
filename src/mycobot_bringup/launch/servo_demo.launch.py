@@ -25,9 +25,9 @@ you ask it to hunt:
     ros2 service call /servo/search std_srvs/srv/Trigger
 
 It then sweeps joint5 (wrist pitch) through +90 to -90 over 15s looking for a
-hand, centres on it, and closes in until the palm fills the target fraction of
-the frame. After 15s with no sighting it returns home and waits for the next
-trigger. To stop it at any point:
+hand and follows it, keeping it in the middle of the frame. After 15s with no
+sighting it returns home and waits for the next trigger. To stop it at any
+point:
 
     ros2 service call /servo/enable std_srvs/srv/SetBool "{data: false}"
 
@@ -38,13 +38,25 @@ assumed_v_sign:=-1.0. Pass skip_probe:=false to measure the mounting instead,
 which is slower (a few seconds of twitching, hold your hand still) but correct
 for any orientation.
 
+Tracking is plain proportional control: each sighting moves the camera a
+fixed FRACTION of the way to having the hand centred, and nothing accumulates
+between sightings. `gain` IS that fraction (0.3 by default, not degrees), and
+it is the only tuning knob that matters. The camera pipeline is slow enough
+that a correction is still in flight when the next two or three detections
+arrive reporting the old error, so a gain near 1.0 commands the same
+correction repeatedly and oscillates -- which is exactly what the previous PID
+version did.
+
+Closing in on the hand is OFF by default while tracking is being tuned. Turn
+it back on with approach_enabled:=true.
+
 Useful arguments:
     robot_ip:=192.168.0.15         Pi address
-    gain:=1.5                      lower if the arm oscillates
-    ki:=0.6                        lower if it overshoots and hunts
+    gain:=0.45                     follow harder (0.3 default); 0.2 if it hunts
+    deadband:=0.03                 sit nearer dead centre (0.05 default)
     lost_timeout:=30.0             longer grace before homing
+    approach_enabled:=true         close in as well as centring
     target_size_fraction:=0.55     closer approach (0.45 default)
-    approach_enabled:=false        centre only, do not close in
     search_sweep_seconds:=25.0     slower sweep, more chance to lock on
     search_range_deg:=90.0         narrower sweep (+45 to -45)
     skip_probe:=false              measure the camera mounting first
@@ -85,20 +97,23 @@ def generate_launch_description():
         description='Drive to the home pose once on startup, so the arm sits '
                     'at a known position until you trigger a hunt')
     gain_arg = DeclareLaunchArgument(
-        'gain', default_value='4.5',
-        description='Servo proportional gain; halve it if the arm oscillates')
-    ki_arg = DeclareLaunchArgument(
-        'ki', default_value='2.2',
-        description='Integral gain; this is the term that actually centres '
-                    'the target. Lower it if the arm overshoots and hunts')
-    kd_arg = DeclareLaunchArgument(
-        'kd', default_value='0.35',
-        description='Derivative gain; damps the approach')
+        'gain', default_value='0.3',
+        description='Fraction of the full centring correction to apply each '
+                    'time the hand is seen. Not degrees: 0.3 means "move a '
+                    'third of the way to centred". Raise toward 0.5 if it '
+                    'feels sluggish, lower toward 0.2 if it hunts. This is '
+                    'the only gain -- there is no PID any more')
+    deg_per_error_arg = DeclareLaunchArgument(
+        'assumed_deg_per_error', default_value='25.0',
+        description='Degrees of joint motion that would fully centre a target '
+                    'at the frame edge -- about half the camera field of '
+                    'view. Geometry, not tuning; change it only if the lens '
+                    'is unusually wide or narrow')
     deadband_arg = DeclareLaunchArgument(
-        'deadband', default_value='0.006',
-        description='Image error below which the arm holds still. Small on '
-                    'purpose: the point is to hold the hand AT the centre, '
-                    'not merely in frame. Raise it if the arm buzzes')
+        'deadband', default_value='0.05',
+        description='Image error below which the arm holds still. 0.05 is a '
+                    'hand comfortably in the middle of the picture. Raise it '
+                    'if the arm buzzes, lower it to sit nearer dead centre')
     model_complexity_arg = DeclareLaunchArgument(
         'model_complexity', default_value='0',
         description='MediaPipe hand model: 0 is ~2x faster than 1. On a '
@@ -115,8 +130,11 @@ def generate_launch_description():
         'target_size_fraction', default_value='0.45',
         description='Palm width as a fraction of frame width to close in to')
     approach_enabled_arg = DeclareLaunchArgument(
-        'approach_enabled', default_value='true',
-        description='Close in on the hand as well as centring it')
+        'approach_enabled', default_value='false',
+        description='Close in on the hand as well as centring it. Off until '
+                    'tracking is solid: it is a second loop on a second axis '
+                    'driven by a much noisier signal, and it moves the camera '
+                    'the centring loop is trying to hold steady')
     sweep_seconds_arg = DeclareLaunchArgument(
         'search_sweep_seconds', default_value='15.0',
         description='Seconds for one traverse of the search sweep. Slower '
@@ -184,8 +202,7 @@ def generate_launch_description():
         name='visual_servo_node',
         parameters=[{
             'gain': LaunchConfiguration('gain'),
-            'ki': LaunchConfiguration('ki'),
-            'kd': LaunchConfiguration('kd'),
+            'assumed_deg_per_error': LaunchConfiguration('assumed_deg_per_error'),
             'deadband': LaunchConfiguration('deadband'),
             'lost_timeout': LaunchConfiguration('lost_timeout'),
             'target_size_fraction': LaunchConfiguration('target_size_fraction'),
@@ -209,8 +226,7 @@ def generate_launch_description():
         stream_read_timeout_arg,
         home_on_start_arg,
         gain_arg,
-        ki_arg,
-        kd_arg,
+        deg_per_error_arg,
         deadband_arg,
         model_complexity_arg,
         show_window_arg,

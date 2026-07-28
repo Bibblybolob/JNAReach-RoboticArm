@@ -213,13 +213,26 @@ Useful overrides:
 
 | Argument | Default | Effect |
 |---|---|---|
-| `gain` | 3.0 | proportional gain; halve it if the arm oscillates |
-| `ki` | 1.2 | integral gain — the term that actually centres; lower it if it hunts |
+| `gain` | 0.3 | **fraction** of the full centring correction per sighting, not degrees; raise toward 0.5 to follow harder, lower toward 0.2 if it hunts |
+| `deadband` | 0.05 | image error it stops correcting below; lower to sit nearer dead centre |
+| `assumed_deg_per_error` | 25.0 | degrees that would fully centre a frame-edge target ≈ half the camera FOV; geometry, not tuning |
 | `lost_timeout` | 15.0 | seconds before giving up and homing |
 | `target_size_fraction` | 0.45 | how close to get; higher is closer |
-| `approach_enabled` | true | set false to centre without closing in |
+| `approach_enabled` | false | set true to close in as well as centring |
 | `search_on_start` | false | start hunting without the trigger |
 | `show_window` | false | OpenCV window from the tracker |
+
+**There is no PID.** Tracking is plain proportional control: each time the hand
+is seen, the camera moves a fixed fraction of the way to having it centred, and
+nothing carries over between sightings. That is deliberate. The pipeline —
+capture on the Pi, JPEG over the network, decode, MediaPipe on CPU, then a jog
+the arm takes time to execute — puts several tenths of a second between an
+observation and the camera finishing its response to it. During that gap
+detections keep arriving reporting the *old* error. An integral term winds up
+across exactly that interval, and any gain near 1.0 commands the same
+correction two or three times over: the arm sails past centre, comes back, and
+oscillates without ever settling. Keeping the per-sighting fraction well under
+1.0 and holding no state is what makes it converge.
 
 ### MoveIt2 planning and RViz
 

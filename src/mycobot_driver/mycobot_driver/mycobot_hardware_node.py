@@ -224,6 +224,11 @@ class MyCobotHardwareNode(Node):
         # timer. Jogging applies its deltas to this rather than paying a
         # blocking read per command.
         self._last_angles_rad = None
+        # Last MEASURED pose, kept apart from the commanded chain above.
+        # Jogs compound off the commanded pose so they accumulate, but they
+        # have to be leashed to where the arm actually is or the target runs
+        # away from a robot that cannot keep up.
+        self._measured_angles_rad = None
         self._last_jog_time = 0.0
         # Monotonic time of the last command actually put on the socket. The
         # keepalive timer uses this to tell "quiet because nothing needs
@@ -606,6 +611,7 @@ class MyCobotHardwareNode(Node):
         # Resync only once jogging has stopped, or if the commanded pose has
         # drifted implausibly far from where the arm actually is (blocked
         # joint, saturated servo) -- at which point reality wins.
+        self._measured_angles_rad = angles
         if self._last_angles_rad is None:
             self._last_angles_rad = angles
         else:
@@ -704,6 +710,20 @@ class MyCobotHardwareNode(Node):
         # until the arm itself finally refuses it.
         for i, (lo, hi) in enumerate(self._joint_limits_deg):
             target_deg[i] = max(lo, min(hi, target_deg[i]))
+        # Leash the starting point to where the arm actually is. The jog
+        # chain compounds off commanded positions, which is what makes a
+        # sweep accumulate -- but if the arm cannot keep up, the commanded
+        # pose walks away from reality until the divergence guard resyncs it,
+        # and the arm visibly snaps back to where it really was. Clamping the
+        # lead here means it never gets far enough to need that.
+        meas = self._measured_angles_rad
+        if meas is not None:
+            for i, m in enumerate(meas):
+                m_deg = math.degrees(m)
+                target_deg[i] = max(m_deg - self._jog_max_divergence,
+                                    min(m_deg + self._jog_max_divergence,
+                                        target_deg[i]))
+
         # Where the arm is starting from, for sizing this jog's speed below.
         from_deg = list(target_deg)
 

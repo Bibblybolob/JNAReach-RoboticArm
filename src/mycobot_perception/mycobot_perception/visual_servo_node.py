@@ -126,7 +126,7 @@ class VisualServoNode(Node):
         # it stalls wherever the remaining push is too small to overcome
         # stiction, gravity sag, or the deadband. That standing offset is why
         # the hand ends up near the centre rather than at it.
-        self.declare_parameter('gain', 3.0)
+        self.declare_parameter('gain', 4.5)
         # Integral accumulates the error that proportional leaves behind and
         # keeps pushing until it is actually gone. This is the term that
         # centres the target. Too high and it overshoots and oscillates.
@@ -151,7 +151,9 @@ class VisualServoNode(Node):
         # Stop if the target has not been seen for this long. Without it, the
         # arm keeps acting on a stale position after the hand leaves frame.
         self.declare_parameter('target_timeout', 0.5)
-        self.declare_parameter('max_step_deg', 2.0)
+        # Cap per cycle. 3.0 matches the driver's own max_jog_deg, so this is
+        # as decisive as a single jog is allowed to be.
+        self.declare_parameter('max_step_deg', 3.0)
 
         # Probe settings. probe_deg is how far each joint is nudged to measure
         # its effect; big enough to produce clear image motion, small enough to
@@ -292,6 +294,9 @@ class VisualServoNode(Node):
         # Sweep direction and accumulated travel while SEARCHING.
         self._search_dir = 1.0
         self._search_travel = 0.0
+        # Set only by /servo/search, so a fresh hunt sweeps from zero while
+        # a resume after a lost lock carries on from where it was.
+        self._restart_sweep = True
         # Wall-clock of the previous sweep tick, so each step can be sized
         # from real elapsed time instead of assuming the loop ran on time.
         self._last_sweep_time: float | None = None
@@ -310,6 +315,12 @@ class VisualServoNode(Node):
         # lurch when the arm finally moves. Acting once per measurement keeps
         # the integral honest.
         self._acted_point_time = 0.0
+        # Consecutive updates on which the error GREW on each axis. A control
+        # law with the right sign shrinks the error; one that only ever grows
+        # it is pushing the target out of frame, which on this rig means the
+        # assumed camera orientation has a sign inverted.
+        self._growing = [0, 0]
+        self._prev_abs_err: tuple[float, float] | None = None
         # Distinguishes "the tracker has never said anything" (wrong topic, node
         # not running, MediaPipe not detecting) from "the hand is momentarily
         # out of frame". These need completely different fixes, and reporting
@@ -415,9 +426,16 @@ class VisualServoNode(Node):
         self._state_since = time.monotonic()
         self._reset_pid()
         if state == SEARCHING:
-            self._search_travel = 0.0
-            # Drop the previous tick's timestamp too, or the first step of a
-            # new sweep is sized from however long the node sat in IDLE.
+            # Only a hunt started from scratch sweeps from zero. Resuming
+            # after a lost lock keeps its progress: zeroing it there meant
+            # every flicker of a detection restarted the sweep where it
+            # stood, so the arm twitched in place instead of ever getting
+            # anywhere. _restart_sweep is set by the search service.
+            if self._restart_sweep:
+                self._search_travel = 0.0
+                self._restart_sweep = False
+            # Drop the previous tick's timestamp either way, or the first
+            # step is sized from however long the node spent elsewhere.
             self._last_sweep_time = None
 
     def _search_cb(self, request, response):
@@ -425,6 +443,7 @@ class VisualServoNode(Node):
             response.success = False
             response.message = 'Servo is disabled; enable it first.'
             return response
+        self._restart_sweep = True
         self._set_state(SEARCHING)
         response.success = True
         response.message = (
@@ -789,6 +808,38 @@ class VisualServoNode(Node):
             f'({deg_per_sec:.0f}deg/s)',
             throttle_duration_sec=3.0)
 
+    def _check_sign(self, ex: float, ey: float) -> None:
+        """Warn when the loop is driving the target away rather than in.
+
+        Only meaningful when the orientation was assumed rather than
+        measured: a wrong sign is precisely what the probe exists to rule
+        out. Rather than leave it as "the arm twitches and never closes",
+        name the axis and the parameter that fixes it.
+        """
+        cur = (abs(ex), abs(ey))
+        if self._prev_abs_err is not None:
+            for i in (0, 1):
+                # Ignore changes too small to distinguish from hand tremor.
+                if cur[i] > self._prev_abs_err[i] + 0.01:
+                    self._growing[i] += 1
+                elif cur[i] < self._prev_abs_err[i]:
+                    self._growing[i] = 0
+        self._prev_abs_err = cur
+
+        for i, (axis, param) in enumerate(
+                (('horizontal', 'assumed_h_sign'),
+                 ('vertical', 'assumed_v_sign'))):
+            if self._growing[i] >= 6:
+                self.get_logger().warn(
+                    f'The {axis} error has grown {self._growing[i]} updates '
+                    f'running -- the arm is pushing the target OUT of frame, '
+                    f'not centring it. The {axis} sign is almost certainly '
+                    f'inverted: relaunch with {param}:='
+                    f'{-self._assumed_v_sign if i else -self._assumed_h_sign:+.0f}'
+                    ', or skip_probe:=false to measure it.',
+                    throttle_duration_sec=5.0)
+                self._growing[i] = 0
+
     def _approach_step(self) -> float:
         """Degrees to move the approach joint to close in on the hand.
 
@@ -905,6 +956,7 @@ class VisualServoNode(Node):
             self._reset_pid()
             return
         ex, ey = err
+        self._check_sign(ex, ey)
 
         # Only act once per measurement. The timer runs at `rate` (15Hz) but
         # detections arrive slower, so without this the same reading would be

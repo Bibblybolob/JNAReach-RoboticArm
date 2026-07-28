@@ -103,8 +103,12 @@ class HandTrackerNode(Node):
 
         self.declare_parameter('image_topic', '/camera/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera_info')
-        # Which landmark to report as "the finger". 8 = index fingertip.
-        self.declare_parameter('target_landmark', INDEX_TIP)
+        # Which landmark to steer at. 9 (middle-finger knuckle) sits in the
+        # middle of the palm and is the steadiest point on the hand: it is on
+        # the rigid part, so it does not move when fingers flex. The index
+        # fingertip (8) was the old default and made the servo chase finger
+        # jitter rather than the hand.
+        self.declare_parameter('target_landmark', MIDDLE_MCP)
         self.declare_parameter('min_detection_confidence', 0.6)
         self.declare_parameter('min_tracking_confidence', 0.5)
         self.declare_parameter('max_num_hands', 1)

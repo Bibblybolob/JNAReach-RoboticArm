@@ -85,7 +85,7 @@ def generate_launch_description():
         description='Drive to the home pose once on startup, so the arm sits '
                     'at a known position until you trigger a hunt')
     gain_arg = DeclareLaunchArgument(
-        'gain', default_value='3.0',
+        'gain', default_value='4.5',
         description='Servo proportional gain; halve it if the arm oscillates')
     ki_arg = DeclareLaunchArgument(
         'ki', default_value='1.2',

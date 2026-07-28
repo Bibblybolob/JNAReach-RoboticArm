@@ -1827,6 +1827,16 @@ class VisualServoNode(Node):
         # next compensation has to subtract; logging the unclamped intent here
         # would have the compensator predicting motion that never happens and
         # steadily under-driving the arm.
+        #
+        # Deliberately the REQUEST, not the driver's report of what it applied.
+        # The driver publishes that on /arm/jog_applied and it reads like the
+        # better number, but it is not: it reports motion as the driver
+        # commands it, which is one arm-response later than this node needs.
+        # Feeding it here put jogs that had already landed -- and were already
+        # visible in the measurement -- back into the compensation window, so
+        # they were counted twice and the loop under-drove. Measured against
+        # this, that swap took the residual from 3px to 40-62px and stopped it
+        # converging at all in ten runs out of twelve.
         self._record_sent(self._ros_now(), dh, dv)
 
         names = [self._h_joint, self._v_joint]

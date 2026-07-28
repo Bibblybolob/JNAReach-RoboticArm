@@ -133,6 +133,25 @@ frame, which is indistinguishable from a badly mounted camera.
   after a deliberate shutdown.
 - Port 9000 is single-client (`listen(1)`). Probe it by connecting and closing
   at once; anything that holds the slot locks out the driver.
+- **The jog profile trades lock-on time for smoothness, and the exchange rate
+  is bad.** `jog_profile` streams to the jog goal on a trapezoid instead of
+  commanding it outright; `max_jog_accel_deg_s2` (1200) sets how gently.
+  Simulated through the real servo maths from a hand at the frame edge: 1200
+  acquires in 0.36s, 600 in 2.02s, 300 fails to converge more often than not.
+  Steadiness once locked (3px) and moving-hand tracking are unchanged
+  throughout — a gentle ramp costs only the getting there. 1200 is therefore
+  nearly a no-op by design, reaching cruise in one command; what it still buys
+  is a ceiling of 72°/s on velocity *change*, which is the step joint1 could
+  not follow. Dropping the deceleration planning was tried, on the theory that
+  stopping at each streamed goal was the cost — it is not, and it came out
+  slightly worse.
+- **`/arm/jog_applied` is diagnostics, not a feedback path.** The driver
+  publishes what it really commanded, which is the fastest way to see a jog
+  being clipped. Feeding it back into the servo's lag compensation was tried
+  and is much worse: it reports motion as it is *commanded*, one arm-response
+  earlier than the compensator needs, so already-landed jogs re-enter the
+  window and get counted twice — residual 3px → 40-62px, and no convergence at
+  all in ten runs of twelve. The servo records its own requests instead.
 - **A joint that is commanded but does not move poisons everything above it.**
   Both the lag compensator and the velocity feedforward subtract jogs they
   assume executed. When one does not, the servo books the missing image motion

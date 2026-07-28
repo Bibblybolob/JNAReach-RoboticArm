@@ -156,6 +156,48 @@ class MyCobotHardwareNode(Node):
         # credits the full commanded motion, so the loop believes corrections
         # landed that never did and steadily under-drives the arm.
         self.declare_parameter('max_jog_deg', 5.0)
+        # --- Trapezoidal jog profile ---
+        # Stream toward the jog goal on an acceleration-limited ramp instead
+        # of commanding each step outright.
+        #
+        # send_angles is point-to-point: handed a new target every command
+        # interval it sprints the gap, stops, and waits for the next one, and
+        # at servo rates that stop-start is the visible jerk. Worse, it asks
+        # for a step change in velocity. A wrist joint can very nearly do that;
+        # joint1, swinging the mass of the whole arm, cannot, and what happened
+        # instead was that it fell behind, the divergence leash pinned its
+        # target, and the servo read the motion it had commanded but not got as
+        # the hand moving away from it.
+        #
+        # With the profile on, the jog callback only moves a goal and this
+        # timer walks the commanded pose to it: accelerate at max_jog_accel,
+        # cruise at max_jog_speed, decelerate to arrive stopped.
+        self.declare_parameter('jog_profile', True)
+        # Degrees per second squared, and a real trade rather than a free win.
+        # Ramping spreads a jog over several command intervals, and every one
+        # of those is dead time in a loop that is already dead-time limited.
+        #
+        # Simulated through the actual servo maths, from a hand appearing at
+        # the frame edge:
+        #
+        #     no profile      acquires in 0.36s, holds 3px from centre
+        #     accel 1200      0.36s, 3px      <- indistinguishable
+        #     accel  600      2.02s, 3px      <- 5x slower to lock on
+        #     accel  300      failed to converge in 9 runs of 12
+        #
+        # Steadiness once locked, and tracking of a moving hand, are unchanged
+        # throughout; what a gentle ramp costs is purely the time to get there.
+        #
+        # 1200 is the honest default: it still refuses any step change in
+        # velocity above accel*dt (72 deg/s per command), which is the thing
+        # joint1 could not follow and the reason this exists, while measuring
+        # identical to no profile at all on acquisition. Lower it if the motion
+        # still looks harsh and you can spend the lock-on time -- but check
+        # against the table above rather than assuming smoother is better.
+        self.declare_parameter('max_jog_accel_deg_s2', 1200.0)
+        # Cruise ceiling, degrees per second. Roughly what the old path
+        # implied: max_jog_deg every command_interval is 5/0.06 = 83.
+        self.declare_parameter('max_jog_speed_deg_s', 80.0)
         self.declare_parameter('jog_speed', 40)
         # Size each jog's speed to the size of that jog, exactly as trajectory
         # streaming does. A fixed speed is wrong here for the same reason it is
@@ -257,6 +299,18 @@ class MyCobotHardwareNode(Node):
         # away from a robot that cannot keep up.
         self._measured_angles_rad = None
         self._last_jog_time = 0.0
+        self._jog_profile = self.get_parameter(
+            'jog_profile').get_parameter_value().bool_value
+        self._jog_accel = self.get_parameter(
+            'max_jog_accel_deg_s2').get_parameter_value().double_value
+        self._jog_max_speed = self.get_parameter(
+            'max_jog_speed_deg_s').get_parameter_value().double_value
+        # Profiler state: where the servo wants the arm, where we have
+        # actually commanded it to so far, and how fast each joint is
+        # currently being asked to travel.
+        self._jog_target_deg = None
+        self._jog_cmd_deg = None
+        self._jog_vel = [0.0] * len(self.JOINT_NAMES)
         # Monotonic time of the last command actually put on the socket. The
         # keepalive timer uses this to tell "quiet because nothing needs
         # sending" from "quiet because the link is genuinely unused".
@@ -301,6 +355,14 @@ class MyCobotHardwareNode(Node):
         # Joint state publisher
         self._js_pub = self.create_publisher(JointState, 'joint_states', 10)
         self._timer = self.create_timer(1.0 / self._rate, self._publish_joint_states)
+
+        # What the arm was actually told to do, as opposed to what was asked
+        # of it. See _publish_jog_applied.
+        self._jog_applied_pub = self.create_publisher(
+            JointJog, 'arm/jog_applied', 10)
+        if self._jog_profile:
+            self._jog_timer = self.create_timer(
+                self._cmd_interval, self._jog_profile_step)
 
         # Each callback group gets its own thread in MultiThreadedExecutor,
         # preventing the 20Hz timer from starving the service/action callbacks.
@@ -723,8 +785,14 @@ class MyCobotHardwareNode(Node):
 
         # Rate-limit to the same interval the trajectory streamer uses. A servo
         # loop publishing faster than the link can carry just builds a backlog.
+        #
+        # Skipped when the profiler is running: there the callback only moves a
+        # GOAL, which is cheap and touches no socket, and the streaming to it
+        # happens on the profiler's own timer at exactly this interval. Rate
+        # limiting the goal as well would throw away servo corrections for no
+        # gain.
         now = time.monotonic()
-        if now - self._last_jog_time < self._cmd_interval:
+        if not self._jog_profile and now - self._last_jog_time < self._cmd_interval:
             return
 
         target_deg = [math.degrees(a) for a in base]
@@ -807,6 +875,16 @@ class MyCobotHardwareNode(Node):
                 throttle_duration_sec=2.0)
             return
 
+        if self._jog_profile:
+            # Hand the goal to the profiler and return. Nothing is sent from
+            # here: _jog_profile_step streams toward this on its own timer,
+            # accelerating and decelerating instead of jumping, which is what
+            # makes the motion a trapezoid rather than a series of lurches.
+            self._jog_target_deg = target_deg
+            if self._jog_cmd_deg is None:
+                self._jog_cmd_deg = list(from_deg)
+            return
+
         speed = self._step_speed(
             from_deg, target_deg, self._cmd_interval,
             enabled=self._adaptive_jog_speed, fallback=self._jog_speed,
@@ -846,9 +924,187 @@ class MyCobotHardwareNode(Node):
             self.get_logger().warn(
                 f'jog rejected: {e}', throttle_duration_sec=2.0)
 
+    @staticmethod
+    def profile_step(remaining, vel, dt, accel, v_max):
+        """One tick of a trapezoidal velocity profile, for a single joint.
+
+        Given how far there is left to go and how fast this joint is currently
+        being asked to travel, return (step, new_velocity) for this tick.
+
+        Three regimes, which is what makes the velocity curve a trapezoid:
+          - far away and slow      -> accelerate, capped at accel * dt
+          - far away and at speed  -> cruise at v_max
+          - close                  -> decelerate
+
+        The deceleration is planned, not reactive. Stopping from speed v at
+        acceleration a needs v^2 / 2a of runway, so the fastest this joint may
+        travel and still stop ON the goal is sqrt(2 * a * remaining); capping
+        the target velocity at that is what lands the ramp instead of sailing
+        through it. Braking only on arrival would overshoot, and an overshoot
+        here is indistinguishable from the oscillation the servo above exists
+        to avoid.
+
+        Pure arithmetic on purpose -- no clock, no socket, no state -- so the
+        profile can be tested without a robot. See test_jog_profile.py.
+        """
+        if dt <= 0.0:
+            return 0.0, vel
+        if accel <= 0.0:
+            # No acceleration limit configured: fall back to the old
+            # behaviour of commanding the whole step at once.
+            step = max(-v_max * dt, min(v_max * dt, remaining))
+            return step, (step / dt)
+
+        # Highest speed from which this joint can still stop ON the goal.
+        #
+        # The continuous answer is sqrt(2*a*remaining), and using it directly
+        # brakes one tick too late: velocity is only revised every dt, so the
+        # joint takes one more full-speed step and arrives with more speed
+        # than the distance left can absorb. It then has to dump the rest in a
+        # single command -- 80 deg/s straight to 12 in one tick at the
+        # defaults, which is precisely the lurch this profile exists to
+        # remove, moved to the end of the move.
+        #
+        # Solving the same stop over discrete steps instead gives the standard
+        # correction below, which simply starts braking half a tick sooner.
+        half = 0.5 * accel * dt
+        v_stop = -half + math.sqrt(half * half + 2.0 * accel * abs(remaining))
+        v_want = math.copysign(min(v_max, v_stop), remaining)
+        # The acceleration limit itself: velocity may change by at most
+        # accel * dt per tick, which is what turns a step command into a ramp.
+        dv = max(-accel * dt, min(accel * dt, v_want - vel))
+        v = vel + dv
+
+        step = v * dt
+        # Never step past the goal; without this the profile ends in a
+        # permanent small dither either side of it. Report the velocity the
+        # truncated step actually represents rather than forcing zero, so the
+        # next tick continues the ramp from where this one really left off.
+        if abs(step) >= abs(remaining):
+            return remaining, remaining / dt
+        return step, v
+
+    def _jog_reset_profile(self) -> None:
+        """Forget the profile. Used whenever something else takes the arm.
+
+        Both halves matter. Dropping the goal stops the profiler driving
+        toward a target set before a trajectory ran, and zeroing the velocity
+        stops it resuming mid-ramp at whatever speed it had -- which would be
+        a lurch from a standstill.
+        """
+        self._jog_target_deg = None
+        self._jog_cmd_deg = None
+        self._jog_vel = [0.0] * len(self.JOINT_NAMES)
+
+    def _jog_profile_step(self) -> None:
+        """Advance the commanded pose toward the goal on a trapezoid.
+
+        A standard trapezoidal velocity profile: accelerate at a fixed rate,
+        cruise at a speed ceiling, then decelerate so as to ARRIVE at the goal
+        with zero velocity rather than overshooting and coming back.
+
+        The deceleration is the part that has to be planned rather than
+        reacted to. From a distance d, stopping at acceleration a needs
+        sqrt(2*a*d) of speed or less, so capping the commanded velocity at
+        that is what makes the ramp down land on the target. Reacting to
+        arrival instead -- braking once you are there -- is what produces
+        overshoot, and in this loop overshoot is indistinguishable from the
+        oscillation the servo above spent three rewrites removing.
+
+        Why this exists at all: send_angles is point-to-point. Handed a fresh
+        target every command interval it sprints the gap, stops, and waits,
+        and at servo rates that stop-start IS the visible jerk. It also asks
+        the arm for a step change in velocity, which a joint carrying the
+        weight of the whole arm cannot deliver -- joint1 simply fell behind,
+        the divergence leash pinned its target, and the servo above then read
+        the missing motion as the hand moving. Ramping asks for something the
+        hardware can actually do.
+        """
+        if not self._jog_profile or self._in_motion.is_set():
+            return
+        if not self._jog_enabled or self._jog_target_deg is None:
+            return
+        mc = self._mc
+        if mc is None or self._jog_cmd_deg is None:
+            return
+
+        applied = [0.0] * len(self.JOINT_NAMES)
+        moving = False
+        for i in range(len(self.JOINT_NAMES)):
+            step, v = self.profile_step(
+                self._jog_target_deg[i] - self._jog_cmd_deg[i],
+                self._jog_vel[i], self._cmd_interval,
+                self._jog_accel, self._jog_max_speed)
+            self._jog_vel[i] = v
+            self._jog_cmd_deg[i] += step
+            applied[i] = step
+            if abs(step) > 1e-4:
+                moving = True
+
+        if not moving:
+            return
+
+        target_deg = list(self._jog_cmd_deg)
+        for i, (lo, hi) in enumerate(self._joint_limits_deg):
+            target_deg[i] = max(lo, min(hi, target_deg[i]))
+
+        speed = self._step_speed(
+            [c - s for c, s in zip(target_deg, applied)], target_deg, dt,
+            enabled=self._adaptive_jog_speed, fallback=self._jog_speed,
+        )
+        speed = max(speed, self._min_jog_speed)
+
+        try:
+            with self._lock:
+                mc.send_angles(target_deg, speed)
+            self._last_tx_time = time.monotonic()
+            self._last_jog_time = time.monotonic()
+            self._last_angles_rad = [math.radians(d) for d in target_deg]
+            self._publish_jog_applied(applied)
+            self.get_logger().info(
+                'jog profile '
+                + ' '.join(f'{n}{d:+.2f}'
+                           for n, d in zip(self.JOINT_NAMES, applied)
+                           if abs(d) > 1e-4)
+                + f' speed={speed} -> {[round(d, 1) for d in target_deg]}',
+                throttle_duration_sec=2.0)
+        except OSError as e:
+            self._handle_link_error(e, 'jog')
+        except Exception as e:
+            self.get_logger().warn(
+                f'jog rejected: {e}', throttle_duration_sec=2.0)
+
+    def _publish_jog_applied(self, applied) -> None:
+        """Report what was actually commanded, not what was asked for.
+
+        Diagnostics. Every place this driver quietly commands something other
+        than what arrived -- the step cap, the joint limits, the divergence
+        leash, the profiler's ramp -- is invisible from outside, and that
+        invisibility has cost two debugging sessions. `ros2 topic echo
+        /arm/jog_applied` against the servo's own log says immediately whether
+        a jog reached the arm intact.
+
+        NOT for feeding back into the servo's lag compensation, which was
+        tried and is worse. That compensation needs to know what motion is
+        still COMING; this reports motion as it is commanded, which is one
+        arm-response earlier. Jogs that had already landed, and were already
+        visible in the measurement, went back into the window and were counted
+        twice -- residual 3px to 40-62px, and no convergence at all in ten
+        runs out of twelve. The servo records its own requests instead.
+        """
+        msg = JointJog()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.joint_names = list(self.JOINT_NAMES)
+        msg.displacements = [float(d) for d in applied]
+        self._jog_applied_pub.publish(msg)
+
     def _jog_enable_callback(self, request, response):
         """Deadman for jogging. Servoing does nothing until this is enabled."""
         self._jog_enabled = bool(request.data)
+        # Drop any half-finished ramp. Re-arming should start from a
+        # standstill against a fresh goal, not resume into whatever the
+        # profiler was doing when it was cut off.
+        self._jog_reset_profile()
         state = 'ENABLED' if self._jog_enabled else 'disabled'
         response.success = True
         response.message = f'Jogging {state}'
@@ -975,6 +1231,8 @@ class MyCobotHardwareNode(Node):
             final_deg = [math.degrees(p) for p in points[-1].positions]
             self._cmd_positions = list(points[-1].positions)
             self._in_motion.set()
+            # A trajectory owns the arm; a stale jog goal must not survive it.
+            self._jog_reset_profile()
             try:
                 with self._lock:
                     self._mc.send_angles(final_deg, self._speed)
@@ -1001,6 +1259,8 @@ class MyCobotHardwareNode(Node):
 
         # Stop reading the hardware for the duration of the move.
         self._in_motion.set()
+        # A trajectory owns the arm; a stale jog goal must not survive it.
+        self._jog_reset_profile()
         result = FollowJointTrajectory.Result()
         start = time.monotonic()
         next_cmd = start
@@ -1170,6 +1430,8 @@ class MyCobotHardwareNode(Node):
         # feeds _cmd_positions with real measured angles, so /joint_states
         # keeps reporting the arm's actual position as it travels.
         self._in_motion.set()
+        # A trajectory owns the arm; a stale jog goal must not survive it.
+        self._jog_reset_profile()
         try:
             with self._lock:
                 self._mc.send_angles(target, self._home_speed)

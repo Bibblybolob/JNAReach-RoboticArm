@@ -105,10 +105,10 @@ class MyCobotHardwareNode(Node):
         # --- Homing ---
         # Fixed joint-angle home pose, in degrees.
         # Kept in sync with the "home" group_state in mycobot_280pi.srdf
-        # ([0, 1.5708, 0, 0, 0, 0] rad) — change both together or
+        # ([0, 1.5708, -1.5708, 0, 0, 0] rad) — change both together or
         # RViz's named "home" and this service will disagree.
         self.declare_parameter(
-            'home_angles_deg', [0.0, 90.0, 0.0, 0.0, 0.0, 0.0]
+            'home_angles_deg', [0.0, 90.0, -90.0, 0.0, 0.0, 0.0]
         )
         # Homing runs slower than normal motion on purpose: it is commanded
         # from an arbitrary unknown starting pose, which makes it the single

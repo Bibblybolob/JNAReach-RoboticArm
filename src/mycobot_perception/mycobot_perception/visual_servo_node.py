@@ -30,9 +30,11 @@ search that has never seen a hand keeps sweeping rather than homing: it was
 asked to hunt. Call /servo/enable false to stop it at any point.
 
 
-THE CONTROL LAW IS DELIBERATELY JUST PROPORTIONAL
+THE CONTROL LAW IS PROPORTIONAL, PLUS TWO FEEDFORWARD TERMS
 
 There is no integral and no derivative term, and that is not an omission.
+What there is instead is a model of the two things a bare proportional loop
+gets wrong here: its own dead time, and the target's motion.
 
 This loop has a lot of dead time in it. A frame is captured on the Pi, JPEG
 encoded, pushed over the network, decoded, run through MediaPipe on a CPU, and
@@ -68,6 +70,62 @@ Simulating the whole pipeline (0.25s true lag, 8 detections/s, 5 deg cap):
     gain 0.70, no compensation     oscillates forever
     gain 0.70, with compensation   settles in 0.7s
 
+That fixes overshoot on a hand holding still. It does NOT make the arm centre
+a hand that is moving, and those are separate failures with separate causes.
+
+A proportional loop chasing a moving target settles at a constant distance
+behind it. Each cycle it removes `gain` of the error it can see while the
+target opens a fresh gap, and the two balance at
+
+    offset = target_speed * (detection_interval / gain + round_trip_lag)
+
+At 8 detections/s, gain 0.7 and 0.25s of lag, a hand crossing the frame at
+half a half-frame per second settles 0.23 out -- 73px of a 640-wide frame,
+for as long as it keeps moving. Raising gain hardly touches it, because the
+dead-time term does not contain gain. The arm shadows the hand at a fixed
+offset, which looks precisely like "it is keeping it in view rather than
+centring it", and it is the reason that complaint survives all the work above.
+
+So the loop also aims where the hand is GOING. It measures the hand's image
+velocity between sightings, subtracts the part of that motion caused by its
+own jogs, and leads the target by `lead_time`. This is feedforward, not an
+integral: it is recomputed from the two most recent sightings every cycle and
+holds no accumulated state, so it cannot wind up during the dead time the way
+the original PID's integral did.
+
+Simulating the pipeline against these actual functions, mean distance from
+centre while the hand keeps moving:
+
+    hand speed     lead_time 0    lead_time 0.15
+    0.25           39px           25px            -35%
+    0.50           73px           49px            -33%
+    1.00          145px           97px            -33%
+
+It holds up whether command_lag over- or under-states the true lag: getting
+that wrong makes the velocity estimate too SMALL (the own-motion subtraction
+below leaves some of our own jog in the measurement), so the term under-leads
+and degrades toward plain proportional rather than overshooting.
+
+Two things it does NOT fix, both worth knowing before reaching for the knob:
+
+  * A hand waved quickly back and forth barely improves (-13% to +7%). That
+    motion reverses faster than any lead can be right about, and it is also
+    the case that runs into the slew ceiling below.
+  * A hand that appears suddenly takes about a second longer to centre. The
+    jump reads as speed, so the loop leads a hand that is not actually going
+    anywhere. Lower lead_time if that matters more than tracking does.
+
+Above all of this sits a ceiling no control law reaches past:
+
+    top slew = (max_step_deg / assumed_deg_per_error) / detection interval
+
+5 deg, 25 deg-per-unit and 8 detections/s give 1.6 half-frames per second,
+and a briskly waved hand exceeds that. Raising max_step_deg is the obvious
+response and does almost nothing (under 3% from 5 to 9) because the clamp
+only binds when the hand is already far out, where dead time dominates. The
+detection rate is what actually moves it: 5/s to 15/s nearly halves the error
+on that same wave. Read the `tracker:` and `pipeline:` lines first.
+
 The one thing to be careful with is `command_lag`, and it is asymmetric. Too
 LOW is harmless -- some in-flight motion goes uncounted and the loop corrects
 slightly harder than it needs to. Too HIGH is not: the window then sweeps in
@@ -78,10 +136,16 @@ at 0.15 against a true lag nearer 0.25, deliberately.
 
 The remaining knobs, in the order worth touching them:
 
+    lead_time          0.15   how far ahead of a moving hand to aim; the one
+                              that decides centred vs merely in frame
     gain                0.7   fraction of the full correction per detection
     max_step_deg        5.0   ceiling on one jog; with the detection rate,
-                              this sets the top speed the camera can slew
+                              this sets the top speed the camera can slew,
+                              and must not exceed the driver's max_jog_deg.
+                              Raising it is rarely the answer -- see above
     command_lag        0.15   see above; lower is safe, higher is not
+    velocity_smoothing  0.6   noise filter on the velocity estimate; lower
+                              chases MediaPipe jitter
     assumed_deg_per_error 25  geometry, not tuning -- half the camera FOV
 
 And the signs no longer need guessing at the command line. `auto_sign`
@@ -231,6 +295,58 @@ class VisualServoNode(Node):
         # dropped, joint at a limit, driver rejected it) the prediction is
         # wrong, and an unbounded wrong prediction is a runaway.
         self.declare_parameter('max_compensation', 0.8)
+        # --- Target velocity feedforward ---
+        # What makes the difference between keeping a moving hand IN FRAME and
+        # holding it AT THE CENTRE.
+        #
+        # Lag compensation above answers "where is the hand now, given my jogs
+        # in flight". It says nothing about the hand's own motion, and a
+        # proportional loop chasing a moving target settles at a constant
+        # distance behind it rather than on it. That is not a tuning miss, it
+        # is what proportional control does with a ramp: each cycle it removes
+        # `gain` of the error it can see, while the target opens up a fresh
+        # gap. Simulating the pipeline, the gap converges to
+        #
+        #     offset = target_speed * (detection_interval / gain + round_trip_lag)
+        #
+        # At 8 detections/s, gain 0.7 and 0.25s of lag, a hand crossing the
+        # frame at half a half-frame per second parks 0.23 out -- about 73px
+        # of a 640-wide frame, permanently, however long you wait. Raising
+        # gain barely touches it: the dead-time term does not contain gain,
+        # and gain is capped by stability anyway. The arm ends up shadowing
+        # the hand at a fixed offset, which reads exactly as "it is keeping it
+        # in view rather than centring it".
+        #
+        # The fix is to aim where the hand is GOING. Measure how fast it is
+        # crossing the image, subtract the part of that motion which is our
+        # own jogs, and lead the target by the time a correction takes to show
+        # up. This is a feedforward term, not an integral: it is computed
+        # fresh from the two most recent sightings and carries no accumulated
+        # state, so it cannot wind up during the dead time the way the
+        # original PID's integral did.
+        #
+        # Seconds to lead by. At 0.15, simulated against these functions, the
+        # trailing offset on a moving hand falls by about a third at every
+        # speed tried (73px -> 49px at 0.5 half-frames/s on a 640 frame).
+        #
+        # But leading is prediction, and predicting further costs step
+        # response: a hand that appears out of nowhere reads as enormous
+        # speed, so the loop leads a hand that is not going anywhere and takes
+        # roughly a second longer to settle on it. Raising this past ~0.25
+        # trades away more settling than it wins back in tracking. Set 0 to
+        # disable and get the old proportional-only behaviour exactly.
+        self.declare_parameter('lead_time', 0.15)
+        # Smoothing on the velocity estimate. Velocity comes from differencing
+        # consecutive detections, and differencing amplifies noise: a couple
+        # of pixels of MediaPipe jitter across a 0.125s gap looks like real
+        # speed, and lead_time multiplies it straight into the error. Lowering
+        # this makes the arm chase jitter for no tracking benefit.
+        self.declare_parameter('velocity_smoothing', 0.6)
+        # Ceiling on the estimated target speed, in half-frames per second. A
+        # dropped detection, a jump to a different hand, or a tracker glitch
+        # produces one enormous difference; without a clamp that becomes one
+        # enormous lead and the arm lunges.
+        self.declare_parameter('max_target_speed', 3.0)
         # Ignore errors smaller than this (normalised). MediaPipe jitter and
         # hand tremor are both a few pixels; without a deadband the arm hunts
         # continuously and buzzes. 0.04 of a half-frame is a hand sitting
@@ -242,11 +358,26 @@ class VisualServoNode(Node):
         # Stop if the target has not been seen for this long. Without it, the
         # arm keeps acting on a stale position after the hand leaves frame.
         self.declare_parameter('target_timeout', 0.9)
-        # Cap per cycle, and the thing that sets top tracking speed: at roughly
-        # 8 detections a second, 5 deg a step is about 40 deg/s of camera slew.
-        # Matches the driver's max_jog_deg, which was raised to suit. Below
-        # about 4 the arm simply cannot keep up with a hand moving at any pace,
-        # which reads as "it follows but always lags behind".
+        # Cap per cycle, and a hard ceiling on how fast the view can slew:
+        #
+        #     top speed = (max_step_deg / assumed_deg_per_error) / detection interval
+        #
+        # At 5 deg, 25 deg-per-unit and 8 detections/s that is 1.6 half-frames
+        # per second. Below about 4 the arm cannot keep up with a hand moving
+        # at any pace, which reads as "it follows but always lags behind".
+        #
+        # Raising it above 5 looks like the fix for that and is not: simulated
+        # against a waved hand, 5 -> 9 moved the mean error by under 3%. The
+        # clamp only binds once the hand is already far off centre (past about
+        # 0.29 of a half-frame at gain 0.7), and by then the loop is limited
+        # by round-trip dead time, so a bigger step overshoots rather than
+        # catches up. lead_time and the detection rate are the levers that
+        # move that number.
+        #
+        # MUST NOT EXCEED the driver's max_jog_deg (5.0), which clamps every
+        # jog. Setting this higher silently caps the real motion while the lag
+        # compensator still credits the full amount, so the loop believes
+        # corrections landed that never did.
         self.declare_parameter('max_step_deg', 5.0)
 
         # Probe settings. probe_deg is how far each joint is nudged to measure
@@ -363,6 +494,11 @@ class VisualServoNode(Node):
         self._lag_comp = bool(self.get_parameter('lag_compensation').value)
         self._command_lag = float(self.get_parameter('command_lag').value)
         self._max_comp = float(self.get_parameter('max_compensation').value)
+        self._lead_time = float(self.get_parameter('lead_time').value)
+        self._vel_smoothing = float(
+            self.get_parameter('velocity_smoothing').value)
+        self._max_target_speed = float(
+            self.get_parameter('max_target_speed').value)
         self._auto_sign = bool(self.get_parameter('auto_sign').value)
         self._auto_sign_samples = int(
             self.get_parameter('auto_sign_samples').value)
@@ -392,6 +528,14 @@ class VisualServoNode(Node):
         # Previous accepted measurement, for computing observed image motion
         # between one detection and the next: (ros_stamp, error array).
         self._prev_meas: tuple[float, np.ndarray] | None = None
+
+        # Estimated target velocity in half-frames per second, and the reading
+        # it was last measured against. Deliberately NOT sharing _prev_meas
+        # with the sign estimator: that one is cleared every auto_sign_samples
+        # detections when it reaches a verdict, and a velocity estimate that
+        # restarts from nothing every few seconds is worse than none.
+        self._vel = np.zeros(2, dtype=float)
+        self._vel_prev: tuple[float, np.ndarray] | None = None
 
         # Rolling pipeline statistics, so "it lags" stops being a guess.
         self._lat_sum = 0.0
@@ -1121,6 +1265,51 @@ class VisualServoNode(Node):
             adjust = adjust * (self._max_comp / norm)
         return error + adjust
 
+    def _update_velocity(self, stamp: float, measured: np.ndarray) -> np.ndarray:
+        """Estimate how fast the TARGET is crossing the image.
+
+        Differencing two sightings gives the image motion between them, but
+        that is the sum of two quite different things: the hand moving, and
+        the camera moving because we jogged it. Only the first is worth
+        leading -- the second is already handled by the lag compensator, and
+        feeding it back in here would have the loop chasing its own motion.
+        So the jogs that landed between the two frames get subtracted, leaving
+        the hand's own travel.
+
+        Returns half-frames per second, smoothed. Zero until a second
+        sighting arrives, which makes the lead term a no-op on the first
+        detection of a lock rather than a guess.
+        """
+        prev = self._vel_prev
+        self._vel_prev = (stamp, measured.copy())
+        if prev is None or self._lead_time <= 0.0:
+            return self._vel
+
+        prev_stamp, prev_measured = prev
+        dt = stamp - prev_stamp
+        # Two readings from the same frame say nothing about speed and would
+        # divide by ~0; a gap of a second means the target was lost and came
+        # back, and the "motion" across that gap is not a velocity.
+        if not (1e-3 < dt < 1.0):
+            return self._vel
+
+        own = np.zeros(2, dtype=float)
+        if self._jfwd is not None:
+            own = self._jfwd @ self._sent_between(
+                prev_stamp - self._command_lag, stamp - self._command_lag)
+
+        raw = (measured - prev_measured - own) / dt
+        # One bad detection produces one enormous difference. Clamped, because
+        # this is multiplied by lead_time and added straight to the error, so
+        # an unbounded velocity is an unbounded lunge.
+        speed = float(np.linalg.norm(raw))
+        if speed > self._max_target_speed:
+            raw = raw * (self._max_target_speed / speed)
+
+        a = self._vel_smoothing
+        self._vel = a * self._vel + (1.0 - a) * raw
+        return self._vel
+
     def _reset_tracking(self) -> None:
         """Drop the diagnostics that only mean anything within one lock.
 
@@ -1139,6 +1328,12 @@ class VisualServoNode(Node):
         self._growing = [0, 0]
         self._sent.clear()
         self._prev_meas = None
+        # The hand that comes back after a dropout is not necessarily the one
+        # that left, and it is certainly not still travelling at the speed it
+        # was. Leading a stale velocity across a gap aims the arm at a place
+        # nothing ever was.
+        self._vel = np.zeros(2, dtype=float)
+        self._vel_prev = None
         self._stuck = [0, 0]
         self._best_abs_err = [float('inf'), float('inf')]
         self._prev_abs_err = None
@@ -1398,6 +1593,16 @@ class VisualServoNode(Node):
         # Correct for where the hand will be once the jogs already in flight
         # have landed, not where it was when this frame was captured.
         error = self._compensate(stamp, measured)
+
+        # Then lead the hand's own motion. _compensate answers "where is it
+        # now"; this answers "where will it be when this correction lands",
+        # which is the one the arm should actually be aiming at. Without it a
+        # proportional loop tracks a moving hand at a fixed distance behind
+        # it -- in frame, never centred.
+        velocity = self._update_velocity(stamp, measured)
+        lead = velocity * self._lead_time
+        error = error + lead
+
         ce = float(np.linalg.norm(error))
 
         if ce < self._deadband:
@@ -1463,20 +1668,26 @@ class VisualServoNode(Node):
             frac = self._last_size_px / float(self._width)
             size_note = f' size={frac:.2f}/{self._target_size:.2f}'
 
-        # Both errors, because the difference between them is the whole story
-        # when tracking misbehaves: `seen` is what the camera reported, `now`
-        # is that corrected for jogs still in flight. If they are far apart the
-        # arm is chasing a lot of stale motion and command_lag matters; if they
-        # are identical the compensator is doing nothing and something upstream
-        # (image timestamps, a dead link) is why.
+        # All three errors, because the differences between them are the whole
+        # story when tracking misbehaves. `seen` is what the camera reported;
+        # `aim` is that corrected for jogs still in flight and led by the
+        # hand's own motion -- the point the arm is actually driving at. If
+        # they are far apart the arm is chasing a lot of stale motion and
+        # command_lag matters; if they are identical neither correction is
+        # doing anything and something upstream (image timestamps, a dead
+        # link) is why. `vel` says how fast the hand is judged to be moving,
+        # which is what to check first if the arm leads or trails a wave.
         comp_note = ''
-        if self._lag_comp and not np.allclose(error, (ex, ey), atol=1e-3):
-            comp_note = f' now=({error[0]:+.3f},{error[1]:+.3f})'
+        if not np.allclose(error, (ex, ey), atol=1e-3):
+            comp_note = f' aim=({error[0]:+.3f},{error[1]:+.3f})'
+        vel_note = ''
+        if self._lead_time > 0.0 and float(np.linalg.norm(velocity)) > 0.05:
+            vel_note = f' vel=({velocity[0]:+.2f},{velocity[1]:+.2f})/s'
 
         # If this logs but the arm does not move, the jog is being rejected by
         # the driver -- check the driver's console, which now says why.
         self.get_logger().info(
-            f'seen=({ex:+.3f},{ey:+.3f}){comp_note}{size_note} -> '
+            f'seen=({ex:+.3f},{ey:+.3f}){comp_note}{vel_note}{size_note} -> '
             + ' '.join(f'{n}{d:+.2f}' for n, d in zip(names, deltas)),
             throttle_duration_sec=2.0)
 

@@ -140,6 +140,21 @@ class MyCobotHardwareNode(Node):
         # so at ~8 detections a second this cap times that rate is the fastest
         # the camera can ever slew. At 3 that was 24 deg/s, slower than a hand
         # moves casually, and the arm could not do anything but trail behind.
+        #
+        # Raising it past 5 was tried and does not help. Simulated against a
+        # waved hand, 5 -> 9 moved the mean tracking error by under 3%: the
+        # clamp only binds when the hand is already far off centre, and at
+        # that point the loop is limited by round-trip dead time, so bigger
+        # steps mostly overshoot. Detection rate is the lever that does move
+        # that number. Raising this is also a hardware question rather than a
+        # tuning one -- the arm has to execute the step within one
+        # command_interval, and speed_at_100_deg_s is still an unmeasured
+        # guess (scripts/measure_arm.py).
+        #
+        # Keep this at or above the servo's max_step_deg (5.0). Below it, jogs
+        # get silently clipped here while the servo's lag compensator still
+        # credits the full commanded motion, so the loop believes corrections
+        # landed that never did and steadily under-drives the arm.
         self.declare_parameter('max_jog_deg', 5.0)
         self.declare_parameter('jog_speed', 40)
         # Size each jog's speed to the size of that jog, exactly as trajectory

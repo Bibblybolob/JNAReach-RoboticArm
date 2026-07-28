@@ -32,7 +32,7 @@ SRC = os.path.join(
     '..', 'mycobot_perception', 'visual_servo_node.py')
 
 WANTED = ('_record_sent', '_sent_between', '_compensate', '_set_jacobian',
-          '_reset_sign_estimate', '_update_sign_estimate')
+          '_reset_sign_estimate', '_update_sign_estimate', '_update_velocity')
 
 GAIN = 0.7
 DEG = 25.0
@@ -68,11 +68,20 @@ for _name in WANTED:
     setattr(_Servo, _name, _NS[_name])
 
 
-def make(h=1.0, v=1.0, lag=0.15, max_comp=0.8, samples=25):
+def make(h=1.0, v=1.0, lag=0.15, max_comp=0.8, samples=25,
+         lead=0.15, vel_smoothing=0.0, max_speed=3.0):
     s = _Servo()
     s._command_lag = lag
     s._max_comp = max_comp
     s._lag_comp = True
+    # Velocity smoothing defaults to 0 here so a single measured difference
+    # arrives undiluted and the arithmetic under test is the arithmetic
+    # asserted on. The smoothing itself is pinned separately.
+    s._lead_time = lead
+    s._vel_smoothing = vel_smoothing
+    s._max_target_speed = max_speed
+    s._vel = np.zeros(2)
+    s._vel_prev = None
     s._sent = []
     s._corr = np.zeros(2)
     s._pmag = np.zeros(2)
@@ -164,6 +173,110 @@ def test_disabling_compensation_is_a_passthrough():
     s._record_sent(10.05, -10.0, -10.0)
     err = np.array([0.6, -0.4])
     assert np.allclose(s._compensate(10.0, err), err)
+
+
+# --- Target velocity feedforward --------------------------------------------
+#
+# The lead term is what centres a MOVING hand instead of trailing it, and it
+# has one failure mode that matters: mistaking the camera's own motion for the
+# hand's. Doing that would have the loop chase its own jogs, so the
+# own-motion subtraction is pinned hardest here.
+
+def test_first_sighting_has_no_velocity():
+    """Nothing to difference against, so the lead term must be a no-op
+    rather than a guess."""
+    s = make()
+    assert np.allclose(s._update_velocity(10.0, np.array([0.5, 0.5])),
+                       np.zeros(2))
+
+
+def test_a_still_hand_has_no_velocity():
+    s = make()
+    err = np.array([0.5, -0.3])
+    s._update_velocity(10.0, err)
+    assert np.allclose(s._update_velocity(10.125, err), np.zeros(2))
+
+
+def test_velocity_is_measured_in_half_frames_per_second():
+    s = make()
+    s._update_velocity(10.0, np.array([0.0, 0.0]))
+    # Moved 0.1 right and 0.05 down over a quarter second.
+    v = s._update_velocity(10.25, np.array([0.1, -0.05]))
+    assert np.allclose(v, [0.4, -0.2])
+
+
+def test_our_own_jog_is_not_mistaken_for_the_hand_moving():
+    """The camera moving looks exactly like the hand moving the other way.
+    Crediting that to the hand would make the loop chase its own motion."""
+    s = make()
+    s._update_velocity(10.0, np.array([0.5, 0.5]))
+    # A jog lands between two frames when it was SENT one command_lag before
+    # them, so 9.9 falls between 10.0-0.15 and 10.125-0.15. Shifts the image
+    # by -0.2 on both axes.
+    d = s._jinv @ np.array([0.2, 0.2])
+    s._record_sent(9.9, *(-d))
+    moved = np.array([0.5, 0.5]) - np.array([0.2, 0.2])
+    assert np.allclose(s._update_velocity(10.125, moved), np.zeros(2))
+
+
+def test_a_hand_moving_while_we_jog_reports_only_the_hand():
+    s = make()
+    s._update_velocity(10.0, np.array([0.5, 0.5]))
+    d = s._jinv @ np.array([0.2, 0.0])
+    s._record_sent(9.9, *(-d))
+    # Image moved -0.2 from our jog, and +0.1 from the hand, over 0.125s.
+    seen = np.array([0.5 - 0.2 + 0.1, 0.5])
+    assert np.allclose(s._update_velocity(10.125, seen), [0.8, 0.0])
+
+
+def test_velocity_is_clamped():
+    """One bad detection is one enormous difference, and lead_time
+    multiplies it straight into the error."""
+    s = make(max_speed=3.0)
+    s._update_velocity(10.0, np.array([0.0, 0.0]))
+    v = s._update_velocity(10.01, np.array([1.0, 1.0]))
+    assert abs(np.linalg.norm(v) - 3.0) < 1e-9
+
+
+def test_a_gap_in_sightings_is_not_a_velocity():
+    """Across a dropout the hand is not the same hand, and the distance it
+    appears to have moved is not a speed."""
+    s = make()
+    s._update_velocity(10.0, np.array([0.0, 0.0]))
+    assert np.allclose(s._update_velocity(14.0, np.array([0.8, 0.8])),
+                       np.zeros(2))
+
+
+def test_repeated_timestamps_do_not_divide_by_zero():
+    s = make()
+    s._update_velocity(10.0, np.array([0.1, 0.1]))
+    v = s._update_velocity(10.0, np.array([0.4, 0.4]))
+    assert np.all(np.isfinite(v)) and np.allclose(v, np.zeros(2))
+
+
+def test_velocity_smoothing_damps_a_single_jump():
+    s = make(vel_smoothing=0.6)
+    s._update_velocity(10.0, np.array([0.0, 0.0]))
+    v = s._update_velocity(10.25, np.array([0.1, 0.0]))
+    assert np.allclose(v, [0.4 * 0.4, 0.0])
+
+
+def test_disabling_lead_time_stops_measuring_velocity():
+    s = make(lead=0.0)
+    s._update_velocity(10.0, np.array([0.0, 0.0]))
+    assert np.allclose(s._update_velocity(10.25, np.array([0.5, 0.5])),
+                       np.zeros(2))
+
+
+def test_leading_a_moving_hand_aims_ahead_of_it():
+    """The whole point: the commanded correction must overshoot the hand's
+    CURRENT position by roughly the distance it travels during the lag."""
+    s = make(lead=0.2)
+    s._update_velocity(10.0, np.array([0.0, 0.0]))
+    v = s._update_velocity(10.25, np.array([0.1, 0.0]))
+    err = np.array([0.1, 0.0]) + v * s._lead_time
+    assert err[0] > 0.1
+    assert np.isclose(err[0], 0.1 + 0.4 * 0.2)
 
 
 # --- auto_sign --------------------------------------------------------------

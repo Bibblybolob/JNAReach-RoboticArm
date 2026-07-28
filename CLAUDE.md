@@ -58,6 +58,18 @@ So: proportional only, and `gain` is a **fraction of a full correction**
 image motion not yet visible, correcting where the hand *will* be. That
 compensation is what makes 0.7 safe where 0.35+ oscillates without it.
 
+**Overshoot and trailing are different failures.** The above fixes overshoot
+on a hand held still. It does nothing for a hand that is *moving*, because a
+proportional loop tracks a moving target at a constant distance behind it —
+`speed * (detection_interval / gain + round_trip_lag)`, about 70px of a 640
+frame at a moderate pace. That term is mostly dead time, so raising `gain`
+barely touches it, and the symptom is "it keeps my hand in view but never
+centres it". `lead_time` (0.15s) is the fix: the node measures how fast the
+hand is crossing the image, subtracts its own jogs from that, and aims ahead.
+Worth ~a third off the offset on smooth motion; little help on a fast wave,
+and it costs ~1s of extra settling on a hand that appears suddenly.
+`lead_time:=0.0` restores proportional-only exactly.
+
 Two traps:
 
 - **`command_lag` (0.15) must stay BELOW the true lag (~0.25).** The error is
@@ -68,7 +80,11 @@ Two traps:
 - **Detection rate is the real ceiling.** Below ~6/s nothing tuned in the
   servo helps. Read the `tracker:` and `pipeline:` log lines before touching
   any gain; `model_complexity:=0` and a smaller camera frame move that number
-  more than anything else.
+  more than anything else. Raising `max_step_deg` looks like the fix for slow
+  tracking and is not — 5 to 9 moves the simulated error under 3%, because
+  the clamp only binds when the hand is already far out and dead time
+  dominates there. It also must not exceed the driver's `max_jog_deg` (5.0),
+  which silently clips it while the compensator still credits the full jog.
 
 Signs are worked out automatically (`auto_sign`) by correlating what each jog
 was predicted to do to the image against what it did. `assumed_h_sign` /

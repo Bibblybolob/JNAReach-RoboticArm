@@ -49,6 +49,21 @@ produced yet, correcting where the hand WILL be rather than where it was.
 That is what makes 0.7 safe where the old PID at an effective 1.4 flicked
 back and forth forever.
 
+That stops it overshooting a hand held still. Centring a hand that is MOVING
+is a different problem: a proportional loop tracks a moving target at a fixed
+distance behind it, however high the gain, because the gap it settles at is
+set mostly by dead time and dead time does not care about gain. At a moderate
+pace that offset is around 70px of a 640-wide frame -- the arm shadows your
+hand and never quite sits on it. So the node also measures how fast the hand
+is crossing the image and aims `lead_time` (0.15s) ahead of it, which takes
+about a third off that offset. If the arm follows a moving hand but always
+sits behind it, that is the knob.
+
+It does not do much for a hand waved quickly back and forth, which reverses
+faster than any prediction can be right about, and it costs about a second of
+extra settling on a hand that appears out of nowhere. lead_time:=0.0 restores
+the old behaviour exactly.
+
 Signs are worked out automatically now: auto_sign correlates what each jog was
 predicted to do to the image against what it did, and flips an inverted axis
 on its own. assumed_h_sign / assumed_v_sign are still there, but you should
@@ -64,8 +79,9 @@ camera frame.
 
 Useful arguments:
     robot_ip:=192.168.0.15         Pi address
+    lead_time:=0.25                sit on a moving hand, not behind it (0.15)
+    lead_time:=0.0                 back to proportional only
     gain:=0.9                      follow harder still (0.7 default)
-    max_step_deg:=7.0              raise the top slew speed
     command_lag:=0.10              if it overshoots; NEVER raise it far
     lag_compensation:=false        back to plain P (then use gain:=0.3)
     deadband:=0.02                 sit nearer dead centre (0.04 default)
@@ -134,8 +150,23 @@ def generate_launch_description():
     max_step_arg = DeclareLaunchArgument(
         'max_step_deg', default_value='5.0',
         description='Biggest single jog. Times the detection rate, this is '
-                    'the top speed the camera can slew, so it is the cap on '
-                    'how fast a moving hand can be followed')
+                    'the top speed the camera can slew. Raising it is rarely '
+                    'the fix for slow tracking (5 to 9 moves the error under '
+                    "3%); it must also stay at or below the driver's "
+                    'max_jog_deg (5.0), which clamps it anyway')
+    lead_time_arg = DeclareLaunchArgument(
+        'lead_time', default_value='0.15',
+        description='Seconds to aim AHEAD of a moving hand, using its '
+                    'measured image speed. This is what centres a moving '
+                    'hand instead of trailing it at a fixed distance. Raise '
+                    'to track a moving hand more tightly, lower if a hand '
+                    'that appears suddenly overshoots; 0 disables it')
+    velocity_smoothing_arg = DeclareLaunchArgument(
+        'velocity_smoothing', default_value='0.6',
+        description='Noise filter on the hand-speed estimate that lead_time '
+                    'multiplies. Velocity comes from differencing sightings, '
+                    'which amplifies jitter, so lowering this makes the arm '
+                    'chase noise')
     auto_sign_arg = DeclareLaunchArgument(
         'auto_sign', default_value='true',
         description='Work out from the tracking motion itself whether an '
@@ -260,6 +291,8 @@ def generate_launch_description():
             'lag_compensation': LaunchConfiguration('lag_compensation'),
             'command_lag': LaunchConfiguration('command_lag'),
             'max_step_deg': LaunchConfiguration('max_step_deg'),
+            'lead_time': LaunchConfiguration('lead_time'),
+            'velocity_smoothing': LaunchConfiguration('velocity_smoothing'),
             'auto_sign': LaunchConfiguration('auto_sign'),
             'lost_timeout': LaunchConfiguration('lost_timeout'),
             'target_size_fraction': LaunchConfiguration('target_size_fraction'),
@@ -286,6 +319,8 @@ def generate_launch_description():
         command_lag_arg,
         lag_comp_arg,
         max_step_arg,
+        lead_time_arg,
+        velocity_smoothing_arg,
         auto_sign_arg,
         deg_per_error_arg,
         deadband_arg,

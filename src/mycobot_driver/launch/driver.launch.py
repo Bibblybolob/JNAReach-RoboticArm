@@ -40,7 +40,7 @@ def generate_launch_description():
     # Home pose in degrees, one entry per arm joint.
     # Mirrored by the "home" group_state in mycobot_280pi.srdf (in radians).
     # Change both together.
-    home_angles = [0.0, 90.0, -90.0, -90.0, 0.0, 0.0]
+    home_angles = [0.0, 90.0, 0.0, 0.0, 0.0, 0.0]
 
     hardware_node = Node(
         package='mycobot_driver',

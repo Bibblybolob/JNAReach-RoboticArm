@@ -321,16 +321,19 @@ class MyCobotHardwareNode(Node):
             for attempt in range(5):
                 angles = mc.get_angles()
                 if (isinstance(angles, list) and len(angles) == 6
-                        and self._angles_within_limits(angles)):
+                        and self._angles_plausible(angles)):
                     break
                 time.sleep(0.3)
             if not isinstance(angles, list) or len(angles) != 6:
                 raise RuntimeError(
                     f'connected but get_angles() returned {angles!r}')
-            if not self._angles_within_limits(angles):
+            if not self._angles_plausible(angles):
                 raise RuntimeError(
-                    f'connected but get_angles() returned implausible '
-                    f'angles {angles!r} (outside joint_limits_deg)')
+                    f'connected but get_angles() returned {angles!r}, which '
+                    f'is not a physically possible pose')
+            # Being parked outside the configured travel is worth saying, but
+            # it is not a reason to refuse the arm -- see _angles_plausible.
+            self._warn_if_outside_limits(angles)
             self._mc = mc
             self.get_logger().info(f'Connected. Joint angles: '
                                    f'{[round(a, 1) for a in angles]}')
@@ -394,24 +397,48 @@ class MyCobotHardwareNode(Node):
         finally:
             self._lock.release()
 
-    def _angles_within_limits(self, angles_deg) -> bool:
-        """Reject an angle reading that is not physically plausible.
+    # No joint on this arm can reach beyond this, so anything past it is a
+    # decoding failure rather than a pose. Kept well clear of joint6's +/-180
+    # so a real reading is never mistaken for garbage.
+    SANITY_LIMIT_DEG = 200.0
 
-        A garbled response on a flaky link can still decode to a valid list
-        of 6 floats -- just not real ones. Trusting that blindly poisons
-        self._last_angles_rad: a jog only clamps the joint(s) it is actually
-        moving, so a bad value on any other joint gets silently re-sent
-        forever until the arm's own validation finally rejects it (seen in
-        practice as pymycobot raising "invalid angle value" on a jog that
-        never should have contained that number in the first place). A
-        margin beyond the configured limits avoids flagging a real reading
-        that is legitimately near a limit.
+    def _angles_plausible(self, angles_deg) -> bool:
+        """Reject a reading that cannot be a real pose at all.
+
+        This catches a garbled response that still decodes to six floats. It
+        deliberately does NOT enforce joint_limits_deg: those are two
+        different jobs, and conflating them is a mistake that cost a session.
+
+        An arm parked slightly outside the configured travel is reporting the
+        truth -- it happens after being moved by hand while released, or when
+        the configured limits are simply tighter than the hardware's real
+        range. Treating that as a bad read refused to connect at all, which
+        strands the driver with no way to command the arm back, even though
+        the jog clamp would have walked it into range on the first move.
         """
-        margin = 5.0
         return all(
-            (lo - margin) <= a <= (hi + margin)
-            for a, (lo, hi) in zip(angles_deg, self._joint_limits_deg)
+            -self.SANITY_LIMIT_DEG <= a <= self.SANITY_LIMIT_DEG
+            for a in angles_deg
         )
+
+    def _warn_if_outside_limits(self, angles_deg) -> None:
+        """Say so when the arm sits outside its configured travel.
+
+        Worth knowing -- it means joint_limits_deg disagrees with reality, and
+        jog targets on that joint will be clamped back into range -- but it is
+        information, not a fault, so it never blocks anything.
+        """
+        outside = [
+            f'joint{i + 1}={a:.1f} (limit {lo:.0f}..{hi:.0f})'
+            for i, (a, (lo, hi)) in enumerate(
+                zip(angles_deg, self._joint_limits_deg))
+            if not (lo <= a <= hi)
+        ]
+        if outside:
+            self.get_logger().warn(
+                'Arm is outside its configured travel: ' + ', '.join(outside)
+                + '. Jogs will clamp these joints back into range.',
+                throttle_duration_sec=30.0)
 
     def _handle_link_error(self, exc: Exception, context: str) -> None:
         """Mark the arm disconnected after a socket-level failure.
@@ -446,12 +473,13 @@ class MyCobotHardwareNode(Node):
             self._last_tx_time = time.monotonic()
             if not isinstance(angles_deg, list) or len(angles_deg) != 6:
                 return None
-            if not self._angles_within_limits(angles_deg):
+            if not self._angles_plausible(angles_deg):
                 self.get_logger().warn(
-                    f'Ignoring implausible angle read {angles_deg} '
-                    '(outside joint_limits_deg) -- treating as a bad read.',
+                    f'Ignoring impossible angle read {angles_deg} -- '
+                    'treating as a garbled response.',
                     throttle_duration_sec=2.0)
                 return None
+            self._warn_if_outside_limits(angles_deg)
             return [math.radians(a) for a in angles_deg]
         except Exception as e:
             self._handle_link_error(e, 'joint-state read')

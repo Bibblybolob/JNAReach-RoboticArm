@@ -330,6 +330,39 @@ class VisualServoNode(Node):
         # exactly where a tracked hand sits. lead_time is the term that
         # addresses moving hands; this one addresses arriving and staying.
         self.declare_parameter('progressive_gain', 2.0)
+        # --- Integral and derivative ---
+        #
+        # Both default to 0, which is the loop described above and the one all
+        # the measurements refer to. Turning them on makes this a real PID.
+        #
+        # The case against, so it is on the record rather than rediscovered:
+        # an integral winds up during dead time. This loop has roughly 250ms
+        # of it, so between commanding a correction and seeing it land, the
+        # error stays large and the integral keeps accumulating on an error
+        # that is already being fixed. It then overshoots by whatever it
+        # banked and unwinds on the way back. The original build did this at
+        # an effective gain near 1.4 and flicked left and right permanently.
+        # `integral_limit` bounds how bad that can get; it does not remove it.
+        #
+        # Derivative has a different problem: it differentiates a measurement
+        # that arrives ~15 times a second with a few pixels of MediaPipe
+        # jitter, so it amplifies noise more than it damps motion. `lead_time`
+        # already does the useful half of what a D term would do here, from a
+        # velocity estimate that has our own commanded motion subtracted out
+        # -- which a raw derivative cannot do, since it cannot tell the hand
+        # moving from the camera moving.
+        #
+        # None of that means they cannot help. It means start at 0.01-0.05 for
+        # ki rather than the 0.5 that feels natural next to gain, watch whether
+        # `seen=` starts alternating sign, and treat the tuner's flips/s as the
+        # number that matters rather than how it looks.
+        self.declare_parameter('ki', 0.0)
+        self.declare_parameter('kd', 0.0)
+        # Ceiling on the accumulated integral, in the same normalised
+        # half-frames as the error. Without it a hand held off-centre for a
+        # few seconds -- or a jog that never reached the arm -- banks an
+        # unbounded correction that has to be paid back in full.
+        self.declare_parameter('integral_limit', 0.5)
         # --- Lag compensation ---
         # The one change that lets this track fast instead of carefully.
         #
@@ -609,6 +642,16 @@ class VisualServoNode(Node):
         self._gain = float(self.get_parameter('gain').value)
         self._progressive_gain = float(
             self.get_parameter('progressive_gain').value)
+        self._ki = float(self.get_parameter('ki').value)
+        self._kd = float(self.get_parameter('kd').value)
+        self._integral_limit = float(
+            self.get_parameter('integral_limit').value)
+        # Accumulated error and the previous error, for the I and D terms.
+        # Both carry state across cycles, which is exactly why they are the
+        # parts that misbehave across a dropout -- see _reset_tracking.
+        self._integral = np.zeros(2, dtype=float)
+        self._prev_error = None
+        self._prev_error_t = None
         self._deadband = float(self.get_parameter('deadband').value)
         self._rate = float(self.get_parameter('rate').value)
         self._lag_comp = bool(self.get_parameter('lag_compensation').value)
@@ -838,6 +881,9 @@ class VisualServoNode(Node):
     _LIVE_PARAMS = {
         'gain': '_gain',
         'progressive_gain': '_progressive_gain',
+        'ki': '_ki',
+        'kd': '_kd',
+        'integral_limit': '_integral_limit',
         'lead_time': '_lead_time',
         'velocity_smoothing': '_vel_smoothing',
         'max_target_speed': '_max_target_speed',
@@ -1895,7 +1941,37 @@ class VisualServoNode(Node):
         # Keyed on the norm rather than per-axis so a hand far out diagonally
         # is chased as one target, not harder in x than in y.
         eff_gain = self._gain * (1.0 + self._progressive_gain * ce)
-        delta = self._jinv @ (eff_gain * error) * -1.0
+        command = eff_gain * error
+
+        # --- Integral and derivative, both 0 unless asked for ---
+        now_s = self._ros_now()
+        if self._ki > 0.0 or self._kd > 0.0:
+            dt = 0.0
+            if self._prev_error_t is not None:
+                dt = now_s - self._prev_error_t
+            # A gap means a dropout, not a long sample: integrating across it
+            # banks a correction for time the loop was not controlling, and
+            # differentiating across it produces a spike from a jump that
+            # never happened as motion.
+            if not (1e-3 < dt < 0.5):
+                dt = 0.0
+
+            if self._ki > 0.0 and dt > 0.0:
+                self._integral = self._integral + error * dt
+                mag = float(np.linalg.norm(self._integral))
+                if mag > self._integral_limit:
+                    self._integral = self._integral * (
+                        self._integral_limit / mag)
+                command = command + self._ki * self._integral
+
+            if self._kd > 0.0 and dt > 0.0 and self._prev_error is not None:
+                derivative = (error - self._prev_error) / dt
+                command = command + self._kd * derivative
+
+        self._prev_error = error.copy()
+        self._prev_error_t = now_s
+
+        delta = self._jinv @ command * -1.0
         dh, dv = float(delta[0]), float(delta[1])
 
         dh = max(-self._max_step, min(self._max_step, dh))

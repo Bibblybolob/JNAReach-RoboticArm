@@ -70,6 +70,9 @@ KNOBS = [
     ('assumed_deg_per_error',   'horiz deg/unit',      2.0,  5.0, 200.0),
     ('assumed_v_deg_per_error', 'vert deg/unit',       2.0,  0.0, 200.0),
     ('velocity_smoothing',      'vel filter',          0.1,  0.0,  0.95),
+    ('ki',                      'integral',            0.01, 0.0,   1.0),
+    ('kd',                      'derivative',          0.01, 0.0,   1.0),
+    ('integral_limit',          'integral cap',        0.1,  0.0,   2.0),
 ]
 
 HELP = """
@@ -144,7 +147,16 @@ class Tuner(Node):
                 if a * b < 0 and abs(a) > 3 and abs(b) > 3:
                     flips += 1
         span = self._samples[-1][0] - self._samples[0][0]
+        # Is the error systematically growing? A correctly signed loop pulls
+        # the target in; an inverted one pushes it out, and then every knob
+        # below is scaling a push. Compare the first third of the window
+        # against the last.
+        third = max(2, len(dists) // 3)
+        diverging = (len(dists) >= 9
+                     and sum(dists[-third:]) / third
+                     > sum(dists[:third]) / third + 25.0)
         return dict(
+            diverging=diverging,
             n=len(dists),
             mean=sum(dists) / len(dists),
             worst=max(dists),
@@ -231,6 +243,20 @@ class Tuner(Node):
 
         if sc is None:
             out.append('  waiting for a hand on /hand/point_px ...\n')
+        elif sc.get('diverging'):
+            # Nothing below this line is worth touching while the loop is
+            # pushing the hand away: every knob scales a correction that is
+            # pointed the wrong way, so they all "feel the same" and the score
+            # is measuring how fast the target leaves rather than how well it
+            # is held.
+            out.append(
+                f'  !! THE ERROR IS GROWING ({sc["mean"]:.0f} px and rising) '
+                f'-- the arm is driving your hand OUT of frame.\n')
+            out.append(
+                '     That is a SIGN problem, not a tuning one. Tuning cannot '
+                'fix it and\n     will feel like nothing does anything. '
+                'Restart with skip_probe:=false to\n     measure the mounting, '
+                'or flip assumed_h_sign / assumed_v_sign.\n')
         else:
             base = ''
             if self._baseline:

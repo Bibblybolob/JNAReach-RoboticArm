@@ -141,6 +141,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -148,6 +149,28 @@ from ament_index_python.packages import get_package_share_directory
 #   export MYCOBOT_IP=192.168.0.50      (whole shell session)
 #   ros2 launch ... robot_ip:=1.2.3.4   (one run, wins over the env var)
 DEFAULT_ROBOT_IP = os.environ.get('MYCOBOT_IP', '192.168.0.15')
+
+
+# Launch arguments arrive as strings and are YAML-parsed on the way into a
+# node, so `device_exposure:=50` becomes an INTEGER and a node declaring a
+# float refuses it -- the node dies at startup over a value the user typed
+# entirely reasonably. Every numeric or boolean parameter below is therefore
+# given an explicit type rather than left to inference. Three separate
+# startup crashes came from not doing this.
+def _f(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=float)
+
+
+def _i(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=int)
+
+
+def _b(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=bool)
+
+
+def _s(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=str)
 
 
 def generate_launch_description():
@@ -356,6 +379,13 @@ def generate_launch_description():
     robot = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(bringup_dir, 'launch', 'robot_bringup.launch.py')),
+        # Plain LaunchConfiguration here, NOT the typed helpers. These are
+        # launch ARGUMENTS being forwarded to another launch file, which are
+        # substitutions resolving to strings; the typing belongs where the
+        # value reaches a node's `parameters`, which for all of these is
+        # robot_bringup. Passing ParameterValue here fails at load with
+        # "'ParameterValue' object is not iterable", which does not point
+        # anywhere near the mistake.
         launch_arguments={
             'robot_ip': LaunchConfiguration('robot_ip'),
             'robot_port': LaunchConfiguration('robot_port'),
@@ -378,8 +408,8 @@ def generate_launch_description():
         name='color_tracker_node',
         condition=LaunchConfigurationEquals('track', 'color'),
         parameters=[{
-            'target_color': LaunchConfiguration('target_color'),
-            'show_window': LaunchConfiguration('show_window'),
+            'target_color': _s('target_color'),
+            'show_window': _b('show_window'),
             'publish_annotated': LaunchConfiguration('show_window'),
         }],
         output='screen',
@@ -393,16 +423,16 @@ def generate_launch_description():
         condition=LaunchConfigurationEquals('track', 'hand'),
         name='hand_tracker_node',
         parameters=[{
-            'show_window': LaunchConfiguration('show_window'),
+            'show_window': _b('show_window'),
             # Encoding and publishing an annotated frame costs real CPU per
             # frame, and nothing subscribes to it in this launch. Host load is
             # what stalls the stack and drops both links, so this is off unless
             # you are actually looking at the window.
             'publish_annotated': LaunchConfiguration('show_window'),
-            'model_complexity': LaunchConfiguration('model_complexity'),
-            'delegate': LaunchConfiguration('delegate'),
-            'target_landmark': LaunchConfiguration('target_landmark'),
-            'max_frame_age': LaunchConfiguration('max_frame_age'),
+            'model_complexity': _i('model_complexity'),
+            'delegate': _s('delegate'),
+            'target_landmark': _i('target_landmark'),
+            'max_frame_age': _f('max_frame_age'),
         }],
         output='screen',
         respawn=True,
@@ -420,28 +450,28 @@ def generate_launch_description():
             'point_topic': PythonExpression([
                 "'/color/point_px' if '", LaunchConfiguration('track'),
                 "' == 'color' else '/hand/point_px'"]),
-            'rate': LaunchConfiguration('rate'),
-            'gain': LaunchConfiguration('gain'),
-            'progressive_gain': LaunchConfiguration('progressive_gain'),
-            'assumed_deg_per_error': LaunchConfiguration('assumed_deg_per_error'),
+            'rate': _f('rate'),
+            'gain': _f('gain'),
+            'progressive_gain': _f('progressive_gain'),
+            'assumed_deg_per_error': _f('assumed_deg_per_error'),
             'assumed_v_deg_per_error': LaunchConfiguration(
                 'assumed_v_deg_per_error'),
-            'deadband': LaunchConfiguration('deadband'),
-            'lag_compensation': LaunchConfiguration('lag_compensation'),
-            'command_lag': LaunchConfiguration('command_lag'),
-            'max_step_deg': LaunchConfiguration('max_step_deg'),
-            'lead_time': LaunchConfiguration('lead_time'),
-            'velocity_smoothing': LaunchConfiguration('velocity_smoothing'),
-            'auto_sign': LaunchConfiguration('auto_sign'),
-            'lost_timeout': LaunchConfiguration('lost_timeout'),
-            'target_size_fraction': LaunchConfiguration('target_size_fraction'),
-            'approach_enabled': LaunchConfiguration('approach_enabled'),
-            'search_on_start': LaunchConfiguration('search_on_start'),
-            'search_sweep_seconds': LaunchConfiguration('search_sweep_seconds'),
-            'search_range_deg': LaunchConfiguration('search_range_deg'),
-            'skip_probe': LaunchConfiguration('skip_probe'),
-            'assumed_h_sign': LaunchConfiguration('assumed_h_sign'),
-            'assumed_v_sign': LaunchConfiguration('assumed_v_sign'),
+            'deadband': _f('deadband'),
+            'lag_compensation': _b('lag_compensation'),
+            'command_lag': _f('command_lag'),
+            'max_step_deg': _f('max_step_deg'),
+            'lead_time': _f('lead_time'),
+            'velocity_smoothing': _f('velocity_smoothing'),
+            'auto_sign': _b('auto_sign'),
+            'lost_timeout': _f('lost_timeout'),
+            'target_size_fraction': _f('target_size_fraction'),
+            'approach_enabled': _b('approach_enabled'),
+            'search_on_start': _b('search_on_start'),
+            'search_sweep_seconds': _f('search_sweep_seconds'),
+            'search_range_deg': _f('search_range_deg'),
+            'skip_probe': _b('skip_probe'),
+            'assumed_h_sign': _f('assumed_h_sign'),
+            'assumed_v_sign': _f('assumed_v_sign'),
         }],
         output='screen',
         respawn=True,

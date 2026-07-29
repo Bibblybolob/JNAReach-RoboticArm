@@ -147,6 +147,12 @@ Two traps:
   makes the image dark enough to break detection outright, so measure rather
   than assume; `camera_node` reports the rate it actually captures and names
   this cause when it looks like this.
+- **`CAP_PROP_BUFFERSIZE=1` halves the frame rate on this driver** — 30.0 fps
+  untouched against 18.5 with it set, measured back to back. It looks like the
+  obvious setting for a servo loop, since a queued frame is a stale frame, but
+  it only pays off when the reader is SLOWER than the camera. Both readers here
+  drain continuously, so the queue never forms and the cost is pure. Neither
+  path sets it now (`device_buffersize`, `--buffersize`, both 0 = leave alone).
 - **Detection rate is the real ceiling.** Below ~6/s nothing tuned in the
   servo helps. Read the `tracker:` and `pipeline:` log lines before touching
   any gain; `model_complexity:=0` and a smaller camera frame move that number

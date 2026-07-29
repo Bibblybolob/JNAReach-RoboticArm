@@ -69,6 +69,23 @@ class CameraNode(Node):
         # dropping frames.
         self.declare_parameter('device_mjpg', True)
         self.declare_parameter('device_fps', 30.0)
+        # V4L2 capture queue depth. 0 means "do not touch it", which is the
+        # default because setting it to 1 HALVES the frame rate on this
+        # driver: 30.0 fps untouched against 18.5 with BUFFERSIZE=1, measured
+        # back to back on the same camera.
+        #
+        # A depth of 1 is the obvious choice for a servo loop -- a queued
+        # frame is a stale frame, and this loop would rather have a new
+        # picture than every picture. But it only pays off if the reader is
+        # SLOWER than the camera, and _device_reader below is a tight loop
+        # with no pacing, so it drains as fast as frames arrive and the queue
+        # never builds. Paying half the frame rate to prevent a queue that
+        # does not form is the wrong trade twice over, since detection rate is
+        # the ceiling on the whole servo loop.
+        #
+        # Set it to 1 if the transit or staleness figures ever suggest frames
+        # really are queueing.
+        self.declare_parameter('device_buffersize', 0)
         # See _open_device: auto-exposure silently caps the frame rate in dim
         # light. Turn it off and the rate triples; the image gets darker.
         self.declare_parameter('device_auto_exposure', True)
@@ -246,12 +263,12 @@ class CameraNode(Node):
                     cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
         else:
             cap = cv2.VideoCapture(spec, cv2.CAP_GSTREAMER)
-        try:
-            # Freshest frame beats a queued one; a servo loop acting on a
-            # buffered frame is correcting where the hand already was.
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+        depth = int(self.get_parameter('device_buffersize').value)
+        if depth > 0:
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, depth)
+            except Exception:
+                pass
         return cap
 
     def _device_reader(self):

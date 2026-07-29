@@ -338,6 +338,10 @@ def main():
                         help='JPEG quality 1-100 (default 75)')
     parser.add_argument('--no-mjpg', action='store_true',
                         help='do not request MJPG capture format')
+    parser.add_argument('--buffersize', type=int, default=0,
+                        help='V4L2 capture queue depth. 0 leaves it alone, '
+                             'which is the default: setting it to 1 halved '
+                             'the measured frame rate (30.0 -> 18.5)')
     parser.add_argument('--no-auto-exposure', action='store_true',
                         help='disable auto exposure. A UVC camera in dim '
                              'light lengthens exposure to brighten the image, '
@@ -369,12 +373,21 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     cap.set(cv2.CAP_PROP_FPS, args.fps)
-    # Always read the freshest frame. Stale frames hurt a servo loop more than
-    # a lower frame rate does.
-    try:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    except Exception:
-        pass  # not supported by every backend
+    # Capture queue depth. NOT set by default, because setting it to 1 halves
+    # the frame rate on this driver -- measured on the host with the same
+    # camera, 30.0 fps untouched against 18.5 with BUFFERSIZE=1, and this Pi
+    # was serving 18.7 against the 30 it was asked for. Same signature.
+    #
+    # A shallow queue only helps when the reader is slower than the camera.
+    # This loop paces itself to the requested rate and no slower, so the queue
+    # stays shallow on its own, and detection rate is the ceiling on the whole
+    # servo loop upstream. --buffersize 1 restores the old behaviour if the
+    # host's transit figures ever show frames genuinely queueing.
+    if args.buffersize > 0:
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, args.buffersize)
+        except Exception:
+            pass  # not supported by every backend
 
     # See --no-auto-exposure. This is a frame rate control as much as a
     # brightness one, and it is the least obvious limit in the whole pipeline.

@@ -27,6 +27,28 @@ from ament_index_python.packages import get_package_share_directory
 DEFAULT_ROBOT_IP = os.environ.get('MYCOBOT_IP', '192.168.0.15')
 
 
+# Launch arguments arrive as strings and are YAML-parsed on the way into a
+# node, so `device_exposure:=50` becomes an INTEGER and a node declaring a
+# float refuses it -- the node dies at startup over a value the user typed
+# entirely reasonably. Every numeric or boolean parameter below is therefore
+# given an explicit type rather than left to inference. Three separate
+# startup crashes came from not doing this.
+def _f(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=float)
+
+
+def _i(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=int)
+
+
+def _b(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=bool)
+
+
+def _s(name):
+    return ParameterValue(LaunchConfiguration(name), value_type=str)
+
+
 def generate_launch_description():
     robot_ip_arg = DeclareLaunchArgument(
         'robot_ip', default_value=DEFAULT_ROBOT_IP,
@@ -117,7 +139,7 @@ def generate_launch_description():
             'speed_headroom': 1.3,
             'home_angles_deg': [0.0, 90.0, -90.0, 0.0, 0.0, 0.0],
             'home_speed': 30,
-            'home_on_start': LaunchConfiguration('home_on_start'),
+            'home_on_start': _b('home_on_start'),
         }],
         output='screen',
         # Deliberately NOT respawned, unlike the other nodes. Two reasons,
@@ -147,19 +169,19 @@ def generate_launch_description():
             # number alone does not make the Pi send faster, it only makes
             # this node republish the same frame more often.
             'frame_rate': 31.0,
-            'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
-            'source': LaunchConfiguration('source'),
+            'stream_read_timeout': _f('stream_read_timeout'),
+            'source': _s('source'),
             # Forced to str: launch YAML-parses '0' into an integer, but this
             # parameter is a string so that a GStreamer pipeline can go in the
             # same field. Without this the node dies at startup on a type
             # mismatch for the most ordinary value anyone would pass.
             'device': ParameterValue(LaunchConfiguration('device'),
                                      value_type=str),
-            'device_auto_exposure': LaunchConfiguration('device_auto_exposure'),
-            'device_exposure': LaunchConfiguration('device_exposure'),
-            'device_fps': LaunchConfiguration('device_fps'),
-            'device_width': LaunchConfiguration('device_width'),
-            'device_height': LaunchConfiguration('device_height'),
+            'device_auto_exposure': _b('device_auto_exposure'),
+            'device_exposure': _f('device_exposure'),
+            'device_fps': _f('device_fps'),
+            'device_width': _i('device_width'),
+            'device_height': _i('device_height'),
         }],
         output='screen',
         respawn=True,

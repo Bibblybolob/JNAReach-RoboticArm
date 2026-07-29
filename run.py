@@ -444,15 +444,40 @@ class Panel(Node):
         return res
 
     def wait_for_nodes(self, timeout=45.0):
+        """Wait for the stack to be genuinely usable, not merely present.
+
+        A node registers its name during construction, so every node is 'up'
+        long before the driver has reached the arm -- and reaching the arm has
+        been measured at nine seconds on a busy Pi. Reporting readiness on the
+        names alone hands back a menu that cannot drive anything yet, and the
+        obvious next move is to press 7, see 'no /joint_states', and conclude
+        the driver is broken when it is simply still connecting.
+
+        So the real signal is joint states arriving: that means the driver has
+        the socket, the arm answered, and commands will land.
+        """
         say('Waiting for nodes...')
         end = time.monotonic() + timeout
+        named = False
         while time.monotonic() < end:
-            live = set(self.get_node_names())
-            if all(n in live for n in EXPECTED_NODES):
-                say('All nodes up.')
+            if not named and all(n in set(self.get_node_names())
+                                 for n in EXPECTED_NODES):
+                named = True
+                say('All nodes up; waiting for the driver to reach the arm...')
+            if named and self._joints is not None:
+                say('Driver connected to the arm. Ready.')
                 return True
-            time.sleep(1.0)
-        warn('Not all nodes appeared; check the log with "l".')
+            time.sleep(0.5)
+
+        if not named:
+            warn('Not all nodes appeared; check the log with "l".')
+        else:
+            warn('Nodes are up but no /joint_states arrived -- the driver has '
+                 'not reached the arm.\n'
+                 '     Port 9000 is single-client, so the usual causes are '
+                 'another process holding it\n'
+                 '     or the arm server still restarting. Check with "9", or '
+                 'read the log with "l".')
         return False
 
     # ---- actions ----

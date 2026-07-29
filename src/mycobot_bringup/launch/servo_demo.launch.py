@@ -207,6 +207,13 @@ def generate_launch_description():
         description='Work out from the tracking motion itself whether an '
                     'axis is inverted, and flip it. Replaces guessing at '
                     'assumed_h_sign / assumed_v_sign by hand')
+    rate_arg = DeclareLaunchArgument(
+        'rate', default_value='30.0',
+        description='How often the servo checks for a new sighting. Keep at '
+                    'or above the camera rate: the loop acts once per new '
+                    'detection, so a lower rate both delays every correction '
+                    'by up to 1/rate and silently discards the detections '
+                    'that arrive in between')
     progressive_gain_arg = DeclareLaunchArgument(
         'progressive_gain', default_value='2.0',
         description='Scale the gain with distance from centre: effective '
@@ -382,6 +389,7 @@ def generate_launch_description():
             'point_topic': PythonExpression([
                 "'/color/point_px' if '", LaunchConfiguration('track'),
                 "' == 'color' else '/hand/point_px'"]),
+            'rate': LaunchConfiguration('rate'),
             'gain': LaunchConfiguration('gain'),
             'progressive_gain': LaunchConfiguration('progressive_gain'),
             'assumed_deg_per_error': LaunchConfiguration('assumed_deg_per_error'),
@@ -424,6 +432,7 @@ def generate_launch_description():
         auto_sign_arg,
         deg_per_error_arg,
         v_deg_per_error_arg,
+        rate_arg,
         progressive_gain_arg,
         deadband_arg,
         track_arg,

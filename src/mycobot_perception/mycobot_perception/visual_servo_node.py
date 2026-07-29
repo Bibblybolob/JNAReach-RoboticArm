@@ -485,9 +485,30 @@ class VisualServoNode(Node):
         # continuously and buzzes. 0.04 of a half-frame is a hand sitting
         # comfortably in the middle of the picture.
         self.declare_parameter('deadband', 0.04)
-        # Loop rate. The driver rate-limits jogs to its command_interval
-        # (0.06s, ~16Hz), so going much above that just discards commands.
-        self.declare_parameter('rate', 15.0)
+        # Loop rate. Keep this AT OR ABOVE the detection rate.
+        #
+        # The loop acts at most once per new sighting (see _acted_point_time),
+        # so this is not a command rate -- it is how often the node looks to
+        # see whether a new measurement has arrived. Two things follow when it
+        # is lower than the camera:
+        #
+        #   * every detection waits up to 1/rate before anything happens to
+        #     it. At 15Hz that is 67ms of pure latency added to a loop whose
+        #     binding constraint is latency.
+        #   * detections arriving faster than this are silently dropped. At
+        #     30fps against a 15Hz loop, half of every frame the Pi worked to
+        #     produce is discarded on arrival.
+        #
+        # It was 15 because the driver used to rate-limit jogs to its
+        # command_interval and anything faster was thrown away there instead.
+        # That is no longer true: with jog_profile on, a jog message only
+        # moves a goal, which is cheap and unthrottled, and the profiler
+        # streams to it on its own timer. So the old ceiling is gone and this
+        # should track the camera.
+        #
+        # 30 to match the Pi. Raising it further costs nothing but does
+        # nothing either -- there is no new information between frames.
+        self.declare_parameter('rate', 30.0)
         # Stop if the target has not been seen for this long. Without it, the
         # arm keeps acting on a stale position after the hand leaves frame.
         self.declare_parameter('target_timeout', 0.9)

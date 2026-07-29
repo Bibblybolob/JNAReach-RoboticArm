@@ -129,6 +129,12 @@ Two traps:
   cross-coupled and no per-axis scalar helps, so measure the real 2x2 with
   `skip_probe:=false`. The `responds Nx as strongly as assumed` line says
   which case you are in.
+- **Keep the servo's `rate` at or above the camera's.** The loop acts once
+  per new sighting, so a lower rate delays every correction by up to `1/rate`
+  AND silently discards the detections arriving in between — at 15Hz against
+  a 30fps camera that was 67ms of added latency and half the frames thrown
+  away. The old justification (the driver rate-limited jogs anyway) stopped
+  being true when `jog_profile` landed: a jog message now only moves a goal.
 - **Detection rate is the real ceiling.** Below ~6/s nothing tuned in the
   servo helps. Read the `tracker:` and `pipeline:` log lines before touching
   any gain; `model_complexity:=0` and a smaller camera frame move that number

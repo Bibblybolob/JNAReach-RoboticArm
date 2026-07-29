@@ -232,7 +232,49 @@ remaining improvement.
 Elephant shipping a Jetson as the onboard computer, reaching the arm over the
 Jetson's own hardware UART (`/dev/ttyTHS1`) rather than USB. So "the Jetson
 drives the arm directly" is a supported topology rather than a modification —
-it is UART pins, not a USB cable, and the baud is the firmware's business.
+UART pins, not a USB cable.
+
+### Putting a Jetson on the arm's UART
+
+The end state, and the software for it is already written:
+
+```bash
+./run.py connection:=serial serial_port:=/dev/ttyTHS1 serial_baud:=1000000 \
+    source:=device device:=0
+```
+
+`connection:=serial` was built for the USB attempt that failed. It is exactly
+what this needs — only the port name changes.
+
+Electrically it is undemanding. Pi GPIO, Jetson GPIO and the ESP32 are all
+3.3V logic, so no level shifting: TX to RX, RX to TX, common ground. **Use
+1000000 baud, not the 115200 in the JetsonNano row** — that column reflects
+that variant's own firmware, and this arm's Atom runs at 1000000 (see
+`pi/server.py`).
+
+Four things to get right:
+
+- **Free the UART from the serial console.** On Jetson, the 40-pin header UART
+  is claimed by a getty by default, which will fight for the port exactly like
+  the Bluetooth bridge did: `systemctl disable --now nvgetty` (or
+  `serial-getty@ttyTHS*`). Same class of bug as the `dialout` group — the port
+  exists, opens, and does not work.
+- **One master.** The Pi must not be driving the same lines. Either remove it
+  or keep `mycobot_server` and the `rc.local` bridge disabled.
+- **Power.** The Jetson wants its own supply (19V for an Orin) and will not fit
+  where the Pi does. Expect it outside the base with a short cable to the UART.
+- **De-risk it for the price of a cable first.** A USB-to-TTL adapter on those
+  same UART lines, driven from the PC with `connection:=serial
+  serial_port:=/dev/ttyUSB0 serial_baud:=1000000`, tests the entire approach
+  without relocating anything. If the protocol works over a raw UART from an
+  external computer, the Jetson version is the same thing on different pins.
+
+**What it buys is mostly reliability, not speed.** `send_angles` is not in
+`server.py`'s `has_return` table so commanding is already cheap, and the
+dominant term in the round trip is the servos physically moving. What goes away
+is a whole class of failure: the Pi unreachable, WiFi dropping mid-run,
+port 9000 single-client lockouts, and factory services stealing the UART —
+three separate sessions were lost to that layer, and none of it was latency.
 
 **The original hope, for the record:** The 280 Pi
 drives its servos through an M5Stack Atom (ESP32) that the Raspberry Pi

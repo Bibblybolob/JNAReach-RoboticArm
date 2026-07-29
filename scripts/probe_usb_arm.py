@@ -6,6 +6,23 @@
 Read-only. It asks the arm for its joint angles and nothing else -- no motion
 is commanded, so this is safe to run with the arm in any pose.
 
+WHICH PORT
+
+The one on the ATOM -- the small module with the LED matrix, up at the head
+near the end effector. That is the ESP32 sitting on the servo bus, and it is
+the only one that could speak the robot protocol.
+
+NOT the USB-C on the base. On a 280 Pi that is the Raspberry Pi's power
+input, and the Pi's USB device controller is not enabled anyway
+(/sys/class/udc/ is empty), so it cannot present itself as a serial port even
+if you wanted it to.
+
+If you are unsure which you have plugged into, this script prints the USB
+descriptor of whatever it finds. An Atom shows up through a USB-serial bridge
+-- expect a vendor string like Silicon Labs, wch.cn, or QinHeng, and a device
+name of the CP210x / CH9102 family. Anything mentioning Raspberry Pi means you
+are on the wrong port.
+
 WHY THIS MATTERS
 
 The 280 Pi has an M5Stack Atom (ESP32) driving the servo bus, and the

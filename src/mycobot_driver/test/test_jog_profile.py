@@ -20,6 +20,8 @@ or pymycobot, and tests the shipping code rather than a copy of it.
 import ast
 import math
 import os
+import threading
+import time
 
 SRC = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -30,21 +32,26 @@ ACCEL = 1200.0   # matches max_jog_accel_deg_s2
 V_MAX = 80.0
 
 
-def _load():
+def _load(*names):
     tree = ast.parse(open(SRC).read())
     cls = next(n for n in tree.body
                if isinstance(n, ast.ClassDef)
                and n.name == 'MyCobotHardwareNode')
-    fn = next(n for n in cls.body
-              if isinstance(n, ast.FunctionDef) and n.name == 'profile_step')
-    # Drop @staticmethod; it is being exec'd as a plain function.
-    fn.decorator_list = []
-    ns = {'math': math}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), SRC, 'exec'), ns)
-    return ns['profile_step']
+    fns = [n for n in cls.body
+           if isinstance(n, ast.FunctionDef) and n.name in names]
+    missing = set(names) - {f.name for f in fns}
+    assert not missing, f'not found in the driver: {sorted(missing)}'
+    for f in fns:
+        # Drop @staticmethod; these are exec'd as plain functions.
+        f.decorator_list = []
+    ns = {'math': math, 'time': time}
+    exec(compile(ast.Module(body=fns, type_ignores=[]), SRC, 'exec'), ns)
+    return ns
 
 
-profile_step = _load()
+_NS = _load('profile_step', '_jog_profile_tick', '_jog_reset_profile',
+            '_publish_jog_applied', '_step_speed')
+profile_step = _NS['profile_step']
 
 
 def drive(distance, dt=DT, accel=ACCEL, v_max=V_MAX, max_ticks=2000):
@@ -232,6 +239,160 @@ def test_faster_acceleration_arrives_sooner():
     slow = len(drive(20.0, accel=200.0))
     fast = len(drive(20.0, accel=1200.0))
     assert fast < slow
+
+
+
+# --- The timer body, driven against a stub arm --------------------------------
+#
+# The arithmetic above is only half the story. A NameError left in
+# _jog_profile_tick by a refactor killed the driver the first time a jog
+# arrived on real hardware -- py_compile does not catch that, and none of the
+# tests above execute the method that had the bug. These do.
+
+
+class _StubArm:
+    def __init__(self):
+        self.sent = []
+
+    def send_angles(self, angles, speed):
+        self.sent.append((list(angles), speed))
+
+
+class _StubLog:
+    def __init__(self):
+        self.messages = []
+
+    def __getattr__(self, level):
+        return lambda msg, **kw: self.messages.append(msg)
+
+
+class _StubNode:
+    """The smallest object _jog_profile_tick will run against."""
+
+    JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
+
+    def __init__(self, target=None, accel=ACCEL):
+        self._jog_profile = True
+        self._in_motion = threading.Event()
+        self._jog_enabled = True
+        self._mc = _StubArm()
+        self._lock = threading.Lock()
+        self._cmd_interval = DT
+        self._jog_accel = accel
+        self._jog_max_speed = V_MAX
+        self._jog_vel = [0.0] * 6
+        self._jog_cmd_deg = [0.0] * 6
+        self._jog_target_deg = list(target) if target else [0.0] * 6
+        self._joint_limits_deg = [(-168.0, 168.0)] * 6
+        self._adaptive_jog_speed = True
+        self._jog_speed = 40
+        self._min_jog_speed = 60
+        self._min_speed = 15
+        self._max_speed = 100
+        self._speed_at_100 = 120.0
+        self._speed_headroom = 1.3
+        self._traj_speed = 60
+        self._adaptive_speed = True
+        self._last_tx_time = 0.0
+        self._last_jog_time = 0.0
+        self._last_angles_rad = None
+        self.applied_msgs = []
+        self._log = _StubLog()
+
+    def get_logger(self):
+        return self._log
+
+    def get_clock(self):
+        class _C:
+            def now(self):
+                class _T:
+                    def to_msg(self):
+                        return None
+                return _T()
+        return _C()
+
+    # Captured instead of published; JointJog needs ROS to construct.
+    def _publish_jog_applied(self, applied):
+        self.applied_msgs.append(list(applied))
+
+
+for _n in ('profile_step', '_jog_profile_tick', '_jog_reset_profile',
+           '_step_speed'):
+    setattr(_StubNode, _n, _NS[_n])
+_StubNode.profile_step = staticmethod(_NS['profile_step'])
+
+
+def test_the_timer_body_actually_runs():
+    """Regression guard for the NameError that killed the driver."""
+    n = _StubNode(target=[10.0, 0, 0, 0, 0, 0])
+    n._jog_profile_tick()
+    assert n._mc.sent, 'nothing was commanded'
+    angles, speed = n._mc.sent[-1]
+    assert angles[0] > 0.0
+    assert speed >= n._min_jog_speed
+
+
+def test_the_timer_body_walks_all_the_way_to_the_goal():
+    n = _StubNode(target=[10.0, 0, 0, 0, 0, 0])
+    for _ in range(200):
+        n._jog_profile_tick()
+    assert abs(n._jog_cmd_deg[0] - 10.0) < 1e-9
+    assert abs(n._mc.sent[-1][0][0] - 10.0) < 1e-9
+    # And it reports each applied step.
+    assert abs(sum(m[0] for m in n.applied_msgs) - 10.0) < 1e-9
+
+
+def test_the_timer_body_is_a_no_op_once_it_has_arrived():
+    n = _StubNode(target=[3.0, 0, 0, 0, 0, 0])
+    for _ in range(200):
+        n._jog_profile_tick()
+    before = len(n._mc.sent)
+    for _ in range(10):
+        n._jog_profile_tick()
+    assert len(n._mc.sent) == before, 'kept commanding after arrival'
+
+
+def test_the_timer_body_respects_the_gates():
+    for attr, value in (('_jog_profile', False), ('_jog_enabled', False),
+                        ('_mc', None), ('_jog_cmd_deg', None),
+                        ('_jog_target_deg', None)):
+        n = _StubNode(target=[10.0, 0, 0, 0, 0, 0])
+        arm = n._mc
+        setattr(n, attr, value)
+        n._jog_profile_tick()
+        assert not arm.sent, f'commanded the arm with {attr}={value}'
+    n = _StubNode(target=[10.0, 0, 0, 0, 0, 0])
+    n._in_motion.set()
+    n._jog_profile_tick()
+    assert not n._mc.sent, 'commanded the arm during a trajectory'
+
+
+def test_the_timer_body_clamps_to_joint_limits():
+    n = _StubNode(target=[500.0, 0, 0, 0, 0, 0])
+    for _ in range(400):
+        n._jog_profile_tick()
+    assert max(a[0] for a, _ in n._mc.sent) <= 168.0
+
+
+def test_a_link_failure_does_not_escape_the_timer_body():
+    n = _StubNode(target=[10.0, 0, 0, 0, 0, 0])
+
+    def boom(angles, speed):
+        raise RuntimeError('pymycobot said no')
+
+    n._mc.send_angles = boom
+    n._jog_profile_tick()          # must not raise
+    assert any('rejected' in m for m in n._log.messages)
+
+
+def test_reset_clears_the_ramp():
+    n = _StubNode(target=[20.0, 0, 0, 0, 0, 0])
+    n._jog_profile_tick()
+    assert n._jog_vel[0] != 0.0
+    n._jog_reset_profile()
+    assert n._jog_target_deg is None
+    assert n._jog_cmd_deg is None
+    assert n._jog_vel == [0.0] * 6
 
 
 if __name__ == '__main__':

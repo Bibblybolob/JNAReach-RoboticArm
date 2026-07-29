@@ -997,6 +997,32 @@ class MyCobotHardwareNode(Node):
         self._jog_vel = [0.0] * len(self.JOINT_NAMES)
 
     def _jog_profile_step(self) -> None:
+        """Timer entry point. Never lets an exception escape.
+
+        An unhandled exception in a timer callback propagates out of
+        executor.spin() and takes the whole driver down -- and a driver that
+        dies mid-motion does not get to run destroy_node, so mc.stop() never
+        happens and the arm is left holding whatever it was last told. That is
+        a bad failure mode for a bug in a smoothing filter.
+
+        It has already happened once: a NameError left in this method by a
+        refactor killed the node the first time a jog arrived. py_compile does
+        not catch that, and the profile's own tests exercise the arithmetic
+        rather than this method, so nothing upstream caught it either.
+        test_jog_profile.py now drives this function against a stub arm for
+        exactly that reason.
+        """
+        try:
+            self._jog_profile_tick()
+        except Exception as e:
+            # Drop the ramp rather than carrying on from a half-updated state.
+            self._jog_reset_profile()
+            self.get_logger().error(
+                f'Jog profile step failed ({e.__class__.__name__}: {e}); '
+                'profile reset, jogging continues on the next command.',
+                throttle_duration_sec=2.0)
+
+    def _jog_profile_tick(self) -> None:
         """Advance the commanded pose toward the goal on a trapezoid.
 
         A standard trapezoidal velocity profile: accelerate at a fixed rate,
@@ -1028,12 +1054,13 @@ class MyCobotHardwareNode(Node):
         if mc is None or self._jog_cmd_deg is None:
             return
 
+        dt = self._cmd_interval
         applied = [0.0] * len(self.JOINT_NAMES)
         moving = False
         for i in range(len(self.JOINT_NAMES)):
             step, v = self.profile_step(
                 self._jog_target_deg[i] - self._jog_cmd_deg[i],
-                self._jog_vel[i], self._cmd_interval,
+                self._jog_vel[i], dt,
                 self._jog_accel, self._jog_max_speed)
             self._jog_vel[i] = v
             self._jog_cmd_deg[i] += step

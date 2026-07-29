@@ -46,6 +46,9 @@ in width.
 
 from __future__ import annotations
 
+from . import _env
+_env.check()   # before cv_bridge: see the module docstring
+
 import cv2
 import numpy as np
 

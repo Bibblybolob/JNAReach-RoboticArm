@@ -49,6 +49,9 @@ from __future__ import annotations
 import math
 import os
 
+from . import _env
+_env.check()   # before cv_bridge: see the module docstring
+
 import cv2
 import numpy as np
 

@@ -67,20 +67,46 @@ def find_ports():
 
 
 def describe(port):
-    """Anything the kernel will tell us about what this is."""
+    """USB descriptor of the device behind this tty.
+
+    Walks UP from the tty until a level carrying idVendor is found, and stops
+    at the first one. Starting several levels up instead reported the xHCI
+    root hub -- "product=xHCI Host Controller, manufacturer=Linux" -- which is
+    true of the machine's USB controller and says nothing about what is
+    plugged into it.
+    """
     import os
     base = os.path.basename(port)
-    bits = []
-    for attr in ('idVendor', 'idProduct', 'product', 'manufacturer'):
-        for depth in ('../../../', '../../'):
-            path = f'/sys/class/tty/{base}/device/{depth}{attr}'
+    for depth in ('', '..', '../..', '../../..', '../../../..'):
+        root = os.path.join(f'/sys/class/tty/{base}/device', depth)
+        try:
+            with open(os.path.join(root, 'idVendor')) as fh:
+                vendor = fh.read().strip()
+        except OSError:
+            continue
+        bits = [f'idVendor={vendor}']
+        for attr in ('idProduct', 'product', 'manufacturer'):
             try:
-                with open(path) as fh:
+                with open(os.path.join(root, attr)) as fh:
                     bits.append(f'{attr}={fh.read().strip()}')
-                    break
             except OSError:
-                continue
-    return ', '.join(bits) or 'no USB descriptor available'
+                pass
+        return ', '.join(bits)
+    return 'no USB descriptor available'
+
+
+def readable(port):
+    """(ok, why-not). A permission problem is not a protocol problem, and
+    reporting it as one sends you looking in completely the wrong place."""
+    import grp
+    import os
+    if not os.access(port, os.R_OK | os.W_OK):
+        try:
+            owner = grp.getgrgid(os.stat(port).st_gid).gr_name
+        except (OSError, KeyError):
+            owner = 'dialout'
+        return False, owner
+    return True, None
 
 
 def try_port(port, baud, timeout=6.0):
@@ -135,6 +161,27 @@ def main():
         print(f'  {p}  ({describe(p)})')
     print()
 
+    # Check access before touching bauds. Every baud fails identically on a
+    # permission error, and four identical failures followed by "the arm did
+    # not answer" points at the firmware when the problem is a unix group.
+    blocked = [(p, g) for p, g in ((p, readable(p)[1]) for p in ports)
+               if g is not None]
+    if blocked and len(blocked) == len(ports):
+        port, group = blocked[0]
+        print('=' * 68)
+        print(f'  {port} exists, but this user cannot open it.')
+        print('=' * 68)
+        print('\nThe device is there -- which is the interesting half of the')
+        print(f'question already answered -- but it is owned by group '
+              f'"{group}"')
+        print('and you are not in it. Nothing about the arm has been tested')
+        print('yet.\n')
+        print(f'    sudo usermod -aG {group} $USER\n')
+        print('Then either log out and back in, or for this shell only:\n')
+        print(f'    newgrp {group}\n')
+        print('and run this again.')
+        return 1
+
     bauds = [args.baud] if args.baud else BAUDS
     for port in ports:
         print(f'{port}:')
@@ -159,7 +206,8 @@ def main():
     print('=' * 68)
     print('  A serial device exists, but the arm did not answer on it.')
     print('=' * 68)
-    print('\nMost likely that port is the ESP32 bootloader/console rather')
+    print('\nPermissions are fine, so this is a real negative. Most likely')
+    print('that port is the ESP32 bootloader/console rather')
     print('than the robot protocol, or the firmware only bridges the GPIO')
     print('UART. Check that mycobot_server is stopped on the Pi -- if it is')
     print('still running it owns the bus and will win.')

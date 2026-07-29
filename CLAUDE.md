@@ -231,6 +231,22 @@ hardware as of this writing; the port may be power-only.
   after a deliberate shutdown.
 - Port 9000 is single-client (`listen(1)`). Probe it by connecting and closing
   at once; anything that holds the slot locks out the driver.
+- **The Pi ships with a Bluetooth bridge that holds the arm's UART, and it
+  starts on every boot.** `/etc/rc.local` runs
+  `/home/er/mycobot_pi_bluetooth/bt_auto_start.sh`, which runs
+  `uart_peripheral_serial.py`, which opens `/dev/ttyAMA0` — the same port
+  `server.py` uses to reach the arm's ESP32. Stopping `mycobot_server` does
+  **not** release it; it was found holding the port after four hours with the
+  unit inactive.
+  ```bash
+  ssh er@<pi> 'sudo pkill -f uart_peripheral_serial'          # now
+  ssh er@<pi> "sudo sed -i 's|^\./bt_auto_start.sh|#&|' /etc/rc.local"   # and at boot
+  ```
+  Two readers on one tty split the incoming byte stream, so this can corrupt
+  the arm's *replies* as well as its commands — `get_angles` returning
+  nonsense makes the driver's measured pose wrong, which is what the
+  divergence guard and `auto_sign` both reason from. Suspect it whenever the
+  arm moves but the image does not respond as predicted.
 - **`send_angles` stops on arrival, so the commanded point must lead.** The
   jog profiler commands `jog_lookahead` (0.12s) of its own velocity ahead of
   the profiled position; without that the arm reaches each commanded angle,

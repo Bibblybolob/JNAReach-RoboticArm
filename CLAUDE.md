@@ -212,5 +212,24 @@ frame, which is indistinguishable from a badly mounted camera.
   timestamp while representing a blend of older frames, so the smoothing lag
   is invisible to the lag compensator, and doubling it adds dead time to the
   loop whose binding constraint is dead time. Tune the existing one instead.
-- Planned hardware move: Jetson Orin Nano + RealSense D405, which removes most
-  of the latency the servo currently compensates for.
+- Planned hardware move: Jetson Orin Nano Super + RealSense D405, with the Pi
+  on Ethernet rather than WiFi. Work for it lands on the **`Jetson` branch**.
+  Groundwork already in place:
+  - `camera_node` takes `source:=device` to open a local V4L2 or CSI camera
+    (a non-numeric `device` is handed to OpenCV as a GStreamer pipeline, which
+    is how `nvarguscamerasrc` gets in) instead of the Pi's MJPEG stream.
+  - `hand_tracker_node` takes `delegate:=gpu`, switching from
+    `mp.solutions.hands` — which is CPU-only and has no delegate option at all
+    — to the Tasks API `HandLandmarker`. Needs a `hand_landmarker.task` bundle
+    (not shipped in the wheel) **and** a mediapipe build with GPU support; the
+    stock Linux wheels are CPU-only, so it falls back and says so. The
+    backend actually in use is logged at startup — do not assume.
+  - **Temper expectations on GPU inference.** At 30fps the budget is 33ms a
+    frame and the CPU path measures 8-19ms, so there is no shortage of
+    inference capacity to relieve. The Orin's value here is latency and
+    topology, not FLOPS, and the biggest single win available is the Jetson
+    driving the arm as well as watching it — that is the leg the servo's
+    ~250ms round trip actually lives in.
+  - MediaPipe on ARM64/Jetson is an integration risk worth checking early:
+    Google publishes no Jetson wheels, so it is community builds or building
+    from source. TensorRT or Isaac ROS are the native alternatives.

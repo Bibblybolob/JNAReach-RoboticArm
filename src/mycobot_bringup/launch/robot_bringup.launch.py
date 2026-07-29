@@ -115,10 +115,12 @@ def generate_launch_description():
                 "' + '/?action=stream'",
             ]),
             # Keep this at or just above the Pi's capture rate (--fps in
-            # pi/mjpg_streamer.service, currently 15). It was 30 against a
+            # pi/mjpg_streamer.service, now 30). It was once 30 against a
             # 10fps source, which just re-sent each frame ~3x and burned host
-            # CPU the stack cannot spare. Raise both together, not one.
-            'frame_rate': 16.0,
+            # CPU the stack cannot spare. RAISE BOTH TOGETHER, NOT ONE: this
+            # number alone does not make the Pi send faster, it only makes
+            # this node republish the same frame more often.
+            'frame_rate': 31.0,
             'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
         }],
         output='screen',

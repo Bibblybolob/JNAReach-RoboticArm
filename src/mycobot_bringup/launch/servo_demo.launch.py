@@ -119,6 +119,8 @@ Useful arguments:
     target_size_fraction:=0.55     closer approach (0.45 default)
     search_sweep_seconds:=25.0     slower sweep, more chance to lock on
     search_range_deg:=90.0         narrower sweep (+45 to -45)
+    delegate:=gpu                  Tasks API on the GPU (needs a model +
+                                   a GPU-capable mediapipe build)
     skip_probe:=false              measure the camera mounting first
     assumed_v_deg_per_error:=19.0  if tilting is weaker than panning
     assumed_h_sign:=-1.0           flip if it drives the hand out sideways
@@ -228,6 +230,18 @@ def generate_launch_description():
         description='Image error below which the arm holds still. 0.05 is a '
                     'hand comfortably in the middle of the picture. Raise it '
                     'if the arm buzzes, lower it to sit nearer dead centre')
+    delegate_arg = DeclareLaunchArgument(
+        'delegate', default_value='cpu',
+        description="Hand detection backend: 'cpu' is mp.solutions.hands, "
+                    "which has no GPU option at all. 'gpu' switches to the "
+                    "Tasks API and needs both a hand_landmarker.task bundle "
+                    "and a mediapipe build with GPU support (the stock Linux "
+                    "wheels are CPU-only). 'auto' tries GPU and falls back "
+                    'quietly. The backend actually used is logged at startup')
+    hand_model_arg = DeclareLaunchArgument(
+        'hand_model_path', default_value='',
+        description='Path to hand_landmarker.task for delegate:=gpu. Empty '
+                    'uses ~/hand_landmarker.task')
     model_complexity_arg = DeclareLaunchArgument(
         'model_complexity', default_value='0',
         description='MediaPipe hand model: 0 is ~2x faster than 1. On a '
@@ -317,6 +331,7 @@ def generate_launch_description():
             # you are actually looking at the window.
             'publish_annotated': LaunchConfiguration('show_window'),
             'model_complexity': LaunchConfiguration('model_complexity'),
+            'delegate': LaunchConfiguration('delegate'),
             'target_landmark': LaunchConfiguration('target_landmark'),
             'max_frame_age': LaunchConfiguration('max_frame_age'),
         }],
@@ -375,6 +390,8 @@ def generate_launch_description():
         progressive_gain_arg,
         deadband_arg,
         model_complexity_arg,
+        delegate_arg,
+        hand_model_arg,
         target_landmark_arg,
         max_frame_age_arg,
         show_window_arg,

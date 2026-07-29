@@ -47,6 +47,7 @@ precisely the step an OAK-D Pro removes, which is why it is isolated here.
 from __future__ import annotations
 
 import math
+import os
 
 import cv2
 import numpy as np
@@ -61,6 +62,7 @@ from geometry_msgs.msg import PointStamped
 
 try:
     import mediapipe as mp
+    from mediapipe.framework.formats import landmark_pb2
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         'mediapipe not installed:\n'
@@ -96,6 +98,85 @@ RULER_A = INDEX_MCP
 RULER_B = PINKY_MCP
 
 
+class _SolutionsDetector:
+    """mp.solutions.hands -- the legacy API. CPU only, by construction."""
+
+    def __init__(self, max_hands, complexity, min_det, min_track):
+        self._hands = mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=max_hands,
+            model_complexity=complexity,
+            min_detection_confidence=min_det,
+            min_tracking_confidence=min_track,
+        )
+
+    def detect(self, rgb, stamp_ms):
+        results = self._hands.process(rgb)
+        if not results.multi_hand_landmarks:
+            return None, None
+        world = None
+        if getattr(results, 'multi_hand_world_landmarks', None):
+            world = results.multi_hand_world_landmarks[0].landmark
+        return results.multi_hand_landmarks[0], world
+
+    def close(self):
+        self._hands.close()
+
+
+class _TasksDetector:
+    """mediapipe.tasks HandLandmarker -- takes a CPU or GPU delegate.
+
+    Constructed eagerly so a missing model bundle or a CPU-only build fails
+    here, at startup, where the caller can fall back and say so, rather than
+    on the first frame.
+    """
+
+    def __init__(self, model_path, use_gpu, max_hands, min_det, min_track):
+        import os as _os
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+
+        if not _os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f'no hand_landmarker.task at {model_path}')
+        delegate = (mp_python.BaseOptions.Delegate.GPU if use_gpu
+                    else mp_python.BaseOptions.Delegate.CPU)
+        options = vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(
+                model_asset_path=model_path, delegate=delegate),
+            # VIDEO rather than IMAGE: it keeps tracking state between frames,
+            # which is both faster and steadier on a stream.
+            running_mode=vision.RunningMode.VIDEO,
+            num_hands=max_hands,
+            min_hand_detection_confidence=min_det,
+            min_tracking_confidence=min_track,
+        )
+        self._lm = vision.HandLandmarker.create_from_options(options)
+        self._last_ms = -1
+
+    def detect(self, rgb, stamp_ms):
+        # detect_for_video insists on strictly increasing timestamps and
+        # raises otherwise, which a jittery source will otherwise trip.
+        stamp_ms = max(int(stamp_ms), self._last_ms + 1)
+        self._last_ms = stamp_ms
+        image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                         data=np.ascontiguousarray(rgb))
+        res = self._lm.detect_for_video(image, stamp_ms)
+        if not res.hand_landmarks:
+            return None, None
+        # Repackaged as the proto the drawing helpers expect, so the annotated
+        # window works identically on both backends.
+        proto = landmark_pb2.NormalizedLandmarkList()
+        proto.landmark.extend([
+            landmark_pb2.NormalizedLandmark(x=p.x, y=p.y, z=p.z)
+            for p in res.hand_landmarks[0]])
+        world = res.hand_world_landmarks[0] if res.hand_world_landmarks else None
+        return proto, world
+
+    def close(self):
+        self._lm.close()
+
+
 class HandTrackerNode(Node):
 
     def __init__(self) -> None:
@@ -126,6 +207,41 @@ class HandTrackerNode(Node):
         # model -- fresher data beats more accurate stale data in a control
         # loop. Raise to 1 if you have GPU inference or a fast host.
         self.declare_parameter('model_complexity', 1)
+        # --- Which MediaPipe backend, and on what ---
+        #
+        # 'cpu' is mp.solutions.hands, the legacy API. It has no delegate
+        # option at all: it runs on the CPU through XNNPACK and there is no
+        # flag to change that. This is the tested path and the default.
+        #
+        # 'gpu' switches to the Tasks API (HandLandmarker), which does take a
+        # delegate. Two things have to be true for it to work, and neither is
+        # true out of the box:
+        #
+        #   1. A model bundle. The pip wheel ships .tflite files for the
+        #      legacy solutions but no hand_landmarker.task, so it has to be
+        #      fetched once -- see hand_model_path.
+        #   2. A MediaPipe build with GPU support. The Linux Python wheels are
+        #      CPU-only, so requesting GPU on a stock `pip install mediapipe`
+        #      typically fails and falls back. On the Jetson this is the knob
+        #      that matters, and it is the reason this exists now rather than
+        #      being retrofitted later.
+        #
+        # 'auto' tries GPU and falls back to the legacy CPU path without
+        # complaint beyond a log line. Whatever happens, the backend actually
+        # in use is logged at startup -- assume nothing.
+        #
+        # Worth knowing before chasing this: at 30 fps the budget is 33ms a
+        # frame and the CPU path measured 8-19ms, so there is no shortage of
+        # inference capacity to fix. The reason to want the Tasks API is the
+        # Jetson, not this machine.
+        self.declare_parameter('delegate', 'cpu')
+        # Where the Tasks bundle lives. Fetch once with:
+        #   wget -O ~/hand_landmarker.task https://storage.googleapis.com/\
+        #     mediapipe-models/hand_landmarker/hand_landmarker/float16/1/\
+        #     hand_landmarker.task
+        self.declare_parameter(
+            'hand_model_path',
+            os.path.expanduser('~/hand_landmarker.task'))
         # Skip frames that are already stale by the time we get to them.
         #
         # MediaPipe on a CPU is slower than the camera, so frames queue up
@@ -153,15 +269,7 @@ class HandTrackerNode(Node):
         self._publish_annotated = bool(self.get_parameter('publish_annotated').value)
 
         self._bridge = CvBridge()
-        self._hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=int(self.get_parameter('max_num_hands').value),
-            model_complexity=int(self.get_parameter('model_complexity').value),
-            min_detection_confidence=float(
-                self.get_parameter('min_detection_confidence').value),
-            min_tracking_confidence=float(
-                self.get_parameter('min_tracking_confidence').value),
-        )
+        self._detector = self._make_detector()
         self._draw = mp.solutions.drawing_utils
         self._draw_styles = mp.solutions.drawing_styles
 
@@ -207,6 +315,58 @@ class HandTrackerNode(Node):
         )
 
     # ---- Camera intrinsics ----
+
+    def _make_detector(self):
+        """Build the hand detector, preferring GPU only if asked and possible.
+
+        Both backends are wrapped so they return the same two things: a
+        landmark list proto (which the drawing helpers understand and which
+        exposes `.landmark`) and the world landmarks. Everything downstream is
+        then identical regardless of which one ran.
+        """
+        want = str(self.get_parameter('delegate').value).lower()
+        if want in ('gpu', 'auto'):
+            model = str(self.get_parameter('hand_model_path').value)
+            try:
+                det = _TasksDetector(
+                    model_path=model,
+                    use_gpu=True,
+                    max_hands=int(self.get_parameter('max_num_hands').value),
+                    min_det=float(
+                        self.get_parameter('min_detection_confidence').value),
+                    min_track=float(
+                        self.get_parameter('min_tracking_confidence').value),
+                )
+                self.get_logger().info(
+                    f'Hand detector: Tasks API on the GPU delegate '
+                    f'({model}).')
+                return det
+            except Exception as e:
+                msg = (f'GPU hand detection unavailable ({e.__class__.__name__}'
+                       f': {e}).')
+                if want == 'gpu':
+                    # Asked for explicitly, so this is worth a warning rather
+                    # than a shrug -- the usual causes are a missing
+                    # hand_landmarker.task or a CPU-only mediapipe wheel.
+                    self.get_logger().warn(
+                        msg + ' Falling back to the CPU path. Check that '
+                        'hand_model_path exists and that this mediapipe build '
+                        'has GPU support.')
+                else:
+                    self.get_logger().info(msg + ' Using the CPU path.')
+
+        det = _SolutionsDetector(
+            max_hands=int(self.get_parameter('max_num_hands').value),
+            complexity=int(self.get_parameter('model_complexity').value),
+            min_det=float(
+                self.get_parameter('min_detection_confidence').value),
+            min_track=float(
+                self.get_parameter('min_tracking_confidence').value),
+        )
+        self.get_logger().info(
+            'Hand detector: mp.solutions.hands on the CPU (XNNPACK). This API '
+            'has no GPU option; delegate:=gpu switches to the Tasks API.')
+        return det
 
     def _info_cb(self, msg: CameraInfo) -> None:
         """Latch intrinsics from CameraInfo, ignoring the uncalibrated stub.
@@ -325,23 +485,20 @@ class HandTrackerNode(Node):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         t0 = self._now()
-        results = self._hands.process(rgb)
+        hand, world = self._detector.detect(rgb, stamp * 1000.0)
         self._proc_sum += self._now() - t0
         self._n_processed += 1
 
         annotated = frame if self._publish_annotated or self._show_window else None
 
-        if not results.multi_hand_landmarks:
+        if hand is None:
             # Drop the smoothing state so a reappearing hand does not get
             # dragged in from wherever it was last seen.
             self._smoothed_px = None
             self._emit_annotated(annotated, msg)
             return
 
-        landmarks = results.multi_hand_landmarks[0].landmark
-        world = None
-        if getattr(results, 'multi_hand_world_landmarks', None):
-            world = results.multi_hand_world_landmarks[0].landmark
+        landmarks = hand.landmark
 
         tip = landmarks[self._target_lm]
         px, py = tip.x * w, tip.y * h
@@ -385,7 +542,7 @@ class HandTrackerNode(Node):
         if annotated is not None:
             self._draw.draw_landmarks(
                 annotated,
-                results.multi_hand_landmarks[0],
+                hand,
                 mp.solutions.hands.HAND_CONNECTIONS,
                 self._draw_styles.get_default_hand_landmarks_style(),
                 self._draw_styles.get_default_hand_connections_style(),
@@ -417,7 +574,7 @@ class HandTrackerNode(Node):
 
     def destroy_node(self) -> bool:
         try:
-            self._hands.close()
+            self._detector.close()
         except Exception:
             pass
         if self._show_window:

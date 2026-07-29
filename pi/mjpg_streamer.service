@@ -9,10 +9,19 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=er
-# --fps 10 keeps the previous frame rate. camera_stream.py now defaults to 30,
-# so this is explicit rather than implied -- redeploying should not silently
-# change the rate. Raise it here if you want the faster stream.
-ExecStart=/usr/bin/python3 /home/er/JON/mycobot_project/pi/camera_stream.py --port 8080 --device 0 --width 640 --height 480 --fps 15
+# Explicit rather than implied, so redeploying never silently changes the
+# rate. Raised 15 -> 30 once camera_stream.py stopped running a capture loop
+# per client: the old path read and JPEG-encoded once per connected client
+# per frame, which is what left the Pi with no headroom.
+#
+# Detection rate is the servo's real ceiling -- simulated, 5/s to 15/s nearly
+# halved the tracking error on a waved hand -- so this is the cheapest
+# remaining gain in the whole pipeline. It is also the setting most likely to
+# be too optimistic for the hardware: watch the server's own
+# `streaming N FPS (K KB/frame), C client(s)` line and back off if N is well
+# under 30. Lower --quality before lowering --fps; smaller frames degrade
+# tracking more gracefully than staler ones.
+ExecStart=/usr/bin/python3 /home/er/JON/mycobot_project/pi/camera_stream.py --port 8080 --device 0 --width 640 --height 480 --fps 30
 Restart=always
 RestartSec=5
 

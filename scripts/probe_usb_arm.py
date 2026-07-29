@@ -18,10 +18,13 @@ input, and the Pi's USB device controller is not enabled anyway
 if you wanted it to.
 
 If you are unsure which you have plugged into, this script prints the USB
-descriptor of whatever it finds. An Atom shows up through a USB-serial bridge
--- expect a vendor string like Silicon Labs, wch.cn, or QinHeng, and a device
-name of the CP210x / CH9102 family. Anything mentioning Raspberry Pi means you
-are on the wrong port.
+descriptor of whatever it finds. On this arm the Atom appears as:
+
+    idVendor=0403 idProduct=6001 product=M5stack manufacturer=Hades2001
+
+0403:6001 is an FTDI FT232, and the product string says M5stack outright, so
+there is no ambiguity once it is listed. Anything naming a Raspberry Pi or an
+xHCI host controller means you are looking at the wrong device.
 
 WHY THIS MATTERS
 
@@ -48,6 +51,7 @@ Afterwards, put it back if you want the network path again:
 
 import argparse
 import glob
+import signal
 import sys
 import time
 
@@ -109,33 +113,77 @@ def readable(port):
     return True, None
 
 
-def try_port(port, baud, timeout=6.0):
-    """Return joint angles if the arm answers on this port/baud, else None."""
+class _Hung(Exception):
+    pass
+
+
+def _on_alarm(signum, frame):
+    raise _Hung()
+
+
+def try_port(port, baud, timeout=4.0):
+    """Return joint angles if the arm answers on this port/baud, else None.
+
+    Guarded by SIGALRM rather than by a deadline around the loop. pymycobot
+    sets a 0.1s timeout on the serial port but then loops on top of it waiting
+    for a well-formed frame, so get_angles() itself blocks far longer than
+    that -- on a port that opens and never replies, indefinitely. A deadline
+    checked between calls never gets control, which hung this script on the
+    FIRST baud and meant the other three were never tried. Those three are
+    most of the information it exists to gather.
+    """
     try:
         from pymycobot import MyCobot280
     except ImportError as e:
         print(f'  pymycobot missing: {e}')
         return None
+    mc = None
+    angles = None
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
     try:
-        mc = MyCobot280(port, str(baud))
-    except Exception as e:
-        print(f'    {baud:>8}  could not open: {e.__class__.__name__}: {e}')
-        return None
-    time.sleep(0.5)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+        # The constructor sleeps 1.5s of its own, so it goes inside the guard.
+        signal.setitimer(signal.ITIMER_REAL, timeout + 2.0)
         try:
-            angles = mc.get_angles()
-        except Exception as e:
-            print(f'    {baud:>8}  error: {e.__class__.__name__}: {e}')
+            mc = MyCobot280(port, str(baud), timeout=0.1)
+        except _Hung:
+            print(f'    {baud:>8}  opening the port hung')
             return None
+        except Exception as e:
+            print(f'    {baud:>8}  could not open: '
+                  f'{e.__class__.__name__}: {e}')
+            return None
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
         # A cold link commonly answers -1 or [] for the first command or two,
-        # exactly as it does over TCP, so this retries rather than concluding.
-        if isinstance(angles, list) and len(angles) == 6:
-            return angles
-        time.sleep(0.3)
-    print(f'    {baud:>8}  opened, but no valid reply in {timeout:.0f}s')
-    return None
+        # exactly as it does over TCP, so try a few times before concluding.
+        for _ in range(3):
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+            try:
+                angles = mc.get_angles()
+            except _Hung:
+                print(f'    {baud:>8}  opened, then silent '
+                      f'(nothing back within {timeout:.0f}s)')
+                return None
+            except Exception as e:
+                print(f'    {baud:>8}  error: {e.__class__.__name__}: {e}')
+                return None
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            if isinstance(angles, list) and len(angles) == 6:
+                return angles
+            time.sleep(0.2)
+        print(f'    {baud:>8}  opened and replied, but not with angles '
+              f'(last: {angles!r})')
+        return None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        if mc is not None:
+            try:
+                mc._serial_port.close()
+            except Exception:
+                pass
 
 
 def main():
@@ -206,7 +254,8 @@ def main():
     print('=' * 68)
     print('  A serial device exists, but the arm did not answer on it.')
     print('=' * 68)
-    print('\nPermissions are fine, so this is a real negative. Most likely')
+    print('\nPermissions are fine and the port opens, so this is a real')
+    print('negative rather than a setup problem. Most likely')
     print('that port is the ESP32 bootloader/console rather')
     print('than the robot protocol, or the firmware only bridges the GPIO')
     print('UART. Check that mycobot_server is stopped on the Pi -- if it is')

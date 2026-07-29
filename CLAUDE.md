@@ -200,19 +200,39 @@ rather than this 2x2. Small deltas on the untouched joints do appear in driver
 logs, but those are the profiler reconciling its commanded pose with the
 measured one after a divergence resync, not the servo asking.
 
-**Driving the arm over USB was tried and does not work.** `connection:=serial`
-exists and the plumbing is correct, but on this hardware the Atom's USB-C is
-an FTDI FT232 (`0403:6001`, `product=M5stack`) that answers **-1 to every
-command at every baud** — 1000000, 921600, 230400, 115200. Tested with the bus
-completely free: `mycobot_server` stopped AND the Bluetooth bridge below killed,
-so nothing else held `/dev/ttyAMA0`. That port is the ESP32 console, not a
-second path into the robot protocol.
+**Driving the arm over USB does not work on this variant, by design.** The
+vendor's own port table settles it:
 
-So the Pi stays in the arm command path, and its ~250ms round trip is a
-property of the hardware rather than something left un-optimised. Ethernet
-between the Jetson and the Pi is the remaining improvement there.
-`scripts/probe_usb_arm.py` re-answers this in seconds if the firmware ever
-changes.
+| model | serial port | baud |
+|---|---|---|
+| 280 M5 | Linux: `/dev/ttyUSB` | 115200 |
+| 280 AR | Linux: `/dev/ttyUSB` | 1000000 |
+| **280 PI** | **`/dev/ttyAMA0`** | **1000000** |
+| 280 JetsonNano | `/dev/ttyTHS1` | 115200 |
+
+The M5 and AR variants list a USB port because on those the host computer *is*
+the master over USB. The **PI variant has no USB entry at all** — its
+documented interface is the Pi's own GPIO UART, which is exactly what
+`pi/server.py` opens, at exactly the baud it uses. The Pi is not a hop in
+front of the arm's interface; it is the arm's interface.
+
+Confirmed experimentally before the table was found: `connection:=serial` is
+plumbed correctly, and the Atom's USB-C is a real FTDI FT232 (`0403:6001`,
+`product=M5stack`), but it answers **-1 to every command at every baud** with
+the bus completely free — `mycobot_server` stopped *and* the Bluetooth bridge
+below killed. It is the ESP32 console. `connection:=serial` and
+`scripts/probe_usb_arm.py` stay for the day a firmware update changes that,
+and for the M5/AR variants where the same code would just work.
+
+So the Pi stays in the arm command path and the ~250ms round trip is a
+property of this hardware. Ethernet between the Jetson and the Pi is the
+remaining improvement.
+
+**That table also validates the Jetson plan.** The `280 JetsonNano` row shows
+Elephant shipping a Jetson as the onboard computer, reaching the arm over the
+Jetson's own hardware UART (`/dev/ttyTHS1`) rather than USB. So "the Jetson
+drives the arm directly" is a supported topology rather than a modification —
+it is UART pins, not a USB cable, and the baud is the firmware's business.
 
 **The original hope, for the record:** The 280 Pi
 drives its servos through an M5Stack Atom (ESP32) that the Raspberry Pi

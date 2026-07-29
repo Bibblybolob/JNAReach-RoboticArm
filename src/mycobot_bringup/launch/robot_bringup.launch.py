@@ -43,6 +43,32 @@ def generate_launch_description():
                     'raise this if the stream reconnects during brief Wi-Fi '
                     'or server stalls that would otherwise recover on their own',
     )
+    # Local-camera options. Declared here because camera_node lives in this
+    # file, and forwarded from servo_demo so one command can move the camera
+    # off the Pi entirely.
+    source_arg = DeclareLaunchArgument(
+        'source', default_value='mjpeg', choices=['mjpeg', 'device'],
+        description="'mjpeg' reads the Pi's stream; 'device' opens a camera "
+                    'plugged into THIS machine, which removes the encode, '
+                    'the network hop and the decode rather than speeding '
+                    'them up')
+    device_arg = DeclareLaunchArgument(
+        'device', default_value='0',
+        description='V4L2 index for source:=device (0 = /dev/video0), or a '
+                    'GStreamer pipeline string for a CSI camera')
+    device_auto_exposure_arg = DeclareLaunchArgument(
+        'device_auto_exposure', default_value='true',
+        description='Auto-exposure caps the frame rate in dim light: this '
+                    'webcam measured 10.2 fps on auto and 30.2 with a short '
+                    'manual exposure. false trades image brightness for rate; '
+                    'adding light is the better fix if you can')
+    device_exposure_arg = DeclareLaunchArgument(
+        'device_exposure', default_value='0.0',
+        description='Manual exposure value when device_auto_exposure is '
+                    'false. 0 keeps the driver default')
+    device_fps_arg = DeclareLaunchArgument('device_fps', default_value='30.0')
+    device_width_arg = DeclareLaunchArgument('device_width', default_value='640')
+    device_height_arg = DeclareLaunchArgument('device_height', default_value='480')
     home_on_start_arg = DeclareLaunchArgument(
         'home_on_start', default_value='true',
         description='Drive to the home pose once on startup so the arm always '
@@ -122,6 +148,18 @@ def generate_launch_description():
             # this node republish the same frame more often.
             'frame_rate': 31.0,
             'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
+            'source': LaunchConfiguration('source'),
+            # Forced to str: launch YAML-parses '0' into an integer, but this
+            # parameter is a string so that a GStreamer pipeline can go in the
+            # same field. Without this the node dies at startup on a type
+            # mismatch for the most ordinary value anyone would pass.
+            'device': ParameterValue(LaunchConfiguration('device'),
+                                     value_type=str),
+            'device_auto_exposure': LaunchConfiguration('device_auto_exposure'),
+            'device_exposure': LaunchConfiguration('device_exposure'),
+            'device_fps': LaunchConfiguration('device_fps'),
+            'device_width': LaunchConfiguration('device_width'),
+            'device_height': LaunchConfiguration('device_height'),
         }],
         output='screen',
         respawn=True,
@@ -134,6 +172,13 @@ def generate_launch_description():
         camera_port_arg,
         stream_read_timeout_arg,
         home_on_start_arg,
+        source_arg,
+        device_arg,
+        device_auto_exposure_arg,
+        device_exposure_arg,
+        device_fps_arg,
+        device_width_arg,
+        device_height_arg,
         robot_state_publisher,
         hardware_node,
         camera_node,

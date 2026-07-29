@@ -75,6 +75,19 @@ class CameraNode(Node):
         # Only used when auto exposure is off. 0 leaves whatever the driver
         # defaults to. Units are driver-specific -- smaller is shorter, and
         # what matters is that exposure time bounds the frame period.
+        #
+        # USUALLY NEEDED ALONGSIDE device_auto_exposure:=false, because the
+        # driver's manual default is often nearly as long as the auto value it
+        # replaced. Measured on this webcam at 640x480 MJPG:
+        #
+        #     auto                                    10.2 fps
+        #     manual, driver default exposure         17.2 fps
+        #     manual, exposure 50                     30.2 fps
+        #
+        # So turning auto off is most of the setup and none of the win. Pick
+        # the largest value that still hits the rate you want; a shorter
+        # exposure than necessary only costs brightness, and detection needs
+        # the light.
         self.declare_parameter('device_exposure', 0.0)
 
         self._source = self.get_parameter('source').get_parameter_value().string_value

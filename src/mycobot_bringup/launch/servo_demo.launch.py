@@ -241,6 +241,30 @@ def generate_launch_description():
         description='Image error below which the arm holds still. 0.05 is a '
                     'hand comfortably in the middle of the picture. Raise it '
                     'if the arm buzzes, lower it to sit nearer dead centre')
+    source_arg = DeclareLaunchArgument(
+        'source', default_value='mjpeg', choices=['mjpeg', 'device'],
+        description='Where frames come from. mjpeg reads the Pi over HTTP; '
+                    'device opens a camera plugged into THIS machine, which '
+                    'removes the encode, the network hop and the decode '
+                    'rather than making them faster')
+    device_arg = DeclareLaunchArgument(
+        'device', default_value='0',
+        description='V4L2 index for source:=device, or a GStreamer pipeline')
+    device_auto_exposure_arg = DeclareLaunchArgument(
+        'device_auto_exposure', default_value='true',
+        description='false trades brightness for frame rate -- auto-exposure caps the rate in dim light (10.2 vs 30.2 fps measured on this webcam)')
+    device_exposure_arg = DeclareLaunchArgument(
+        'device_exposure', default_value='0.0',
+        description='manual exposure value; 0 keeps the default')
+    device_fps_arg = DeclareLaunchArgument(
+        'device_fps', default_value='30.0',
+        description='frame rate requested from a local camera')
+    device_width_arg = DeclareLaunchArgument(
+        'device_width', default_value='640',
+        description='local camera width')
+    device_height_arg = DeclareLaunchArgument(
+        'device_height', default_value='480',
+        description='local camera height')
     track_arg = DeclareLaunchArgument(
         'track', default_value='hand', choices=['hand', 'color'],
         description="What to follow. 'color' runs color_tracker_node instead "
@@ -338,6 +362,13 @@ def generate_launch_description():
             'camera_port': LaunchConfiguration('camera_port'),
             'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
             'home_on_start': LaunchConfiguration('home_on_start'),
+            'source': LaunchConfiguration('source'),
+            'device': LaunchConfiguration('device'),
+            'device_auto_exposure': LaunchConfiguration('device_auto_exposure'),
+            'device_exposure': LaunchConfiguration('device_exposure'),
+            'device_fps': LaunchConfiguration('device_fps'),
+            'device_width': LaunchConfiguration('device_width'),
+            'device_height': LaunchConfiguration('device_height'),
         }.items(),
     )
 
@@ -435,6 +466,13 @@ def generate_launch_description():
         rate_arg,
         progressive_gain_arg,
         deadband_arg,
+        source_arg,
+        device_arg,
+        device_auto_exposure_arg,
+        device_exposure_arg,
+        device_fps_arg,
+        device_width_arg,
+        device_height_arg,
         track_arg,
         target_color_arg,
         model_complexity_arg,

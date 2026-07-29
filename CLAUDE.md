@@ -135,6 +135,18 @@ Two traps:
   a 30fps camera that was 67ms of added latency and half the frames thrown
   away. The old justification (the driver rate-limited jogs anyway) stopped
   being true when `jog_profile` landed: a jog message now only moves a goal.
+- **Auto-exposure is a frame rate control, and it is the least obvious limit
+  in the system.** A UVC camera in dim light lengthens its exposure to
+  brighten the image, and frame time cannot be shorter than exposure time — so
+  it silently caps the rate while still *reporting* 30fps when asked.
+  Measured on this webcam at 640x480 MJPG: **10.2 fps on auto, 30.2 fps with a
+  short manual exposure**, same camera, same everything else. Since detection
+  rate is the ceiling on the whole servo loop, the room lighting was setting
+  the tracking performance. `device_auto_exposure:=false` on the host,
+  `--no-auto-exposure` on the Pi — or just add light. Too short an exposure
+  makes the image dark enough to break detection outright, so measure rather
+  than assume; `camera_node` reports the rate it actually captures and names
+  this cause when it looks like this.
 - **Detection rate is the real ceiling.** Below ~6/s nothing tuned in the
   servo helps. Read the `tracker:` and `pipeline:` log lines before touching
   any gain; `model_complexity:=0` and a smaller camera frame move that number

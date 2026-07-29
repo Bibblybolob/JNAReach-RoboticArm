@@ -208,7 +208,26 @@ def check_pi_in_sync():
         warn('Continuing with outdated Pi code.')
 
 
-def preflight():
+def wait_for_pi_camera():
+    say('Waiting for camera on :8080 ...')
+    for i in range(30):
+        if camera_ok(IP):
+            say('Camera OK')
+            return
+        if i == 29:
+            die(f'Camera never came up on {IP}:8080.\n'
+                f'  If ping also failed, the Pi is off or on another address '
+                f'(set MYCOBOT_IP).\n'
+                f"  If ping worked, the service is down: "
+                f"ssh {os.environ.get('MYCOBOT_PI_USER', 'er')}@{IP} "
+                f"'systemctl status mjpg_streamer'\n"
+                f'  If you have MOVED THE WEBCAM off the Pi and onto this '
+                f'machine, the Pi has no camera to serve -- use '
+                f'source:=device instead.')
+        time.sleep(1)
+
+
+def preflight(args=()):
     """Prove the Pi is serving both ports before launching.
 
     Without this, an unreachable arm surfaces as 'Waiting for /arm/jog_enable'
@@ -228,19 +247,16 @@ def preflight():
 
     check_pi_in_sync()
 
-    say('Waiting for camera on :8080 ...')
-    for i in range(30):
-        if camera_ok(IP):
-            say('Camera OK')
-            break
-        if i == 29:
-            die(f'Camera never came up on {IP}:8080.\n'
-                f'  If ping also failed, the Pi is off or on another address '
-                f'(set MYCOBOT_IP).\n'
-                f"  If ping worked, the service is down: "
-                f"ssh {os.environ.get('MYCOBOT_PI_USER', 'er')}@{IP} "
-                f"'systemctl status mjpg_streamer'")
-        time.sleep(1)
+    # The Pi's camera is only in the picture when camera_node is reading it.
+    # With source:=device the camera is plugged into this machine instead, and
+    # blocking startup on a stream nothing will open -- or worse, refusing to
+    # start because the webcam was physically moved off the Pi -- is the
+    # preflight getting in the way of the thing it exists to protect.
+    if any(a.replace(' ', '') == 'source:=device' for a in args):
+        say('source:=device -- skipping the Pi camera check; camera_node will '
+            'open a local device.')
+    else:
+        wait_for_pi_camera()
 
     say('Waiting for arm TCP on :9000 ...')
     for i in range(30):
@@ -672,14 +688,14 @@ def main():
                                stderr=subprocess.DEVNULL)
             time.sleep(3)  # let the arm's single client slot be released
             attached = False
-            preflight()
+            preflight(args)
             stack = Stack(args)
             stack.start()
             panel.wait_for_nodes()
         else:
             warn('Attaching to the existing stack as-is.')
     else:
-        preflight()
+        preflight(args)
         stack = Stack(args)
         stack.start()
         panel.wait_for_nodes()

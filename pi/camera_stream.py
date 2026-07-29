@@ -338,6 +338,20 @@ def main():
                         help='JPEG quality 1-100 (default 75)')
     parser.add_argument('--no-mjpg', action='store_true',
                         help='do not request MJPG capture format')
+    parser.add_argument('--no-auto-exposure', action='store_true',
+                        help='disable auto exposure. A UVC camera in dim '
+                             'light lengthens exposure to brighten the image, '
+                             'and frame time cannot be shorter than exposure '
+                             'time -- so it silently caps the rate while '
+                             'still reporting 30fps when asked. Measured on '
+                             'this webcam: 10.2 fps auto, 30.2 fps manual. '
+                             'Costs image brightness; detection needs a rate '
+                             'more than it needs a pretty picture, but too '
+                             'dark breaks detection outright, so measure')
+    parser.add_argument('--exposure', type=float, default=0,
+                        help='manual exposure value, with --no-auto-exposure. '
+                             '0 leaves the driver default. Units are '
+                             'driver-specific; smaller is shorter')
     parser.add_argument('--no-passthrough', action='store_true',
                         help='decode and re-encode every frame instead of '
                              'forwarding the camera JPEG untouched. Costs '
@@ -362,6 +376,13 @@ def main():
     except Exception:
         pass  # not supported by every backend
 
+    # See --no-auto-exposure. This is a frame rate control as much as a
+    # brightness one, and it is the least obvious limit in the whole pipeline.
+    if args.no_auto_exposure:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)   # 1 = manual in V4L2/UVC
+        if args.exposure > 0:
+            cap.set(cv2.CAP_PROP_EXPOSURE, args.exposure)
+
     if not cap.isOpened():
         print(f'ERROR: Cannot open camera /dev/video{args.device}')
         return
@@ -377,7 +398,11 @@ def main():
     print(f'Requested: {args.width}x{args.height} @ {args.fps} FPS'
           f'{"" if args.no_mjpg else " MJPG"}')
     print(f'Camera gave: {actual_w}x{actual_h} @ {actual_fps:.0f} FPS '
-          f'[{fourcc_str}]')
+          f'[{fourcc_str}] auto-exposure '
+          f'{"OFF" if args.no_auto_exposure else "on"}')
+    print('NOTE: the FPS above is what the camera CLAIMS. Watch the '
+          '"streaming N FPS" lines for what it delivers -- on auto exposure '
+          'in dim light those differ by 3x.')
     if fourcc_str.strip('\x00') not in ('MJPG', '') and not args.no_mjpg:
         print('NOTE: camera did not switch to MJPG; frame rate may be capped '
               'by USB bandwidth at this resolution.')

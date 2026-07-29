@@ -68,6 +68,14 @@ class CameraNode(Node):
         # the Pi: YUYV at 640x480 saturates USB 2.0 and the camera answers by
         # dropping frames.
         self.declare_parameter('device_mjpg', True)
+        self.declare_parameter('device_fps', 30.0)
+        # See _open_device: auto-exposure silently caps the frame rate in dim
+        # light. Turn it off and the rate triples; the image gets darker.
+        self.declare_parameter('device_auto_exposure', True)
+        # Only used when auto exposure is off. 0 leaves whatever the driver
+        # defaults to. Units are driver-specific -- smaller is shorter, and
+        # what matters is that exposure time bounds the frame period.
+        self.declare_parameter('device_exposure', 0.0)
 
         self._source = self.get_parameter('source').get_parameter_value().string_value
         self._url = self.get_parameter('camera_url').get_parameter_value().string_value
@@ -185,7 +193,10 @@ class CameraNode(Node):
         gets in (nvarguscamerasrc ... ! appsink)."""
         spec = str(self.get_parameter('device').value)
         if spec.isdigit():
-            cap = cv2.VideoCapture(int(spec))
+            # CAP_V4L2 explicitly. Left to choose, OpenCV picked a backend on
+            # this machine whose read() blocked forever -- the node opened the
+            # camera, reported success, and then never produced a frame.
+            cap = cv2.VideoCapture(int(spec), cv2.CAP_V4L2)
             if self.get_parameter('device_mjpg').value:
                 # Before the size, as on the Pi: some V4L2 drivers only offer
                 # the higher rates for a resolution once the format is MJPG.
@@ -195,6 +206,31 @@ class CameraNode(Node):
                     int(self.get_parameter('device_width').value))
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT,
                     int(self.get_parameter('device_height').value))
+            cap.set(cv2.CAP_PROP_FPS,
+                    float(self.get_parameter('device_fps').value))
+
+            # AUTO-EXPOSURE IS A FRAME RATE CONTROL, which is not obvious and
+            # cost a lot of pipeline work to discover. A UVC camera in dim
+            # light lengthens its exposure to brighten the image, and frame
+            # time cannot be shorter than exposure time -- so the camera
+            # quietly drops to whatever rate the room allows while still
+            # REPORTING 30fps when asked. Measured on this webcam: 10.2 fps on
+            # auto, 30.2 fps with a short manual exposure. Same camera, same
+            # resolution, same everything else.
+            #
+            # Detection rate is the ceiling on the whole servo loop, so this
+            # can matter more than anything tuned in the servo. Left on auto
+            # by default because a too-short exposure makes the image dark
+            # enough to break detection outright, which is worse than a slow
+            # one; the achieved rate is measured below and says so when it
+            # looks like this.
+            if not bool(self.get_parameter('device_auto_exposure').value):
+                # 1 is "manual" in V4L2's UVC mapping, 3 is "aperture
+                # priority" (auto). OpenCV passes the value straight through.
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                exposure = float(self.get_parameter('device_exposure').value)
+                if exposure > 0:
+                    cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
         else:
             cap = cv2.VideoCapture(spec, cv2.CAP_GSTREAMER)
         try:
@@ -227,7 +263,13 @@ class CameraNode(Node):
                     continue
                 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                self.get_logger().info(f'Local camera open at {w}x{h}')
+                self.get_logger().info(
+                    f'Local camera open at {w}x{h}, camera reports '
+                    f'{cap.get(cv2.CAP_PROP_FPS):.0f} fps '
+                    f'(auto exposure '
+                    f'{"on" if self.get_parameter("device_auto_exposure").value else "OFF"})')
+                grabbed = 0
+                rate_since = time.monotonic()
 
             ok, frame = cap.read()
             if not ok:
@@ -246,6 +288,30 @@ class CameraNode(Node):
             fails = 0
             with self._frame_lock:
                 self._latest_frame = frame
+
+            # What the camera ACTUALLY delivers, which is regularly not what
+            # it claims when asked. Reported rather than assumed because the
+            # gap is the single cheapest thing to fix in this pipeline and is
+            # invisible from anywhere else.
+            grabbed += 1
+            elapsed = time.monotonic() - rate_since
+            if elapsed >= 10.0:
+                actual = grabbed / elapsed
+                want = float(self.get_parameter('device_fps').value)
+                note = ''
+                if (actual < 0.6 * want
+                        and bool(self.get_parameter(
+                            'device_auto_exposure').value)):
+                    note = (' -- well under what was asked for. Auto-exposure '
+                            'caps frame rate in dim light: this camera '
+                            'measured 10fps on auto and 30fps with a short '
+                            'manual exposure. Try '
+                            'device_auto_exposure:=false, or add light.')
+                self.get_logger().info(
+                    f'local camera: {actual:.1f} fps captured '
+                    f'(asked for {want:.0f}){note}')
+                grabbed = 0
+                rate_since = time.monotonic()
 
         if cap is not None:
             cap.release()

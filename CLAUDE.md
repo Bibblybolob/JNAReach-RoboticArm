@@ -200,7 +200,21 @@ rather than this 2x2. Small deltas on the untouched joints do appear in driver
 logs, but those are the profiler reconciling its commanded pose with the
 measured one after a divergence resync, not the servo asking.
 
-**The arm may be reachable over USB, skipping the Pi entirely.** The 280 Pi
+**Driving the arm over USB was tried and does not work.** `connection:=serial`
+exists and the plumbing is correct, but on this hardware the Atom's USB-C is
+an FTDI FT232 (`0403:6001`, `product=M5stack`) that answers **-1 to every
+command at every baud** — 1000000, 921600, 230400, 115200. Tested with the bus
+completely free: `mycobot_server` stopped AND the Bluetooth bridge below killed,
+so nothing else held `/dev/ttyAMA0`. That port is the ESP32 console, not a
+second path into the robot protocol.
+
+So the Pi stays in the arm command path, and its ~250ms round trip is a
+property of the hardware rather than something left un-optimised. Ethernet
+between the Jetson and the Pi is the remaining improvement there.
+`scripts/probe_usb_arm.py` re-answers this in seconds if the firmware ever
+changes.
+
+**The original hope, for the record:** The 280 Pi
 drives its servos through an M5Stack Atom (ESP32) that the Raspberry Pi
 reaches over the GPIO UART at 1000000 baud. The Atom has its own USB-C port,
 and if that is a data port into the same firmware then `connection:=serial`

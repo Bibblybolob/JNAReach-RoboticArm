@@ -552,13 +552,29 @@ class MyCobotHardwareNode(Node):
             # log and makes the terminal crawl. The first one prints
             # immediately; after that it is a reminder, not news.
             self.get_logger().error(
-                f'Cannot reach the arm at {self._ip}:{self._port} -- {e}\n'
-                '  The node is running but every command will be refused '
-                'until this is fixed. Check that:\n'
-                f'    - the Pi is powered and on the network (ping {self._ip})\n'
-                '    - server.py is running on it (port 9000)\n'
-                '    - nothing else holds the connection; Server.py accepts '
-                'ONE client, so a stray script or a second driver locks it out',
+                (f'Cannot reach the arm over {self._serial_port} -- {e}\n'
+                 '  The node is running but every command will be refused '
+                 'until this is fixed. This is the connection:=serial path, '
+                 'so NOTHING about the Pi is relevant:\n'
+                 '    - the port opening does not mean the arm is on it. On '
+                 'this hardware the Atom exposes an FTDI port that answers '
+                 '-1 to every command at every baud -- it is the ESP32 '
+                 'console, not the robot protocol\n'
+                 '    - scripts/probe_usb_arm.py tests this directly, without '
+                 'starting a stack\n'
+                 '    - connection:=tcp is the path that works; it needs '
+                 'mycobot_server running on the Pi'
+                 if self._connection == 'serial' else
+                 f'Cannot reach the arm at {self._ip}:{self._port} -- {e}\n'
+                 '  The node is running but every command will be refused '
+                 'until this is fixed. Check that:\n'
+                 f'    - the Pi is powered and on the network (ping {self._ip})\n'
+                 '    - server.py is running on it (port 9000):\n'
+                 '        ssh er@' + str(self._ip) + " 'systemctl start "
+                 "mycobot_server'\n"
+                 '    - nothing else holds the connection; Server.py accepts '
+                 'ONE client, so a stray script or a second driver locks it '
+                 'out'),
                 throttle_duration_sec=30.0,
             )
             return False

@@ -281,6 +281,7 @@ class _StubNode:
         self._jog_accel = accel
         self._jog_max_speed = V_MAX
         self._jog_vel = [0.0] * 6
+        self._jog_lookahead = 0.12
         self._jog_cmd_deg = [0.0] * 6
         self._jog_target_deg = list(target) if target else [0.0] * 6
         self._joint_limits_deg = [(-168.0, 168.0)] * 6
@@ -393,6 +394,36 @@ def test_reset_clears_the_ramp():
     assert n._jog_target_deg is None
     assert n._jog_cmd_deg is None
     assert n._jog_vel == [0.0] * 6
+
+
+def test_the_command_leads_the_profile_so_the_arm_never_arrives():
+    """The pulsing fix. send_angles stops on arrival, so commanding exactly
+    the profiled position makes the arm reach it and wait. While travelling,
+    the commanded angle must be AHEAD of the profiled one."""
+    n = _StubNode(target=[60.0, 0, 0, 0, 0, 0])
+    n._jog_profile_tick()
+    n._jog_profile_tick()
+    commanded = n._mc.sent[-1][0][0]
+    assert commanded > n._jog_cmd_deg[0], (
+        f'commanded {commanded:.2f} is not ahead of the profile position '
+        f'{n._jog_cmd_deg[0]:.2f} -- the arm will arrive and wait')
+
+
+def test_the_lookahead_never_overshoots_the_goal():
+    n = _StubNode(target=[8.0, 0, 0, 0, 0, 0])
+    for _ in range(200):
+        n._jog_profile_tick()
+    assert max(a[0] for a, _ in n._mc.sent) <= 8.0 + 1e-9
+
+
+def test_the_jog_chain_compounds_off_the_profile_not_the_lookahead():
+    """_last_angles_rad feeds the next jog. Compounding off a point the arm
+    was merely aimed at would walk the chain forward by a lookahead per
+    tick."""
+    n = _StubNode(target=[60.0, 0, 0, 0, 0, 0])
+    for _ in range(3):
+        n._jog_profile_tick()
+    assert abs(math.degrees(n._last_angles_rad[0]) - n._jog_cmd_deg[0]) < 1e-9
 
 
 if __name__ == '__main__':

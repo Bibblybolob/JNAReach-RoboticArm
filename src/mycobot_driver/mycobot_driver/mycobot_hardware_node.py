@@ -198,6 +198,16 @@ class MyCobotHardwareNode(Node):
         # Cruise ceiling, degrees per second. Roughly what the old path
         # implied: max_jog_deg every command_interval is 5/0.06 = 83.
         self.declare_parameter('max_jog_speed_deg_s', 80.0)
+        # Seconds to aim ahead of the profiled position when commanding the
+        # arm. See _jog_profile_tick: without it the arm reaches each
+        # commanded angle, stops, and waits for the next one, which is felt as
+        # motion arriving in pulses. The trajectory streamer has used the same
+        # trick at 0.12 for the same reason since long before this existed.
+        #
+        # Too large and the arm leads the profile far enough that the profile
+        # stops describing what it is doing; the clamp to the goal above
+        # bounds the damage. 0 restores the old arrive-and-wait behaviour.
+        self.declare_parameter('jog_lookahead', 0.12)
         self.declare_parameter('jog_speed', 40)
         # Size each jog's speed to the size of that jog, exactly as trajectory
         # streaming does. A fixed speed is wrong here for the same reason it is
@@ -305,6 +315,8 @@ class MyCobotHardwareNode(Node):
             'max_jog_accel_deg_s2').get_parameter_value().double_value
         self._jog_max_speed = self.get_parameter(
             'max_jog_speed_deg_s').get_parameter_value().double_value
+        self._jog_lookahead = self.get_parameter(
+            'jog_lookahead').get_parameter_value().double_value
         # Profiler state: where the servo wants the arm, where we have
         # actually commanded it to so far, and how fast each joint is
         # currently being asked to travel.
@@ -1071,9 +1083,39 @@ class MyCobotHardwareNode(Node):
         if not moving:
             return
 
-        target_deg = list(self._jog_cmd_deg)
+        # AIM AHEAD OF WHERE THE PROFILE CURRENTLY IS.
+        #
+        # send_angles is point-to-point: it drives to the commanded angle and
+        # stops. Commanding exactly the profiled position means the arm
+        # reaches it, stops, and waits for the next command a command_interval
+        # later -- motion delivered in pulses with a pause between each, which
+        # is how it feels on hardware and is not what the trapezoid was
+        # supposed to produce.
+        #
+        # The trajectory streamer in this same file already solved this with
+        # `lookahead`, for exactly the same reason and in exactly these words:
+        # commanding the current scheduled pose makes the arm chase a target
+        # it has already reached. The jog path simply never got the same
+        # treatment. Extending the commanded point by the profile's own
+        # velocity keeps a target in front of the arm at all times, so it is
+        # always moving toward something rather than arriving and waiting.
+        #
+        # Self-cancelling at the end of a move: velocity goes to zero as the
+        # profile settles, so the lookahead goes with it and the arm lands on
+        # the real goal rather than past it.
+        target_deg = [c + v * self._jog_lookahead
+                      for c, v in zip(self._jog_cmd_deg, self._jog_vel)]
         for i, (lo, hi) in enumerate(self._joint_limits_deg):
             target_deg[i] = max(lo, min(hi, target_deg[i]))
+        # Never let the lookahead push past the goal itself -- overshooting a
+        # target the servo has already chosen is the oscillation everything
+        # upstream exists to avoid.
+        for i, goal in enumerate(self._jog_target_deg):
+            cur = self._jog_cmd_deg[i]
+            if goal >= cur:
+                target_deg[i] = min(target_deg[i], goal)
+            else:
+                target_deg[i] = max(target_deg[i], goal)
 
         speed = self._step_speed(
             [c - s for c, s in zip(target_deg, applied)], target_deg, dt,
@@ -1086,7 +1128,12 @@ class MyCobotHardwareNode(Node):
                 mc.send_angles(target_deg, speed)
             self._last_tx_time = time.monotonic()
             self._last_jog_time = time.monotonic()
-            self._last_angles_rad = [math.radians(d) for d in target_deg]
+            # The PROFILED position, not the lookahead-extended command:
+            # the jog chain compounds off this, and compounding off a point
+            # the arm was only aimed at would walk the whole chain forward by
+            # a lookahead every tick.
+            self._last_angles_rad = [math.radians(d)
+                                     for d in self._jog_cmd_deg]
             self._publish_jog_applied(applied)
             self.get_logger().info(
                 'jog profile '

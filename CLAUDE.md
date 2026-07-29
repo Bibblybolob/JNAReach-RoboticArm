@@ -206,6 +206,14 @@ frame, which is indistinguishable from a badly mounted camera.
   after a deliberate shutdown.
 - Port 9000 is single-client (`listen(1)`). Probe it by connecting and closing
   at once; anything that holds the slot locks out the driver.
+- **`send_angles` stops on arrival, so the commanded point must lead.** The
+  jog profiler commands `jog_lookahead` (0.12s) of its own velocity ahead of
+  the profiled position; without that the arm reaches each commanded angle,
+  stops, and waits out the rest of the `command_interval`, which is felt as
+  motion arriving in pulses with a pause between each. The trajectory streamer
+  has used the same trick at the same value since long before the jog path
+  existed — the jog path simply never got it. The lookahead is clamped to the
+  goal so it cannot overshoot, and self-cancels as velocity goes to zero.
 - **The jog profile trades lock-on time for smoothness, and the exchange rate
   is bad.** `jog_profile` streams to the jog goal on a trapezoid instead of
   commanding it outright; `max_jog_accel_deg_s2` (1200) sets how gently.

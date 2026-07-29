@@ -58,21 +58,31 @@ from std_srvs.srv import Trigger
 
 
 SERVO_NODE = 'visual_servo_node'
+DRIVER_NODE = 'mycobot_hardware_node'
 
-# name, attribute label, step, minimum, maximum
+# node, name, label, step, minimum, maximum
+#
+# The driver knobs are here because the SPEED ceiling lives there, not in the
+# servo. The servo can ask for 150 deg/s of goal and the profiler will still
+# only deliver max_jog_speed_deg_s, so "make it move faster" is tuned on the
+# driver while the score is read off the servo.
 KNOBS = [
-    ('gain',                    'gain at centre',      0.05, 0.05,  2.0),
-    ('progressive_gain',        'gain rise w/ dist',   0.25, 0.0,   8.0),
-    ('lead_time',               'aim ahead (s)',       0.05, 0.0,   0.6),
-    ('deadband',                'hold-still zone',     0.01, 0.0,   0.2),
-    ('command_lag',             'lag window (s)',      0.02, 0.0,   0.4),
-    ('max_step_deg',            'max jog (deg)',       1.0,  1.0,  15.0),
-    ('assumed_deg_per_error',   'horiz deg/unit',      2.0,  5.0, 200.0),
-    ('assumed_v_deg_per_error', 'vert deg/unit',       2.0,  0.0, 200.0),
-    ('velocity_smoothing',      'vel filter',          0.1,  0.0,  0.95),
-    ('ki',                      'integral',            0.01, 0.0,   1.0),
-    ('kd',                      'derivative',          0.01, 0.0,   1.0),
-    ('integral_limit',          'integral cap',        0.1,  0.0,   2.0),
+    (SERVO_NODE, 'gain',                    'gain at centre',      0.05, 0.05,  2.0),
+    (SERVO_NODE, 'progressive_gain',        'gain rise w/ dist',   0.25, 0.0,   8.0),
+    (SERVO_NODE, 'lead_time',               'aim ahead (s)',       0.05, 0.0,   0.6),
+    (SERVO_NODE, 'deadband',                'hold-still zone',     0.01, 0.0,   0.2),
+    (SERVO_NODE, 'command_lag',             'lag window (s)',      0.02, 0.0,   0.4),
+    (SERVO_NODE, 'max_step_deg',            'max jog (deg)',       1.0,  1.0,  15.0),
+    (SERVO_NODE, 'assumed_deg_per_error',   'horiz deg/unit',      2.0,  5.0, 200.0),
+    (SERVO_NODE, 'assumed_v_deg_per_error', 'vert deg/unit',       2.0,  0.0, 200.0),
+    (SERVO_NODE, 'velocity_smoothing',      'vel filter',          0.1,  0.0,  0.95),
+    (SERVO_NODE, 'ki',                      'integral',            0.01, 0.0,   1.0),
+    (SERVO_NODE, 'kd',                      'derivative',          0.01, 0.0,   1.0),
+    (SERVO_NODE, 'integral_limit',          'integral cap',        0.1,  0.0,   2.0),
+    (DRIVER_NODE, 'max_jog_speed_deg_s',   'ARM top speed d/s',   5.0,  10.0, 200.0),
+    (DRIVER_NODE, 'max_jog_accel_deg_s2',  'ARM accel d/s2',    100.0, 100.0, 3000.0),
+    (DRIVER_NODE, 'speed_at_100_deg_s',    'speed@100 (GUESS)',   5.0,  20.0, 300.0),
+    (DRIVER_NODE, 'max_jog_deg',           'max jog step deg',    0.5,   1.0,  20.0),
 ]
 
 HELP = """
@@ -100,8 +110,9 @@ class Tuner(Node):
                                  self._info_cb, 10)
         self.create_subscription(PointStamped, '/hand/point_px',
                                  self._point_cb, 1)
-        self._set_cli = self.create_client(
-            SetParameters, f'/{SERVO_NODE}/set_parameters')
+        self._set_cli = {
+            n: self.create_client(SetParameters, f'/{n}/set_parameters')
+            for n in (SERVO_NODE, DRIVER_NODE)}
         self._search_cli = self.create_client(Trigger, '/servo/search')
 
     # ---- data in ----
@@ -174,28 +185,36 @@ class Tuner(Node):
     # ---- parameters ----
 
     def fetch_values(self):
-        """Read the servo's current values via the parameter service."""
+        """Read current values from every node that owns a knob."""
         from rcl_interfaces.srv import GetParameters
-        cli = self.create_client(GetParameters,
-                                 f'/{SERVO_NODE}/get_parameters')
-        if not cli.wait_for_service(timeout_sec=5.0):
-            self._status = (f'no {SERVO_NODE} on the graph -- is ./run.py '
-                            'running?')
-            return False
-        req = GetParameters.Request()
-        req.names = [k[0] for k in KNOBS] + ['approach_enabled']
-        fut = cli.call_async(req)
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=5.0)
-        if fut.result() is None:
-            self._status = 'the servo did not answer a parameter read'
-            return False
-        for name, pv in zip(req.names, fut.result().values):
-            self._values[name] = (pv.bool_value if pv.type == 1
-                                  else pv.double_value)
+        for node in (SERVO_NODE, DRIVER_NODE):
+            names = [k[1] for k in KNOBS if k[0] == node]
+            if node == SERVO_NODE:
+                names = names + ['approach_enabled']
+            cli = self.create_client(GetParameters,
+                                     f'/{node}/get_parameters')
+            if not cli.wait_for_service(timeout_sec=5.0):
+                self._status = (f'no {node} on the graph -- is ./run.py '
+                                'running?')
+                return False
+            req = GetParameters.Request()
+            req.names = names
+            fut = cli.call_async(req)
+            rclpy.spin_until_future_complete(self, fut, timeout_sec=5.0)
+            if fut.result() is None:
+                self._status = f'{node} did not answer a parameter read'
+                return False
+            for name, pv in zip(names, fut.result().values):
+                # INTEGER=2, DOUBLE=3, BOOL=1 -- max_jog_deg and friends come
+                # back as whichever the node declared.
+                self._values[name] = (
+                    pv.bool_value if pv.type == 1 else
+                    float(pv.integer_value) if pv.type == 2 else
+                    pv.double_value)
         self._status = 'connected'
         return True
 
-    def apply(self, name, value):
+    def apply(self, name, value, node=SERVO_NODE):
         req = SetParameters.Request()
         if isinstance(value, bool):
             req.parameters = [Parameter(name, Parameter.Type.BOOL,
@@ -203,11 +222,11 @@ class Tuner(Node):
         else:
             req.parameters = [Parameter(name, Parameter.Type.DOUBLE,
                                         float(value)).to_parameter_msg()]
-        fut = self._set_cli.call_async(req)
+        fut = self._set_cli[node].call_async(req)
         rclpy.spin_until_future_complete(self, fut, timeout_sec=2.0)
         res = fut.result()
         if res is None:
-            self._status = f'{name}: no reply from the servo'
+            self._status = f'{name}: no reply from {node}'
             return False
         if not res.results[0].successful:
             self._status = f'{name} refused: {res.results[0].reason}'
@@ -217,11 +236,11 @@ class Tuner(Node):
         return True
 
     def nudge(self, direction):
-        name, _, step, lo, hi = KNOBS[self._sel]
+        node, name, _, step, lo, hi = KNOBS[self._sel]
         cur = self._values.get(name, 0.0)
         new = max(lo, min(hi, round(cur + direction * step, 4)))
         if new != cur:
-            self.apply(name, new)
+            self.apply(name, new, node)
 
     def toggle_approach(self):
         cur = bool(self._values.get('approach_enabled', False))
@@ -278,7 +297,11 @@ class Tuner(Node):
                            'lowering horiz deg/unit\n')
         out.append('\n')
 
-        for i, (name, label, step, _, _) in enumerate(KNOBS):
+        last_node = None
+        for i, (node, name, label, step, _, _) in enumerate(KNOBS):
+            if node != last_node:
+                out.append(f'  {"-" * 4} {node} {"-" * 4}\n')
+                last_node = node
             mark = '>' if i == self._sel else ' '
             val = self._values.get(name, float('nan'))
             out.append(f'  {mark} {label:<18} {val:8.3f}   ({name})\n')

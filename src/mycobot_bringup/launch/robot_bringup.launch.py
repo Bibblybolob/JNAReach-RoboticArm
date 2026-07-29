@@ -91,6 +91,22 @@ def generate_launch_description():
     device_fps_arg = DeclareLaunchArgument('device_fps', default_value='30.0')
     device_width_arg = DeclareLaunchArgument('device_width', default_value='640')
     device_height_arg = DeclareLaunchArgument('device_height', default_value='480')
+    connection_arg = DeclareLaunchArgument(
+        'connection', default_value='tcp', choices=['tcp', 'serial'],
+        description="How to reach the arm. 'tcp' goes through the Pi's "
+                    "server.py over the network. 'serial' drives the arm's "
+                    'ESP32 directly over USB, removing the Pi, TCP and the '
+                    'network from every arm command. Stop mycobot_server on '
+                    'the Pi first -- two masters on one bus is erratic. Test '
+                    'with scripts/probe_usb_arm.py before relying on it')
+    serial_port_arg = DeclareLaunchArgument(
+        'serial_port', default_value='/dev/ttyUSB0',
+        description='Serial device for connection:=serial')
+    serial_baud_arg = DeclareLaunchArgument(
+        'serial_baud', default_value='1000000',
+        description="Baud for connection:=serial. 1000000 matches what the "
+                    "Pi's server.py opens the arm's UART at -- it is the "
+                    'firmware rate, not a property of the cable')
     home_on_start_arg = DeclareLaunchArgument(
         'home_on_start', default_value='true',
         description='Drive to the home pose once on startup so the arm always '
@@ -140,6 +156,9 @@ def generate_launch_description():
             'home_angles_deg': [0.0, 90.0, -90.0, 0.0, 0.0, 0.0],
             'home_speed': 30,
             'home_on_start': _b('home_on_start'),
+            'connection': _s('connection'),
+            'serial_port': _s('serial_port'),
+            'serial_baud': _i('serial_baud'),
         }],
         output='screen',
         # Deliberately NOT respawned, unlike the other nodes. Two reasons,
@@ -194,6 +213,9 @@ def generate_launch_description():
         camera_port_arg,
         stream_read_timeout_arg,
         home_on_start_arg,
+        connection_arg,
+        serial_port_arg,
+        serial_baud_arg,
         source_arg,
         device_arg,
         device_auto_exposure_arg,

@@ -107,6 +107,7 @@ you which case you are in.
 
 Useful arguments:
     robot_ip:=192.168.0.15         Pi address
+    connection:=serial             drive the arm over USB, no Pi in the path
     track:=color                   follow a colour blob, not a hand
     target_color:=red              which colour (red default)
     lead_time:=0.25                sit on a moving hand, not behind it (0.15)
@@ -264,6 +265,15 @@ def generate_launch_description():
         description='Image error below which the arm holds still. 0.05 is a '
                     'hand comfortably in the middle of the picture. Raise it '
                     'if the arm buzzes, lower it to sit nearer dead centre')
+    connection_arg = DeclareLaunchArgument(
+        'connection', default_value='tcp', choices=['tcp', 'serial'],
+        description="'serial' drives the arm's ESP32 directly over USB, "
+                    'removing the Pi and the network from the arm command '
+                    'path. Probe it first with scripts/probe_usb_arm.py')
+    serial_port_arg = DeclareLaunchArgument(
+        'serial_port', default_value='/dev/ttyUSB0')
+    serial_baud_arg = DeclareLaunchArgument(
+        'serial_baud', default_value='1000000')
     source_arg = DeclareLaunchArgument(
         'source', default_value='mjpeg', choices=['mjpeg', 'device'],
         description='Where frames come from. mjpeg reads the Pi over HTTP; '
@@ -392,6 +402,9 @@ def generate_launch_description():
             'camera_port': LaunchConfiguration('camera_port'),
             'stream_read_timeout': LaunchConfiguration('stream_read_timeout'),
             'home_on_start': LaunchConfiguration('home_on_start'),
+            'connection': LaunchConfiguration('connection'),
+            'serial_port': LaunchConfiguration('serial_port'),
+            'serial_baud': LaunchConfiguration('serial_baud'),
             'source': LaunchConfiguration('source'),
             'device': LaunchConfiguration('device'),
             'device_auto_exposure': LaunchConfiguration('device_auto_exposure'),
@@ -496,6 +509,9 @@ def generate_launch_description():
         rate_arg,
         progressive_gain_arg,
         deadband_arg,
+        connection_arg,
+        serial_port_arg,
+        serial_baud_arg,
         source_arg,
         device_arg,
         device_auto_exposure_arg,

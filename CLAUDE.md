@@ -191,6 +191,31 @@ loads the functions out of the node by source. **Run it after any change to
 the control law**; a flipped sign does not crash, it drives the target out of
 frame, which is indistinguishable from a badly mounted camera.
 
+**Only joint1, joint5 and joint3 are ever commanded.** The servo names
+`horizontal_joint` (joint1, pan), `vertical_joint` (joint5, tilt) and
+`approach_joint` (joint3, only when `approach_enabled`). joints 2, 4 and 6 are
+untouched by design — two DOF centre a target in an image and a third changes
+range; more would need the full 6-DOF image Jacobian and a pseudo-inverse
+rather than this 2x2. Small deltas on the untouched joints do appear in driver
+logs, but those are the profiler reconciling its commanded pose with the
+measured one after a divergence resync, not the servo asking.
+
+**The arm may be reachable over USB, skipping the Pi entirely.** The 280 Pi
+drives its servos through an M5Stack Atom (ESP32) that the Raspberry Pi
+reaches over the GPIO UART at 1000000 baud. The Atom has its own USB-C port,
+and if that is a data port into the same firmware then `connection:=serial`
+puts this machine directly on the bus: no `server.py`, no TCP, no network in
+any arm command. That is the leg of the ~250ms round trip nothing else here
+has been able to reduce, and it is the topology comparable arms use.
+
+```bash
+./scripts/probe_usb_arm.py     # read-only, no motion commanded
+```
+
+**Stop `mycobot_server` on the Pi first** — it drives the same firmware over
+the UART, and two masters on one bus behaves erratically. Untested against
+hardware as of this writing; the port may be power-only.
+
 ## Gotchas
 
 - **The home pose `[0, 90, -90, 0, 0, 0]` is defined in five places** and they

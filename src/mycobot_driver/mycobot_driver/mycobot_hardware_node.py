@@ -29,7 +29,7 @@ from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointJog
 from std_srvs.srv import SetBool
 
-from pymycobot import MyCobot280Socket
+from pymycobot import MyCobot280, MyCobot280Socket
 
 
 class MyCobotHardwareNode(Node):
@@ -48,6 +48,39 @@ class MyCobotHardwareNode(Node):
         self.declare_parameter(
             'robot_ip', os.environ.get('MYCOBOT_IP', '192.168.0.15'))
         self.declare_parameter('robot_port', 9000)
+        # --- How to reach the arm ---
+        #
+        # 'tcp' goes through the Pi: this node -> network -> server.py ->
+        # /dev/ttyAMA0 -> the arm's ESP32 -> servos. That is the shipped path
+        # and the only one that works out of the box.
+        #
+        # 'serial' talks to the arm's controller DIRECTLY over USB, skipping
+        # the Pi, server.py, TCP and the network in one step. The 280 Pi has an
+        # M5Stack Atom (ESP32) driving the servo bus, and its USB-C port is a
+        # second serial interface into the same firmware. If that port
+        # enumerates as a serial device, this node can be the master.
+        #
+        # Worth doing if it works, because it removes the whole arm-side
+        # network leg -- the part of the ~250ms round trip that nothing else
+        # in this project has been able to touch, and the reason the JetArm
+        # topology (compute -> USB -> MCU -> servos) tracks more smoothly.
+        #
+        # ONE MASTER AT A TIME. The Pi drives the same firmware over its GPIO
+        # UART, so leaving mycobot_server running while this node talks over
+        # USB puts two masters on one bus and the arm will behave erratically:
+        #
+        #     ssh er@<pi> 'sudo systemctl stop mycobot_server'
+        #
+        # Untested against hardware -- nobody has had that USB port plugged in
+        # yet. If the arm does not answer, the port is most likely power-only
+        # or the firmware does not bridge USB to the protocol, and neither is
+        # something this node can work around.
+        self.declare_parameter('connection', 'tcp')
+        self.declare_parameter('serial_port', '/dev/ttyUSB0')
+        # 1000000, matching what pi/server.py opens /dev/ttyAMA0 at. That is
+        # the arm firmware's rate, not a property of the transport, so it is
+        # the same over USB.
+        self.declare_parameter('serial_baud', 1000000)
         # NOTE ON LINK BUDGET: Server.py on the Pi accepts a single client and
         # blocks up to 100ms (its read() wait_time) on any command in its
         # has_return table. get_angles (0x20) and get_gripper_value (0x65) are
@@ -265,6 +298,16 @@ class MyCobotHardwareNode(Node):
         self._speed = self.get_parameter('default_speed').get_parameter_value().integer_value
         self._motion_rate = self.get_parameter(
             'publish_rate_during_motion').get_parameter_value().double_value
+        self._connection = self.get_parameter(
+            'connection').get_parameter_value().string_value
+        self._serial_port = self.get_parameter(
+            'serial_port').get_parameter_value().string_value
+        self._serial_baud = self.get_parameter(
+            'serial_baud').get_parameter_value().integer_value
+        if self._connection not in ('tcp', 'serial'):
+            raise ValueError(
+                f"connection must be 'tcp' or 'serial', got "
+                f'{self._connection!r}')
         self._cmd_interval = self.get_parameter('command_interval').get_parameter_value().double_value
         self._lookahead = self.get_parameter('lookahead').get_parameter_value().double_value
         self._traj_speed = self.get_parameter('trajectory_speed').get_parameter_value().integer_value
@@ -454,11 +497,19 @@ class MyCobotHardwareNode(Node):
     # ---- Connection ----
 
     def _connect(self) -> bool:
-        """Try to open the socket to the arm. Never raises."""
+        """Try to open the link to the arm. Never raises."""
         try:
-            self.get_logger().info(
-                f'Connecting to myCobot at {self._ip}:{self._port} ...')
-            mc = MyCobot280Socket(self._ip, self._port)
+            if self._connection == 'serial':
+                self.get_logger().info(
+                    f'Connecting to myCobot DIRECTLY over '
+                    f'{self._serial_port} at {self._serial_baud} baud '
+                    f'(no Pi, no network). Stop mycobot_server on the Pi '
+                    f'first -- two masters on one bus behaves erratically.')
+                mc = MyCobot280(self._serial_port, str(self._serial_baud))
+            else:
+                self.get_logger().info(
+                    f'Connecting to myCobot at {self._ip}:{self._port} ...')
+                mc = MyCobot280Socket(self._ip, self._port)
             time.sleep(0.5)
             # Prove the link works rather than trusting that constructing the
             # socket succeeded; a dead server can still accept a connection.

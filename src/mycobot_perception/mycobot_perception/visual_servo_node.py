@@ -241,6 +241,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 
 from control_msgs.msg import JointJog
 from geometry_msgs.msg import PointStamped
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import CameraInfo
 from std_srvs.srv import SetBool, Trigger
 
@@ -786,6 +787,16 @@ class VisualServoNode(Node):
         self._jog_pub = self.create_publisher(
             JointJog, self.get_parameter('jog_topic').value, 1)
 
+        # Let the tuning knobs be changed while the arm is tracking.
+        #
+        # Every parameter above is read once here into an attribute, which is
+        # fast but means `ros2 param set` silently did nothing -- the value
+        # changed, the behaviour did not. Tuning therefore meant a relaunch per
+        # experiment, with the hand in a different place each time, which is
+        # how you end up comparing two settings that were never measured
+        # against the same thing. scripts/tune_servo.py drives this.
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         # Servoing is armed by default now; the search trigger is what actually
         # sets the arm moving, so a second gate here served no purpose.
         self._enabled = True
@@ -819,6 +830,74 @@ class VisualServoNode(Node):
         )
 
     # ---- Driver gate ----
+
+    # Tuning knobs that can be changed while tracking, and where each one
+    # lands. Anything not in here is structural -- topics, joint names, the
+    # search geometry -- and changing it mid-flight would mean rebuilding
+    # state rather than assigning a number.
+    _LIVE_PARAMS = {
+        'gain': '_gain',
+        'progressive_gain': '_progressive_gain',
+        'lead_time': '_lead_time',
+        'velocity_smoothing': '_vel_smoothing',
+        'max_target_speed': '_max_target_speed',
+        'max_lead': '_max_lead',
+        'deadband': '_deadband',
+        'command_lag': '_command_lag',
+        'max_compensation': '_max_comp',
+        'max_step_deg': '_max_step',
+        'lag_compensation': '_lag_comp',
+        'target_size_fraction': '_target_size',
+        'approach_gain': '_approach_gain',
+        'max_approach_step_deg': '_max_approach_step',
+    }
+
+    def _on_set_parameters(self, params):
+        """Apply a live parameter change, or say why it was refused."""
+        for p in params:
+            name = p.name
+            if name in ('assumed_deg_per_error', 'assumed_v_deg_per_error'):
+                value = float(p.value)
+                if name == 'assumed_deg_per_error':
+                    if value <= 0.0:
+                        return SetParametersResult(
+                            successful=False,
+                            reason='assumed_deg_per_error must be positive')
+                    self._assumed_deg = value
+                else:
+                    # 0 keeps its "same as horizontal" meaning.
+                    self._assumed_v_deg = (value if value > 0.0
+                                           else self._assumed_deg)
+                # The Jacobian is built from these, so it has to be rebuilt --
+                # assigning the attribute alone would change the log line and
+                # nothing else. Only when the mounting was assumed: after a
+                # real probe the measured Jacobian is the better answer and
+                # must not be overwritten by a guess.
+                if self._skip_probe and self._probed:
+                    self._assume_orientation()
+                continue
+
+            if name == 'approach_enabled':
+                self._approach_enabled = bool(p.value)
+                self._approach_sign = (
+                    self._assumed_approach_sign
+                    if self._approach_enabled else 0.0)
+                continue
+
+            attr = self._LIVE_PARAMS.get(name)
+            if attr is None:
+                # Unknown or structural. Refusing loudly beats accepting it and
+                # leaving the caller to wonder why nothing changed.
+                return SetParametersResult(
+                    successful=False,
+                    reason=f'{name} cannot be changed while running')
+            setattr(self, attr,
+                    bool(p.value) if isinstance(p.value, bool)
+                    else float(p.value))
+
+        self.get_logger().info(
+            'live: ' + ', '.join(f'{p.name}={p.value}' for p in params))
+        return SetParametersResult(successful=True)
 
     def _arm_jog_once(self) -> None:
         """Enable the driver's jog gate, retrying until the driver appears."""

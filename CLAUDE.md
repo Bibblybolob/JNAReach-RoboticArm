@@ -110,8 +110,25 @@ Signs are worked out automatically (`auto_sign`) by correlating what each jog
 was predicted to do to the image against what it did. `assumed_h_sign` /
 `assumed_v_sign` still exist but should not need reaching for.
 
+**Tune it live, not by relaunching.** The servo takes runtime parameter
+changes (`add_on_set_parameters_callback`); structural ones — topics, joint
+names, search geometry — are refused with a reason rather than silently
+ignored, which is what `ros2 param set` used to do for everything since every
+value was read once into an attribute at construction.
+
+```bash
+./scripts/tune_servo.py          # with ./run.py already running
+```
+
+Scores the loop while it tracks: mean distance from centre, worst miss, and
+**sign flips per second**. The last one is the point — a mean alone rewards a
+loop that has given up, since a servo parked off-centre scores the same as one
+buzzing evenly around it. Per-axis errors are separate because the two axes
+have separate scales and a weak vertical is invisible in a combined figure.
+
 ```bash
 python3 src/mycobot_perception/test/test_servo_math.py
+python3 src/mycobot_driver/test/test_jog_profile.py
 ```
 Pins the sign conventions and the auto_sign detector. Runs without ROS — it
 loads the functions out of the node by source. **Run it after any change to
@@ -172,6 +189,16 @@ frame, which is indistinguishable from a badly mounted camera.
 - `obstacles.yaml` is empty; `src/mycobot_bringup/config/network.yaml` is read
   by nothing and disagrees with the defaults.
 - Approach (closing in on the hand) is implemented but off by default
-  (`approach_enabled:=false`) until tracking is solid.
+  (`approach_enabled:=false`) until tracking is solid. **While it is off, the
+  toward/away axis genuinely never moves** — `_approach_sign` is pinned to 0,
+  so joint3 gets no command at all. "Some motors are not contributing" is that,
+  not a fault. Only joint1 (pan), joint5 (tilt) and joint3 (approach, when
+  enabled) are ever driven; joints 2, 4 and 6 are untouched by design.
+- **The hand position is already EMA-smoothed** in `hand_tracker_node`
+  (`smoothing`, 0.6, applied in pixel space before publishing). Do not add a
+  second filter in the servo: the published point carries the *frame's*
+  timestamp while representing a blend of older frames, so the smoothing lag
+  is invisible to the lag compensator, and doubling it adds dead time to the
+  loop whose binding constraint is dead time. Tune the existing one instead.
 - Planned hardware move: Jetson Orin Nano + RealSense D405, which removes most
   of the latency the servo currently compensates for.

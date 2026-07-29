@@ -24,6 +24,26 @@ says the Pi is not running current code, that is what it means.
 python3 pi/test_camera_stream.py     # runs without a Pi or a camera
 ```
 
+**"The camera lags" now has a number.** The Pi stamps each MJPEG part with its
+capture time (`X-Capture-Us`) and `camera_node` reports:
+
+```
+camera transit: +4ms mean, +230ms worst, over best case
+```
+
+The two clocks are not synchronised, so the absolute difference is
+meaningless — but the offset is constant, so the smallest difference seen in a
+run is taken as the zero and everything is reported above it. That is enough
+to catch a spike, which is the whole question. **This is the only measurement
+of the Pi→host leg**; the servo's `frames Nms old` counts from `camera_node`'s
+*publish* stamp, written after capture, encode, network and decode, so a stall
+out there is invisible to it.
+
+Read it against the other two: a high transit figure is frames delayed *in
+flight* (Pi stalling, link congested, host not draining the socket). A slow
+camera is a low `streaming N FPS` on the Pi and does **not** raise transit —
+different fault, different fix.
+
 **An overloaded Pi does not look like an overloaded Pi.** It shows up as three
 apparently unrelated faults at once: the driver taking ten seconds to connect,
 homing timing out, and `camera_node` failing to connect for half a minute

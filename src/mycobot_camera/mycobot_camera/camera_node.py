@@ -30,6 +30,7 @@ anywhere, and nothing here should be taken as evidence about its size.
 """
 import os
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -97,6 +98,13 @@ class CameraNode(Node):
         self._height = None
         self._latest_frame = None
         self._frame_lock = threading.Lock()
+        # Transit measurement: the smallest (arrival - capture) seen acts as
+        # the unknown clock offset, and everything is reported relative to it.
+        self._transit_floor = None
+        self._transit_n = 0
+        self._transit_sum = 0.0
+        self._transit_max = 0.0
+        self._transit_report = 0.0
         self._stop_event = threading.Event()
 
         if self._source == 'device':
@@ -116,6 +124,60 @@ class CameraNode(Node):
         self._reader_thread.start()
 
         self._timer = self.create_timer(1.0 / rate, self._publish_latest_frame)
+
+    def _note_transit(self, headers: bytes) -> None:
+        """Measure how long this frame took to get here from the sensor.
+
+        The Pi stamps each part with its own capture time. The two clocks are
+        not synchronised, so the absolute difference is meaningless -- but the
+        offset between them is CONSTANT, so the smallest difference seen in a
+        run is the best case (near-zero queueing) and everything above it is
+        real, measurable delay. Reporting excess-over-best sidesteps the clock
+        problem entirely and still answers the only question being asked:
+        is it lagging right now, and by how much.
+
+        This is the one leg of the pipeline nothing else measures. The servo's
+        `frames Nms old` counts from this node's PUBLISH stamp, which is
+        written after capture, encode, network and decode have already
+        happened, so a stall out here is invisible to it.
+        """
+        idx = headers.find(b'X-Capture-Us:')
+        if idx == -1:
+            return                      # older Pi build; nothing to measure
+        try:
+            captured_us = int(headers[idx + 13:].split(b'\r\n', 1)[0])
+        except (ValueError, IndexError):
+            return
+
+        diff = time.time() - captured_us / 1e6
+        if self._transit_floor is None or diff < self._transit_floor:
+            # Best case seen so far; treat it as the clock offset. Frames
+            # cannot arrive before they were taken, so the minimum is the
+            # closest thing to a zero available without synchronised clocks.
+            self._transit_floor = diff
+        excess = diff - self._transit_floor
+
+        self._transit_n += 1
+        self._transit_sum += excess
+        self._transit_max = max(self._transit_max, excess)
+
+        now = time.monotonic()
+        if now - self._transit_report < 10.0 or self._transit_n < 10:
+            return
+        mean = self._transit_sum / self._transit_n
+        note = ''
+        if self._transit_max > 0.25:
+            note = (' -- frames are arriving in bursts; the Pi or the link is '
+                    'stalling, and the servo cannot see this from its own '
+                    'staleness figure')
+        self.get_logger().info(
+            f'camera transit: +{mean * 1000:.0f}ms mean, '
+            f'+{self._transit_max * 1000:.0f}ms worst, over best case'
+            f'{note}')
+        self._transit_report = now
+        self._transit_n = 0
+        self._transit_sum = 0.0
+        self._transit_max = 0.0
 
     def _open_device(self):
         """Open a local camera. An integer is a /dev/videoN index; anything
@@ -214,6 +276,9 @@ class CameraNode(Node):
                     start = buf.find(b'\xff\xd8')  # JPEG SOI marker
                     end = buf.find(b'\xff\xd9')    # JPEG EOI marker
                     if start != -1 and end != -1 and end > start:
+                        # Everything before the SOI is this part's headers,
+                        # which is where the Pi puts its capture time.
+                        self._note_transit(buf[:start])
                         jpg = buf[start:end + 2]
                         buf = buf[end + 2:]
                         frame = cv2.imdecode(

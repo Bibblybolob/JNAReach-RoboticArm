@@ -62,6 +62,7 @@ slow.
 """
 
 import argparse
+import socket
 import threading
 import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -83,6 +84,7 @@ class Camera:
         self._quality = quality
         self._cond = threading.Condition()
         self._jpeg = None
+        self._captured_us = 0
         self._seq = 0
         self._stop = threading.Event()
         self._frames = 0
@@ -119,6 +121,12 @@ class Camera:
                       'reads', flush=True)
                 self._fail_streak = 0
 
+            # Stamped as close to the read as possible: this is the number the
+            # host subtracts to find out how old a frame is by the time
+            # anything looks at it, and every line of code between the capture
+            # and the stamp is latency that hides from that measurement.
+            captured_us = int(time.time() * 1e6)
+
             ok, jpeg = cv2.imencode(
                 '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._quality])
             if not ok:
@@ -128,6 +136,7 @@ class Camera:
             # Encoded once here, not once per client.
             with self._cond:
                 self._jpeg = data
+                self._captured_us = captured_us
                 self._seq += 1
                 self._cond.notify_all()
 
@@ -150,15 +159,22 @@ class Camera:
                 next_frame = time.monotonic()
 
     def latest(self, after_seq, timeout=5.0):
-        """Block until a frame newer than `after_seq`. Returns (seq, bytes)."""
+        """Block until a frame newer than `after_seq`.
+
+        Returns (seq, bytes, captured_us). A client slower than the capture
+        rate is handed the CURRENT frame rather than the next one in order,
+        so it drops intermediate frames instead of falling progressively
+        further behind. Skipping is the right failure here: a servo loop wants
+        the newest frame, not every frame.
+        """
         with self._cond:
             if not self._cond.wait_for(
                     lambda: self._stop.is_set() or self._seq > after_seq,
                     timeout=timeout):
-                return after_seq, None
+                return after_seq, None, 0
             if self._stop.is_set():
-                return after_seq, None
-            return self._seq, self._jpeg
+                return after_seq, None, 0
+            return self._seq, self._jpeg, self._captured_us
 
     def snapshot(self):
         with self._cond:
@@ -195,18 +211,35 @@ class StreamHandler(BaseHTTPRequestHandler):
 
         with StreamHandler._lock:
             StreamHandler.clients += 1
+        # Bound how much the kernel will hold for a client that is not
+        # draining. Frames already handed to the socket cannot be replaced
+        # with fresher ones, so a deep send buffer is latency the skipping
+        # above cannot undo -- a couple of frames' worth is plenty.
+        try:
+            self.connection.setsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF, 128 * 1024)
+        except OSError:
+            pass
         # A blocking write to a dead peer is the thing that used to leak
         # threads; a timeout turns it into an exception this thread can exit on.
         self.connection.settimeout(self.write_timeout)
         seq = 0
         try:
             while True:
-                seq, data = self.camera.latest(seq)
+                seq, data, captured_us = self.camera.latest(seq)
                 if data is None:
                     break            # shutting down, or no frames for 5s
                 self.wfile.write(b'--frame\r\n')
                 self.wfile.write(b'Content-Type: image/jpeg\r\n')
                 self.wfile.write(f'Content-Length: {len(data)}\r\n'.encode())
+                # When this frame came off the sensor, by the Pi's clock. The
+                # host cannot trust the absolute value -- the two clocks are
+                # not synchronised -- but the OFFSET between them is constant,
+                # so variation in (arrival - capture) is real variation in
+                # latency. That is what "the camera sometimes lags" needs:
+                # not an absolute figure, a reliable way to see a spike.
+                self.wfile.write(
+                    f'X-Capture-Us: {captured_us}\r\n'.encode())
                 self.wfile.write(b'\r\n')
                 self.wfile.write(data)
                 self.wfile.write(b'\r\n')

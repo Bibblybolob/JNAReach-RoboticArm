@@ -20,6 +20,18 @@ Three machines, and confusing them is the most common source of wasted time.
 checksums them against the Pi and refuses to start quietly out of sync — if it
 says the Pi is not running current code, that is what it means.
 
+```bash
+python3 pi/test_camera_stream.py     # runs without a Pi or a camera
+```
+
+**An overloaded Pi does not look like an overloaded Pi.** It shows up as three
+apparently unrelated faults at once: the driver taking ten seconds to connect,
+homing timing out, and `camera_node` failing to connect for half a minute
+while `run.py`'s preflight said the camera was fine moments earlier. The Pi
+runs both `server.py` and `camera_stream.py`, so anything that eats a core
+starves the other. Check the camera server's own FPS/client log line before
+believing the fault is where it appears to be.
+
 Override the address with `MYCOBOT_IP`; every script and launch file reads it.
 
 ## Running it

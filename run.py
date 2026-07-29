@@ -227,13 +227,36 @@ def wait_for_pi_camera():
         time.sleep(1)
 
 
+def _arg_is(args, name, value):
+    return any(a.replace(' ', '') == f'{name}:={value}' for a in args)
+
+
 def preflight(args=()):
-    """Prove the Pi is serving both ports before launching.
+    """Prove the Pi is serving what this run needs, and nothing more.
 
     Without this, an unreachable arm surfaces as 'Waiting for /arm/jog_enable'
     and a dead camera as a servo node that never sees a frame -- two confusing
     ROS-level symptoms for one plain infrastructure problem.
+
+    But WHAT this run needs from the Pi depends on how it was invoked, and
+    checking for more than that turns the preflight from a help into an
+    obstacle. connection:=serial drives the arm over USB; source:=device opens
+    a local camera. With both, the Pi is not in the picture at all and every
+    check below is asking after a machine this run will never speak to.
     """
+    serial_arm = _arg_is(args, 'connection', 'serial')
+    local_cam = _arg_is(args, 'source', 'device')
+
+    if serial_arm and local_cam:
+        say('connection:=serial and source:=device -- the Pi is not in this '
+            'run at all, so nothing about it is checked.')
+        print(f'{DIM}    The arm is driven over USB and the camera is local. '
+              f'If the arm does not\n    respond, the driver will say so; '
+              f'scripts/probe_usb_arm.py tests it\n    directly. Stop '
+              f'mycobot_server on the Pi -- two masters on one bus is '
+              f'erratic.{OFF}')
+        return
+
     say(f'Checking Pi at {IP} ...')
     if ping_ok(IP):
         say('Pi reachable.')
@@ -252,11 +275,16 @@ def preflight(args=()):
     # blocking startup on a stream nothing will open -- or worse, refusing to
     # start because the webcam was physically moved off the Pi -- is the
     # preflight getting in the way of the thing it exists to protect.
-    if any(a.replace(' ', '') == 'source:=device' for a in args):
+    if local_cam:
         say('source:=device -- skipping the Pi camera check; camera_node will '
             'open a local device.')
     else:
         wait_for_pi_camera()
+
+    if serial_arm:
+        say('connection:=serial -- skipping the arm TCP check; the driver '
+            'opens the USB serial port instead.')
+        return
 
     say('Waiting for arm TCP on :9000 ...')
     for i in range(30):

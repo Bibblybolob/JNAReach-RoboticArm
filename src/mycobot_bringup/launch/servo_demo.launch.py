@@ -7,7 +7,8 @@ Starts, in one terminal:
   - robot_state_publisher   (URDF TF tree)
   - mycobot_hardware_node   (arm driver: joint states, trajectories, jogging)
   - camera_node             (Pi MJPEG stream -> /camera/image_raw)
-  - hand_tracker_node       (MediaPipe -> /hand/point_px)
+  - hand_tracker_node       (MediaPipe -> /hand/point_px)     track:=hand
+    or color_tracker_node   (LAB threshold -> /color/point_px) track:=color
   - visual_servo_node       (image error -> /arm/jog)
 
 move_group and RViz are deliberately NOT included. Visual servoing bypasses
@@ -106,6 +107,8 @@ you which case you are in.
 
 Useful arguments:
     robot_ip:=192.168.0.15         Pi address
+    track:=color                   follow a colour blob, not a hand
+    target_color:=red              which colour (red default)
     lead_time:=0.25                sit on a moving hand, not behind it (0.15)
     lead_time:=0.0                 back to proportional only
     gain:=0.6                      hotter near the centre (0.45 default)
@@ -135,7 +138,8 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import LaunchConfigurationEquals
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 
@@ -230,6 +234,17 @@ def generate_launch_description():
         description='Image error below which the arm holds still. 0.05 is a '
                     'hand comfortably in the middle of the picture. Raise it '
                     'if the arm buzzes, lower it to sit nearer dead centre')
+    track_arg = DeclareLaunchArgument(
+        'track', default_value='hand', choices=['hand', 'color'],
+        description="What to follow. 'color' runs color_tracker_node instead "
+                    'of MediaPipe and points the servo at it. The control '
+                    'loop is identical -- only the measurement changes, and '
+                    'it changes for the better: a blob centroid is steadier '
+                    'than a hand landmark and costs 0.2ms against 8-19ms')
+    target_color_arg = DeclareLaunchArgument(
+        'target_color', default_value='red',
+        description='Colour to follow when track:=color (red, green, blue, '
+                    'yellow). Tune with lab_bounds if the lighting fights it')
     delegate_arg = DeclareLaunchArgument(
         'delegate', default_value='cpu',
         description="Hand detection backend: 'cpu' is mp.solutions.hands, "
@@ -319,9 +334,25 @@ def generate_launch_description():
         }.items(),
     )
 
+    color_tracker = Node(
+        package='mycobot_perception',
+        executable='color_tracker_node',
+        name='color_tracker_node',
+        condition=LaunchConfigurationEquals('track', 'color'),
+        parameters=[{
+            'target_color': LaunchConfiguration('target_color'),
+            'show_window': LaunchConfiguration('show_window'),
+            'publish_annotated': LaunchConfiguration('show_window'),
+        }],
+        output='screen',
+        respawn=True,
+        respawn_delay=3.0,
+    )
+
     hand_tracker = Node(
         package='mycobot_perception',
         executable='hand_tracker_node',
+        condition=LaunchConfigurationEquals('track', 'hand'),
         name='hand_tracker_node',
         parameters=[{
             'show_window': LaunchConfiguration('show_window'),
@@ -345,6 +376,12 @@ def generate_launch_description():
         executable='visual_servo_node',
         name='visual_servo_node',
         parameters=[{
+            # Whichever tracker is running publishes the contract the servo
+            # consumes, so switching targets is a topic change and nothing
+            # more -- the control law does not know the difference.
+            'point_topic': PythonExpression([
+                "'/color/point_px' if '", LaunchConfiguration('track'),
+                "' == 'color' else '/hand/point_px'"]),
             'gain': LaunchConfiguration('gain'),
             'progressive_gain': LaunchConfiguration('progressive_gain'),
             'assumed_deg_per_error': LaunchConfiguration('assumed_deg_per_error'),
@@ -389,6 +426,8 @@ def generate_launch_description():
         v_deg_per_error_arg,
         progressive_gain_arg,
         deadband_arg,
+        track_arg,
+        target_color_arg,
         model_complexity_arg,
         delegate_arg,
         hand_model_arg,
@@ -405,6 +444,7 @@ def generate_launch_description():
         v_sign_arg,
         search_on_start_arg,
         robot,
+        color_tracker,
         hand_tracker,
         servo,
     ])

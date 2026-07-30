@@ -337,6 +337,16 @@ Four things to get right:
     `listen` needs no divider at all and answers the pin-mapping question on
     its own, so do that one first.
 
+  - **Three wires, not two.** TX and RX alone cannot work, and this cost a
+    session. A receiver decides high-or-low by comparing the incoming voltage
+    against *its own* ground, so with no shared reference the two boards float
+    relative to each other and the arm reads constant idle, constant break, or
+    garbage — never valid frames. It presents exactly as `-1` from
+    `get_angles`, i.e. indistinguishable from wrong pins or a dead bus. A
+    loopback will not catch it either: the loopback shares the adapter's ground
+    with itself. Removing the Pi makes this newly load-bearing, since the Pi
+    was the common reference for everything in the base.
+
   Note the Uno's 3.3V pin is irrelevant to any of this — it is a ~50mA
   regulator output for powering peripherals, not a logic-level selector. Both
   AVRs run at VCC = 5V and their pins swing 0–5V regardless. A CP2102/CH340

@@ -4,6 +4,7 @@
     ./scripts/probe_uart_bridge.py loopback          # jumper TX to RX
     ./scripts/probe_uart_bridge.py listen            # passive tap, decodes frames
     ./scripts/probe_uart_bridge.py poke              # ask the arm, dump raw bytes
+    ./scripts/probe_uart_bridge.py hunt              # poke on a loop while you probe pins
 
 This is the cheap de-risking step for putting a Jetson (or anything else) on
 the arm's UART in place of the Raspberry Pi. Three questions:
@@ -462,6 +463,60 @@ def cmd_poke(args):
     return 1
 
 
+def cmd_hunt(args):
+    """Poke twice a second and report live, so you can probe pins by hand.
+
+    For when the transmit side works and nothing answers -- the receive wire is
+    on the wrong pin and the question is which. Running the whole test per
+    guess is too slow to search with; this leaves the port open, asks
+    continuously, and names what it hears each time, so you can walk a jumper
+    down the header and watch for the line to change.
+
+    GET_ANGLES only, so it commands nothing however long it runs.
+    """
+    request = bytes([HEADER, HEADER, 0x02, 0x20, FOOTER])
+    print(f'{args.port} at {args.baud} baud. Asking for angles twice a '
+          f'second.\nNo motion is commanded -- leave it running.\n')
+    print('Move the RECEIVE wire from pin to pin. Ground and the transmit')
+    print('wire stay put. Watch for REPLY.\n')
+    print('  silent = nothing driving that pin (or not seated)')
+    print('  echo   = hearing your own transmit wire couple across\n')
+
+    ser = open_port(args.port, args.baud)
+    n = 0
+    try:
+        while True:
+            n += 1
+            ser.reset_input_buffer()
+            ser.write(request)
+            ser.flush()
+            time.sleep(0.2)
+            got = ser.read(512)
+            with contextlib.redirect_stdout(io.StringIO()):
+                framed = _drain_frames(bytearray(got)) if got else 0
+            if framed:
+                print(f'  [{n:>4}]  REPLY  {len(got)}B  {got[:20].hex(" ")}')
+                print('\n' + '=' * 68)
+                print('  That pin is the arm\'s TX. Leave the wire there.')
+                print('=' * 68)
+                print('\n    ./scripts/serial_move_test.py '
+                      f'--port {args.port}\n')
+                return 0
+            if not got:
+                state = 'silent'
+            elif len(got) == len(request):
+                state = f'echo    {got.hex(" ")}'
+            else:
+                state = f'{len(got)}B      {got[:20].hex(" ")}'
+            print(f'  [{n:>4}]  {state}')
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        print(f'\nStopped after {n} attempts, no reply.')
+        return 1
+    finally:
+        ser.close()
+
+
 def _drain_frames(buf):
     """Pull complete frames off the front of buf, printing each. Returns the
     count. Leaves a partial frame in place for the next read."""
@@ -496,7 +551,7 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['loopback', 'listen', 'poke'])
+    ap.add_argument('mode', choices=['loopback', 'listen', 'poke', 'hunt'])
     ap.add_argument('--port', default='/dev/ttyACM0',
                     help='ttyACM0 for an Uno, ttyUSB0 for most adapters')
     ap.add_argument('--baud', type=int, default=1000000,
@@ -508,7 +563,7 @@ def main():
                          'an error rate off')
     args = ap.parse_args()
     return {'loopback': cmd_loopback, 'listen': cmd_listen,
-            'poke': cmd_poke}[args.mode](args)
+            'poke': cmd_poke, 'hunt': cmd_hunt}[args.mode](args)
 
 
 if __name__ == '__main__':

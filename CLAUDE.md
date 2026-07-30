@@ -317,7 +317,25 @@ Four things to get right:
   ```bash
   ./scripts/probe_uart_bridge.py loopback   # does the link carry bytes intact?
   ./scripts/probe_uart_bridge.py listen     # is this wire really the arm's TX?
+  ./scripts/probe_uart_bridge.py poke       # ask the arm, dump the raw reply
+  ./scripts/probe_uart_bridge.py hunt       # poke on a loop while you probe pins
   ```
+
+  **Bytes arriving is not the arm answering.** A floating receive wire running
+  alongside a transmitting one couples enough to frame as bytes, and it only
+  does so while you are sending — which is exactly when you are looking. The
+  tell is length: `GET_ANGLES` is 5 bytes out and 17 back, so N copies return
+  5N from an echo and 17N from the arm. `poke` runs that automatically.
+
+  Measured here: 5 sent, 5 back, `ff ff fb bf fb`, byte-identical over repeated
+  trials while a jumpered loopback on the same adapter was 5120/5120 perfect. A
+  real short would echo perfectly; mangled-but-deterministic is capacitive
+  coupling, which passes edges and not levels — the receiver takes the first
+  falling spike as a start bit and then samples a line already back high, hence
+  bytes that are nearly all 1s. Repeatable because the same data makes the same
+  edges. `hunt` exists for the search that follows: it asks twice a second and
+  names what it hears, so the receive wire can be walked down the header by
+  hand instead of guessing a pin and re-running everything.
 
   **A loopback cannot detect a wrong baud rate, ever.** Both directions are the
   same chip driven from the same divisor register, so a wrong rate is wrong

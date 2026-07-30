@@ -347,6 +347,24 @@ Four things to get right:
     with itself. Removing the Pi makes this newly load-bearing, since the Pi
     was the common reference for everything in the base.
 
+  - **Identify the wires by their idle voltage, with the adapter unplugged.**
+    UART idles high, so with the arm powered and nothing else connected, a
+    meter to the arm's ground tells you which is which:
+
+    | reading | what it is | connect |
+    |---|---|---|
+    | steady ~3.3V | the arm's **TX** — an output idling high | adapter's RX (D1) |
+    | ~0V, or floating/drifting | the arm's **RX** — an input | adapter's TX (D0) |
+    | ~5V | not a UART line. A power rail — wrong connector |
+    | **3.6V** | a 5V driver already on it, clamped (see below) |
+
+    That 3.6V case is worth knowing on sight: 5V through the Uno's on-board 1k
+    into an ESP32 input pin is held by the pin's protection diode at 3.3 + Vf ≈
+    3.6V, drawing ~1.4mA. So **3.6V means your D0 is on the arm's RX and the
+    divider is not working** — the orientation is right and the level shift is
+    missing. A correct 1k/2k reads 3.33V. It is also the ESP32's absolute
+    maximum (VDD+0.3), i.e. surviving on the diode rather than by design.
+
   Note the Uno's 3.3V pin is irrelevant to any of this — it is a ~50mA
   regulator output for powering peripherals, not a logic-level selector. Both
   AVRs run at VCC = 5V and their pins swing 0–5V regardless. A CP2102/CH340

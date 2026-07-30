@@ -381,6 +381,18 @@ Four things to get right:
     | ~5V | not a UART line. A power rail — wrong connector |
     | **3.6V** | a 5V driver already on it, clamped (see below) |
 
+    **A pin labelled "TX" does not settle anything** — whose TX? Two opposite
+    conventions are both in use: named for the *host's* signal, which is what
+    the Pi pinout does (pin 8 is "UART TX" because the *Pi* transmits, so a
+    replacement host wires straight through), or named for *that board's* own
+    port, which means crossed. The arm's connector is documented the first way
+    but a silkscreen elsewhere on the board may be the second.
+
+    Settle it by which pin is **driven**, which is not a labelling question.
+    Adapter off, arm powered, then hang a 10k from the pin to ground: an output
+    idling high barely moves, a floating input collapses toward 0. The arm's TX
+    is the output, and the adapter's RX goes there.
+
     That 3.6V case is worth knowing on sight: 5V through the Uno's on-board 1k
     into an ESP32 input pin is held by the pin's protection diode at 3.3 + Vf ≈
     3.6V, drawing ~1.4mA. So **3.6V means your D0 is on the arm's RX and the

@@ -311,9 +311,20 @@ Four things to get right:
     an **output** — the USB chip's TX — and `D1` ("TX") an **input**. So wire
     label-to-same-label, *not* crossed, which is the opposite of the reflex.
   - **The Uno is 5V and the ESP32 is not 5V tolerant.** Listening on D1 is
-    free; driving D0 into the arm's RX at 5V can destroy it. 1k series + 2k to
-    ground gives 3.3V. `listen` needs no divider and answers the pin-mapping
-    question on its own, so do that one first.
+    free; driving D0 into the arm's RX at 5V can destroy it. Fit **one**
+    resistor, 2k from D0 to ground: the board already has 1k in series to the
+    D0 pin, so that completes a 1k/2k divider at 3.33V. A second resistor in
+    series gives 2.5V against the ESP32's 2.475V threshold — a 25mV margin,
+    which is a line that reads as neither high nor low. Measure it (idle UART
+    sits high, so D0 should read ~3.3V); 5V means the board resistor is absent.
+    `listen` needs no divider at all and answers the pin-mapping question on
+    its own, so do that one first.
+
+  Note the Uno's 3.3V pin is irrelevant to any of this — it is a ~50mA
+  regulator output for powering peripherals, not a logic-level selector. Both
+  AVRs run at VCC = 5V and their pins swing 0–5V regardless. A CP2102/CH340
+  breakout with a 3.3V jumper switches real VCCIO and costs about $3, which is
+  the better tool for anything past one evening.
 
   Stopping `mycobot_server` is **not** enough before transmitting: GPIO14 stays
   in ALT0 actively driving pin 8, so two outputs fight. `sudo raspi-gpio set 14

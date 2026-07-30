@@ -46,9 +46,19 @@ damaging it permanently.
     listening (D1) is safe    -- it is an input, nothing is driven
     transmitting (D0) is not  -- put a divider in it
 
-A 1k series resistor from D0 with a 2k from there to ground gives 3.3V, which
-is why `listen` exists as a separate mode: it answers the pin-mapping question
-with no divider and no risk. Do that first.
+Add ONE resistor, 2k from D0 to ground -- not two. The Uno R3 already has a 1k
+in series between the 16U2's TX and the D0 header pin (it is there so an
+external device can override the USB chip), so 2k to ground completes a 1k/2k
+divider at 3.33V. Adding your own series resistor on top makes it 1k+1k/2k =
+2.5V, and the ESP32's input threshold is 0.75 x VDD = 2.475V -- a 25mV margin,
+i.e. a line that reads as neither high nor low depending on temperature.
+
+Clones vary, so measure rather than assume: UART idles high, so D0 with the
+resistor fitted and nothing transmitting should sit at ~3.3V. If it reads 5V
+the on-board resistor is absent and you need a 1k in series as well.
+
+This is why `listen` exists as a separate mode: it uses only D1, an input, so
+it answers the pin-mapping question with no divider and no risk. Do it first.
 
 THE OTHER MASTER
 

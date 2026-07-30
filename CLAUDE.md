@@ -576,6 +576,54 @@ hardware as of this writing; the port may be power-only.
   - `camera_node` takes `source:=device` to open a local V4L2 or CSI camera
     (a non-numeric `device` is handed to OpenCV as a GStreamer pipeline, which
     is how `nvarguscamerasrc` gets in) instead of the Pi's MJPEG stream.
+  - **`source:=realsense`** drives a RealSense through librealsense.
+
+    ```bash
+    ./run.py source:=realsense                    # hand detection only
+    ./run.py source:=realsense rs_depth:=true     # + /camera/depth_raw
+    ```
+
+    Not the same as pointing `source:=device` at it. A RealSense does
+    enumerate UVC nodes, so OpenCV can sometimes grab *something* — but which
+    `/dev/videoN` carries colour is not stable across replugs, the formats are
+    Y8/Y16/Z16 rather than the MJPG that path requests, and it discards depth
+    and the factory intrinsics, which are the whole reason to own one.
+
+    **This is what finally supplies camera intrinsics.** `CameraInfo` has
+    always gone out with width and height and empty `k`/`p`/`d` — the reason
+    `/hand/point_cam` is silent and depth unavailable. librealsense hands over
+    the factory calibration with the stream, so `source:=realsense` fills in a
+    real projection matrix without `calibrate_camera.py` ever being run.
+
+    **Three D405-specific things:**
+
+    - **Depth is only valid from ~7cm to 50cm.** That is exactly right for
+      pressing buttons and wrong for following a hand across a room — but
+      **hand detection is unaffected either way**, because MediaPipe works on
+      the colour image and never looks at depth. A hand at 2m tracks as well
+      as it ever did; only the range reading goes away.
+    - **Its colour comes from the same stereo imagers as depth**, so there is
+      no separate RGB module and the two are natively registered.
+      `rs_align_depth_to_color` is therefore off by default; on a D435/D455 it
+      would be mandatory.
+    - **The lens is much wider, and that invalidates the servo gains.** Error
+      is normalised per axis, so 1.0 means "at the edge" on any camera — but
+      the edge is ~25° away on the current webcam and ~43° on a D405. The same
+      normalised error therefore commands nearly twice the rotation, and the
+      loop will over-command and ring. `camera_node` computes the real FOV from
+      the intrinsics and warns when it is this much wider, naming
+      `skip_probe:=false` as the fix. **Re-measure before trusting any tuning
+      in this file.**
+
+    `pyrealsense2` is deliberately not in `requirements.txt` as a hard
+    dependency — there is no official ARM64 wheel, so requiring it would break
+    install on the very platform this is for. The node reports it missing and
+    keeps running.
+
+    ```bash
+    python3 src/mycobot_camera/test/test_realsense_source.py
+    ```
+    Stubs librealsense, so it runs with no camera attached.
   - `hand_tracker_node` takes `delegate:=gpu`, switching from
     `mp.solutions.hands` — which is CPU-only and has no delegate option at all
     — to the Tasks API `HandLandmarker`. Needs a `hand_landmarker.task` bundle

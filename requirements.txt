@@ -34,3 +34,13 @@ mediapipe<1.0
 opencv-contrib-python<5
 pymycobot
 requests
+
+# Only needed for source:=realsense. Deliberately NOT a hard dependency: the
+# mjpeg and device paths are unaffected by its absence, and on Jetson/ARM64
+# there is no official wheel, so requiring it here would break install on the
+# platform this project is moving to. camera_node reports it as missing and
+# keeps running.
+#
+#   pip install pyrealsense2
+#
+# On ARM64, build librealsense from source with -DBUILD_PYTHON_BINDINGS=ON.

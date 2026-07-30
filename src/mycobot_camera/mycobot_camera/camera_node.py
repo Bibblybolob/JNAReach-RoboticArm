@@ -107,6 +107,32 @@ class CameraNode(Node):
         # the light.
         self.declare_parameter('device_exposure', 0.0)
 
+        # --- source:=realsense ------------------------------------------
+        # An Intel RealSense via librealsense rather than V4L2. A RealSense
+        # does enumerate UVC video nodes, so source:=device can sometimes grab
+        # SOMETHING off one of them -- but which /dev/videoN carries colour is
+        # not stable across replugs, the formats are Y8/Y16/Z16 rather than the
+        # MJPG this path asks for, and it throws away depth and the factory
+        # intrinsics, which are the entire reason to own the camera.
+        #
+        # 640x480 by default to match the rest of the project: the servo's
+        # tuning is expressed in fractions of a 640-wide frame.
+        self.declare_parameter('rs_width', 640)
+        self.declare_parameter('rs_height', 480)
+        self.declare_parameter('rs_fps', 30)
+        # Serial number, for when more than one is plugged in. Empty = first.
+        self.declare_parameter('rs_serial', '')
+        # Depth costs USB bandwidth and hand detection is purely 2D, so it is
+        # off by default. Turn it on for the approach axis and for
+        # /hand/point_cam, which needs the intrinsics this path supplies.
+        self.declare_parameter('rs_depth', False)
+        # D405 SPECIFIC: its colour comes from the same stereo imagers that
+        # produce depth, so the two are natively registered and aligning is a
+        # no-op that costs CPU. On a D435/D455, whose RGB module is a separate
+        # sensor on a different baseline, alignment is required for a pixel in
+        # one image to mean anything in the other.
+        self.declare_parameter('rs_align_depth_to_color', False)
+
         self._source = self.get_parameter('source').get_parameter_value().string_value
         self._url = self.get_parameter('camera_url').get_parameter_value().string_value
         rate = self.get_parameter('frame_rate').get_parameter_value().double_value
@@ -131,11 +157,26 @@ class CameraNode(Node):
         # CameraInfo stays RELIABLE: it is tiny, and consumers need to receive
         # it once rather than catch it in flight.
         self._info_pub = self.create_publisher(CameraInfo, 'camera/camera_info', 10)
+        # Only created when a depth stream was actually asked for, so nothing
+        # advertises a topic it will never publish on.
+        self._depth_pub = None
+        if (self.get_parameter('source').value == 'realsense'
+                and bool(self.get_parameter('rs_depth').value)):
+            self._depth_pub = self.create_publisher(
+                Image, 'camera/depth_raw', sensor_qos)
 
         self._width = None
         self._height = None
         self._latest_frame = None
+        self._latest_depth = None
         self._frame_lock = threading.Lock()
+        # Camera intrinsics. None until a source supplies them, which today
+        # only source:=realsense does -- the other two paths have no way to
+        # know them and calibrate_camera.py has never been run. CameraInfo
+        # goes out with empty k/p/d in that case, exactly as it always has.
+        self._k = None
+        self._p = None
+        self._d = None
         # Transit measurement: the smallest (arrival - capture) seen acts as
         # the unknown clock offset, and everything is reported relative to it.
         self._transit_floor = None
@@ -152,12 +193,21 @@ class CameraNode(Node):
                 f'({self.get_parameter("device_width").value}x'
                 f'{self.get_parameter("device_height").value}). No network '
                 'leg on this path.')
+        elif self._source == 'realsense':
+            target = self._realsense_reader
+            self.get_logger().info(
+                f'Opening RealSense via librealsense at '
+                f'{self.get_parameter("rs_width").value}x'
+                f'{self.get_parameter("rs_height").value}@'
+                f'{self.get_parameter("rs_fps").value} '
+                f'(depth {"on" if self.get_parameter("rs_depth").value else "off"})')
         elif self._source == 'mjpeg':
             target = self._stream_reader
             self.get_logger().info(f'Opening camera stream: {self._url}')
         else:
             raise ValueError(
-                f"source must be 'mjpeg' or 'device', got {self._source!r}")
+                f"source must be 'mjpeg', 'device' or 'realsense', got "
+                f'{self._source!r}')
         self._reader_thread = threading.Thread(target=target, daemon=True)
         self._reader_thread.start()
 
@@ -346,6 +396,164 @@ class CameraNode(Node):
         if cap is not None:
             cap.release()
 
+    def _realsense_reader(self):
+        """Runs in a background thread: reads an Intel RealSense.
+
+        Same contract as the other two readers -- fill _latest_frame, let the
+        timer publish it -- so nothing downstream knows or cares which camera
+        is attached. What this path adds over source:=device is the factory
+        intrinsics, which arrive with the stream and cost nothing: CameraInfo
+        has been going out with width and height and empty k/p/d, which is why
+        /hand/point_cam has never had anything to say.
+
+        D405 NOTES, since that is the one this project is buying:
+
+        - Its colour comes from the same stereo pair as depth, so there is no
+          separate RGB module and the two images are natively registered.
+          rs_align_depth_to_color is therefore off by default; on a D435/D455
+          it would be required.
+        - Depth is only valid from about 7cm to 50cm. That is the point of the
+          camera for pressing buttons, and a real limitation for following a
+          hand across a room -- but HAND DETECTION IS UNAFFECTED, because
+          MediaPipe works on the colour image and never looks at depth. A hand
+          at 2m tracks exactly as well; only the range reading goes away.
+        - It needs USB 3. On USB 2 librealsense will either refuse the profile
+          or quietly hand back a slower one.
+        """
+        try:
+            import pyrealsense2 as rs
+        except ImportError:
+            self.get_logger().error(
+                'source:=realsense needs pyrealsense2, which is not '
+                'installed:\n'
+                '    pip install pyrealsense2\n'
+                'On Jetson/ARM64 there are no official wheels -- build '
+                'librealsense from source with -DBUILD_PYTHON_BINDINGS=ON, '
+                'the same integration risk as MediaPipe on that platform. '
+                'This node will publish nothing until then.')
+            return
+
+        width = int(self.get_parameter('rs_width').value)
+        height = int(self.get_parameter('rs_height').value)
+        fps = int(self.get_parameter('rs_fps').value)
+        want_depth = bool(self.get_parameter('rs_depth').value)
+        serial = str(self.get_parameter('rs_serial').value)
+
+        while not self._stop_event.is_set():
+            pipeline = None
+            try:
+                pipeline = rs.pipeline()
+                config = rs.config()
+                if serial:
+                    config.enable_device(serial)
+                config.enable_stream(rs.stream.color, width, height,
+                                     rs.format.bgr8, fps)
+                if want_depth:
+                    config.enable_stream(rs.stream.depth, width, height,
+                                         rs.format.z16, fps)
+                profile = pipeline.start(config)
+
+                dev = profile.get_device()
+                name = dev.get_info(rs.camera_info.name)
+                usb = 'unknown'
+                try:
+                    usb = dev.get_info(rs.camera_info.usb_type_descriptor)
+                except Exception:
+                    pass
+                self.get_logger().info(
+                    f'RealSense open: {name}, USB {usb}, '
+                    f'{width}x{height}@{fps}')
+                if usb.startswith('2'):
+                    self.get_logger().warn(
+                        f'This camera is on USB {usb}. A RealSense needs USB '
+                        f'3 for full rate -- expect a silently reduced frame '
+                        f'rate, which caps the whole servo loop.')
+
+                # Factory intrinsics. Nothing else in this project has ever
+                # had them, so this is what unblocks depth downstream.
+                intr = (profile.get_stream(rs.stream.color)
+                        .as_video_stream_profile().get_intrinsics())
+                self._set_intrinsics(intr.fx, intr.fy, intr.ppx, intr.ppy,
+                                     list(intr.coeffs))
+                self.get_logger().info(
+                    f'intrinsics: fx={intr.fx:.1f} fy={intr.fy:.1f} '
+                    f'cx={intr.ppx:.1f} cy={intr.ppy:.1f} -- CameraInfo now '
+                    f'carries a real projection matrix.')
+                self._warn_field_of_view(intr.fx, intr.fy, width, height)
+
+                align = None
+                if want_depth and bool(self.get_parameter(
+                        'rs_align_depth_to_color').value):
+                    align = rs.align(rs.stream.color)
+
+                grabbed = 0
+                rate_since = time.monotonic()
+                while not self._stop_event.is_set():
+                    frames = pipeline.wait_for_frames(5000)
+                    if align is not None:
+                        frames = align.process(frames)
+                    color = frames.get_color_frame()
+                    if not color:
+                        continue
+                    frame = np.asanyarray(color.get_data())
+                    with self._frame_lock:
+                        self._latest_frame = frame
+                    if want_depth:
+                        depth = frames.get_depth_frame()
+                        if depth:
+                            with self._frame_lock:
+                                self._latest_depth = np.asanyarray(
+                                    depth.get_data())
+
+                    grabbed += 1
+                    elapsed = time.monotonic() - rate_since
+                    if elapsed >= 10.0:
+                        self.get_logger().info(
+                            f'realsense: {grabbed / elapsed:.1f} fps captured '
+                            f'(asked for {fps})')
+                        grabbed = 0
+                        rate_since = time.monotonic()
+            except Exception as e:
+                self.get_logger().error(
+                    f'RealSense error: {e.__class__.__name__}: {e}; '
+                    f'retrying in 2s')
+                self._stop_event.wait(2.0)
+            finally:
+                if pipeline is not None:
+                    try:
+                        pipeline.stop()
+                    except Exception:
+                        pass
+
+    def _set_intrinsics(self, fx, fy, cx, cy, coeffs):
+        self._k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        self._p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+        self._d = [float(c) for c in coeffs]
+
+    def _warn_field_of_view(self, fx, fy, width, height):
+        """The servo's tuning is tied to the lens, not just the pixel count.
+
+        Its error is normalised per axis, so "1.0" means the frame edge on any
+        camera -- but how many DEGREES the edge is away depends entirely on the
+        field of view. The published gains were fitted against a webcam whose
+        edges are ~25 and ~19 degrees out. A D405 is roughly 87x58 degrees,
+        i.e. near double, so the same normalised error means about twice the
+        rotation and the loop will over-command by that factor.
+        """
+        import math
+        h_deg = math.degrees(math.atan2(width / 2.0, fx))
+        v_deg = math.degrees(math.atan2(height / 2.0, fy))
+        self.get_logger().info(
+            f'field of view: frame edge is {h_deg:.0f} deg horizontally, '
+            f'{v_deg:.0f} deg vertically')
+        if h_deg > 32.0:
+            self.get_logger().warn(
+                f'This lens is much wider than the one the servo was tuned '
+                f'against (~25 deg horizontal, ~19 vertical). A normalised '
+                f'error means ~{h_deg / 25.0:.1f}x as much rotation, so the '
+                f'loop will over-command and may oscillate. Re-measure with '
+                f'skip_probe:=false before trusting the gains.')
+
     def _stream_reader(self):
         """Runs in a background thread: continuously reads the MJPEG
         multipart HTTP stream and decodes frames as they arrive."""
@@ -408,7 +616,25 @@ class CameraNode(Node):
         info_msg.header.frame_id = self._frame_id
         info_msg.width = self._width
         info_msg.height = self._height
+        if self._k is not None:
+            info_msg.distortion_model = 'plumb_bob'
+            info_msg.k = self._k
+            info_msg.p = self._p
+            # plumb_bob wants exactly 5 coefficients; librealsense hands back
+            # 5 for Brown-Conrady and zeros for the rest.
+            info_msg.d = (self._d + [0.0] * 5)[:5]
         self._info_pub.publish(info_msg)
+
+        if self._depth_pub is not None:
+            with self._frame_lock:
+                depth = (None if self._latest_depth is None
+                         else self._latest_depth.copy())
+            if depth is not None:
+                depth_msg = self._bridge.cv2_to_imgmsg(
+                    depth, encoding='16UC1')
+                depth_msg.header.stamp = stamp
+                depth_msg.header.frame_id = self._frame_id
+                self._depth_pub.publish(depth_msg)
 
     def destroy_node(self):
         self._stop_event.set()

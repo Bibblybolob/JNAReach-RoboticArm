@@ -245,7 +245,8 @@ def preflight(args=()):
     check below is asking after a machine this run will never speak to.
     """
     serial_arm = _arg_is(args, 'connection', 'serial')
-    local_cam = _arg_is(args, 'source', 'device')
+    local_cam = (_arg_is(args, 'source', 'device')
+                 or _arg_is(args, 'source', 'realsense'))
 
     if serial_arm and local_cam:
         say('connection:=serial and source:=device -- the Pi is not in this '
@@ -276,7 +277,7 @@ def preflight(args=()):
     # start because the webcam was physically moved off the Pi -- is the
     # preflight getting in the way of the thing it exists to protect.
     if local_cam:
-        say('source:=device -- skipping the Pi camera check; camera_node will '
+        say('local camera source -- skipping the Pi camera check; camera_node will '
             'open a local device.')
     else:
         wait_for_pi_camera()

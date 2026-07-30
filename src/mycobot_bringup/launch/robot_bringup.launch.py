@@ -90,6 +90,13 @@ def generate_launch_description():
                     'false. 0 keeps the driver default')
     device_fps_arg = DeclareLaunchArgument('device_fps', default_value='30.0')
     device_width_arg = DeclareLaunchArgument('device_width', default_value='640')
+    rs_width_arg = DeclareLaunchArgument('rs_width', default_value='640')
+    rs_height_arg = DeclareLaunchArgument('rs_height', default_value='480')
+    rs_fps_arg = DeclareLaunchArgument('rs_fps', default_value='30')
+    rs_depth_arg = DeclareLaunchArgument('rs_depth', default_value='false')
+    rs_serial_arg = DeclareLaunchArgument('rs_serial', default_value='')
+    rs_align_arg = DeclareLaunchArgument(
+        'rs_align_depth_to_color', default_value='false')
     device_height_arg = DeclareLaunchArgument('device_height', default_value='480')
     connection_arg = DeclareLaunchArgument(
         'connection', default_value='tcp', choices=['tcp', 'serial'],
@@ -200,6 +207,12 @@ def generate_launch_description():
             'device_exposure': _f('device_exposure'),
             'device_fps': _f('device_fps'),
             'device_width': _i('device_width'),
+            'rs_width': _i('rs_width'),
+            'rs_height': _i('rs_height'),
+            'rs_fps': _i('rs_fps'),
+            'rs_depth': _b('rs_depth'),
+            'rs_serial': _s('rs_serial'),
+            'rs_align_depth_to_color': _b('rs_align_depth_to_color'),
             'device_height': _i('device_height'),
         }],
         output='screen',
@@ -222,6 +235,12 @@ def generate_launch_description():
         device_exposure_arg,
         device_fps_arg,
         device_width_arg,
+        rs_width_arg,
+        rs_height_arg,
+        rs_fps_arg,
+        rs_depth_arg,
+        rs_serial_arg,
+        rs_align_arg,
         device_height_arg,
         robot_state_publisher,
         hardware_node,

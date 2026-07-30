@@ -274,8 +274,22 @@ def generate_launch_description():
         'serial_port', default_value='/dev/ttyUSB0')
     serial_baud_arg = DeclareLaunchArgument(
         'serial_baud', default_value='1000000')
+    rs_width_arg = DeclareLaunchArgument('rs_width', default_value='640')
+    rs_height_arg = DeclareLaunchArgument('rs_height', default_value='480')
+    rs_fps_arg = DeclareLaunchArgument('rs_fps', default_value='30')
+    rs_depth_arg = DeclareLaunchArgument(
+        'rs_depth', default_value='false',
+        description='Publish /camera/depth_raw. Off by default: hand '
+                    'detection is 2D and depth costs USB bandwidth.')
+    rs_serial_arg = DeclareLaunchArgument('rs_serial', default_value='')
+    rs_align_arg = DeclareLaunchArgument(
+        'rs_align_depth_to_color', default_value='false',
+        description='Needed on a D435/D455, a no-op on a D405 whose colour '
+                    'and depth come from the same imagers.')
+
     source_arg = DeclareLaunchArgument(
-        'source', default_value='mjpeg', choices=['mjpeg', 'device'],
+        'source', default_value='mjpeg',
+        choices=['mjpeg', 'device', 'realsense'],
         description='Where frames come from. mjpeg reads the Pi over HTTP; '
                     'device opens a camera plugged into THIS machine, which '
                     'removes the encode, the network hop and the decode '
@@ -412,6 +426,13 @@ def generate_launch_description():
             'device_fps': LaunchConfiguration('device_fps'),
             'device_width': LaunchConfiguration('device_width'),
             'device_height': LaunchConfiguration('device_height'),
+            'rs_width': LaunchConfiguration('rs_width'),
+            'rs_height': LaunchConfiguration('rs_height'),
+            'rs_fps': LaunchConfiguration('rs_fps'),
+            'rs_depth': LaunchConfiguration('rs_depth'),
+            'rs_serial': LaunchConfiguration('rs_serial'),
+            'rs_align_depth_to_color': LaunchConfiguration(
+                'rs_align_depth_to_color'),
         }.items(),
     )
 
@@ -518,6 +539,12 @@ def generate_launch_description():
         device_exposure_arg,
         device_fps_arg,
         device_width_arg,
+        rs_width_arg,
+        rs_height_arg,
+        rs_fps_arg,
+        rs_depth_arg,
+        rs_serial_arg,
+        rs_align_arg,
         device_height_arg,
         track_arg,
         target_color_arg,

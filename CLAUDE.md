@@ -388,6 +388,18 @@ Four things to get right:
     port, which means crossed. The arm's connector is documented the first way
     but a silkscreen elsewhere on the board may be the second.
 
+    **A divider is a speed limit as well as a level shift**, and 1000000 baud
+    is not forgiving. Source impedance drives the wire capacitance, and a bit
+    is 1µs: 10k/10k is 5kΩ and takes ~600ns to settle — 60% of a bit, so the
+    line never arrives before it is sampled. 1k/2k is 667Ω and 8%. Reach for
+    values in the low kΩ; 10k resistors are the ones most likely to be in a
+    parts drawer and they do not work here. 10k/10k also outputs 2.5V, which is
+    barely over the ESP32's 2.475V threshold before any loading at all.
+
+    And the divider belongs **only on the line the adapter drives**. On the
+    receive line it attenuates the arm's reply, which is the signal you are
+    trying to read.
+
     Settle it by which pin is **driven**, which is not a labelling question.
     Adapter off, arm powered, then hang a 10k from the pin to ground: an output
     idling high barely moves, a floating input collapses toward 0. The arm's TX

@@ -246,11 +246,33 @@ The end state, and the software for it is already written:
 `connection:=serial` was built for the USB attempt that failed. It is exactly
 what this needs — only the port name changes.
 
-Electrically it is undemanding. Pi GPIO, Jetson GPIO and the ESP32 are all
-3.3V logic, so no level shifting: TX to RX, RX to TX, common ground. **Use
-1000000 baud, not the 115200 in the JetsonNano row** — that column reflects
-that variant's own firmware, and this arm's Atom runs at 1000000 (see
-`pi/server.py`).
+**Which pins.** `pi/server.py` opens `/dev/ttyAMA0`, which is the Pi's PL011
+UART. On a Pi 4 that lands on **GPIO14 (TXD) = physical pin 8** and **GPIO15
+(RXD) = physical pin 10**, plus any ground (6, 9, 14, 20, 25, 30, 34, 39).
+
+It has to be the PL011 rather than the mini-UART: `/dev/ttyS0` derives its
+clock from the core clock and is not dependable at 1000000 baud, which is the
+rate this arm runs at. That also means the Pi is configured with BT moved off
+the PL011 (`dtoverlay=disable-bt` or `miniuart-bt`). Confirm on the Pi with:
+
+```bash
+ls -l /dev/serial*                 # serial0 -> ttyAMA0 means it is on the header
+grep -E 'enable_uart|dtoverlay' /boot/firmware/config.txt
+sudo raspi-gpio get 14,15          # expect ALT0 = TXD0/RXD0
+```
+
+Convenient for the port: **the Orin Nano's 40-pin header carries its UART on
+pins 8 and 10 too**, so a board-for-board substitution is pin-for-pin.
+
+And do NOT cross TX/RX if you are substituting the Jetson for the Pi — the
+arm's harness already crosses them to suit the Pi's header, so the Jetson's
+pin 8 goes where the Pi's pin 8 went. Crossing applies only when adding a
+second host alongside. Check continuity before powering anything.
+
+Electrically it is undemanding otherwise: Pi GPIO, Jetson GPIO and the ESP32
+are all 3.3V logic, so no level shifting. **Use 1000000 baud, not the 115200 in
+the JetsonNano row** — that column reflects that variant's own firmware, and
+this arm's Atom runs at 1000000 (see `pi/server.py`).
 
 Four things to get right:
 

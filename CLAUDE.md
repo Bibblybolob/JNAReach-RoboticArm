@@ -250,6 +250,29 @@ what this needs — only the port name changes.
 UART. On a Pi 4 that lands on **GPIO14 (TXD) = physical pin 8** and **GPIO15
 (RXD) = physical pin 10**, plus any ground (6, 9, 14, 20, 25, 30, 34, 39).
 
+Elephant documents the arm's 40-pin connector with the stock Pi pinout, which
+confirms this rather than leaving it inferred from `/dev/ttyAMA0`. The labels
+are named from the **Pi's** point of view — `GPIO14 (UART TX)` is the *Pi*
+transmitting — so a host standing in for the Pi is not crossed: its output goes
+to pin 8 exactly where the Pi's output went.
+
+**The three wires you need are adjacent.** Counting down the even row, ground,
+TX and RX are the 3rd, 4th and 5th positions:
+
+```
+ 1  3v3 Power     |  2  5V Power        <- 5V, and only two along from pin 6
+ 3  GPIO2  SDA    |  4  5V Power        <- 5V
+ 5  GPIO3  SCL    |  6  Ground          <- ground
+ 7  GPIO4         |  8  GPIO14 UART TX  <- host's TX out
+ 9  Ground        | 10  GPIO15 UART RX  <- host's RX in
+```
+
+That closeness is also the trap: **a wire reading ~5V is pin 2 or 4, not pin
+10.** Measured exactly that way on the bench — D0 correctly on pin 8 (3.6V,
+clamped) while D1 sat on a 5V rail, so the adapter transmitted fine, the arm
+answered on pin 10, and nothing was listening. It presents as total silence
+from `poke`, i.e. identical to a dead bus.
+
 It has to be the PL011 rather than the mini-UART: `/dev/ttyS0` derives its
 clock from the core clock and is not dependable at 1000000 baud, which is the
 rate this arm runs at. That also means the Pi is configured with BT moved off

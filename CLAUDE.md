@@ -291,6 +291,35 @@ Four things to get right:
   without relocating anything. If the protocol works over a raw UART from an
   external computer, the Jetson version is the same thing on different pins.
 
+  ```bash
+  ./scripts/probe_uart_bridge.py loopback   # does the adapter do 1000000 baud?
+  ./scripts/probe_uart_bridge.py listen     # is this wire really the arm's TX?
+  ```
+
+  Answer both before `probe_usb_arm.py`, which commands nothing but does
+  assume the link works. **An Arduino Uno R3 serves as the adapter**, with
+  three traps that have nothing to do with the arm:
+
+  - **A bridging sketch is not available.** The Uno has one hardware UART and
+    it is already wired to the USB chip; SoftwareSerial tops out around
+    115200, against the 1000000 this arm needs. Tie **RESET to GND** instead —
+    that parks the ATmega328P and leaves the ATmega16U2 wired straight
+    through, i.e. a plain USB-to-TTL adapter. It divides 16MHz to exactly
+    1000000 in double-speed mode, better than some dedicated adapters.
+  - **D0/D1 invert when you do that**, and this is the evening-waster. The
+    labels describe the 328P, which is now switched off. `D0` ("RX") becomes
+    an **output** — the USB chip's TX — and `D1` ("TX") an **input**. So wire
+    label-to-same-label, *not* crossed, which is the opposite of the reflex.
+  - **The Uno is 5V and the ESP32 is not 5V tolerant.** Listening on D1 is
+    free; driving D0 into the arm's RX at 5V can destroy it. 1k series + 2k to
+    ground gives 3.3V. `listen` needs no divider and answers the pin-mapping
+    question on its own, so do that one first.
+
+  Stopping `mycobot_server` is **not** enough before transmitting: GPIO14 stays
+  in ALT0 actively driving pin 8, so two outputs fight. `sudo raspi-gpio set 14
+  ip` makes it high-impedance (reverts on reboot). For `listen` you want
+  `mycobot_server` *running* — its traffic is what you are trying to see.
+
 **What it buys is mostly reliability, not speed.** `send_angles` is not in
 `server.py`'s `has_return` table so commanding is already cheap, and the
 dominant term in the round trip is the servos physically moving. What goes away

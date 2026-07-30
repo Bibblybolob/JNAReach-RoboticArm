@@ -16,10 +16,18 @@ it is worth testing at all. What it pins:
     gains were fitted against a much narrower one
 """
 import math
+import os
 import sys
 import types
 
 import numpy as np
+
+# The documented way to run this is `python3 src/mycobot_camera/test/...` from
+# the repo root, which does not put the package on the path. Add it here so
+# the command in CLAUDE.md works as written rather than only under a
+# PYTHONPATH the reader has to know about.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def make_fake_rs(width=640, height=480, fx=380.0, fy=380.0, usb='3.2',
@@ -140,7 +148,14 @@ class Recorder:
 def build_node(params, logger):
     """A CameraNode with rclpy's machinery replaced, so no ROS graph is
     needed. Only the pieces _realsense_reader touches are provided."""
-    from mycobot_camera.camera_node import CameraNode
+    try:
+        from mycobot_camera.camera_node import CameraNode
+    except ImportError as e:
+        # camera_node imports rclpy and cv_bridge at module level, so this
+        # needs ROS on the path even though no ROS graph is started.
+        sys.exit(f'Cannot import camera_node: {e}\n\n'
+                 'Source ROS first:\n'
+                 '    source /opt/ros/humble/setup.bash')
     import threading
 
     node = CameraNode.__new__(CameraNode)

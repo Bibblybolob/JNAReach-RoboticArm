@@ -292,9 +292,26 @@ Four things to get right:
   external computer, the Jetson version is the same thing on different pins.
 
   ```bash
-  ./scripts/probe_uart_bridge.py loopback   # does the adapter do 1000000 baud?
+  ./scripts/probe_uart_bridge.py loopback   # does the link carry bytes intact?
   ./scripts/probe_uart_bridge.py listen     # is this wire really the arm's TX?
   ```
+
+  **A loopback cannot detect a wrong baud rate, ever.** Both directions are the
+  same chip driven from the same divisor register, so a wrong rate is wrong
+  identically at each end and the bytes still return byte-perfect. Only
+  `listen`, against traffic some *other* device generated, tests the rate. What
+  loopback does catch is signal integrity — and on an Uno it is pessimistic
+  about the real link, because the loopback path crosses the on-board 1k series
+  resistor **twice** (16U2 TX → 1k → D0 → jumper → D1 → 1k → 16U2 RX). ~2k into
+  dupont capacitance is about a third of a 1µs bit; driving the arm puts only
+  one of those resistors in the path. So a few tenths of a percent of corrupt
+  bytes in loopback at 1000000 is expected on an Uno and does not condemn the
+  adapter. The script re-measures at lower rates and says whether the error rate
+  scales (edge-rate limit) or not (bad connection).
+
+  Either way, **do not command motion until the link is clean**: the myCobot
+  protocol carries no checksum, so a flipped bit in a `SEND_ANGLES` payload is
+  simply a joint angle the arm accepts and moves to.
 
   Answer both before `probe_usb_arm.py`, which commands nothing but does
   assume the link works. **An Arduino Uno R3 serves as the adapter**, with

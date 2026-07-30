@@ -285,7 +285,24 @@ sudo raspi-gpio get 14,15          # expect ALT0 = TXD0/RXD0
 ```
 
 Convenient for the port: **the Orin Nano's 40-pin header carries its UART on
-pins 8 and 10 too**, so a board-for-board substitution is pin-for-pin.
+pins 8 and 10 too** (UART1, `/dev/ttyTHS1`), so a board-for-board substitution
+is pin-for-pin. Confirmed against NVIDIA's docs, not assumed. 3.3V both sides,
+1/3v3, 2 and 4/5V, 6/GND all match as well.
+
+What does **not** carry over is the naming. `GPIO14` is a Broadcom number and
+means nothing on Tegra — the Linux GPIO names and numbers are unrelated — and
+the device is `ttyTHS1`, not `ttyAMA0`. Only the power, ground and UART
+positions are guaranteed; SPI/I2C/PWM assignments merely resemble the Pi's.
+
+Two live risks worth checking before committing hardware:
+
+- **A reported JetPack 7 / L4T R39.2 bug leaves the ttyTHS1 TX pad not
+  driving** on the Orin Nano Super devkit — the exact board planned here. It
+  would present as transmitting into silence with everything apparently
+  correct, i.e. indistinguishable from the wiring faults above. Verify the UART
+  loops back on the Jetson alone before wiring it to the arm.
+- Corrupted data on ttyTHS1 has also been reported on JetPack 6.2.2 (Orin NX,
+  Waveshare carrier).
 
 And do NOT cross TX/RX if you are substituting the Jetson for the Pi — the
 arm's harness already crosses them to suit the Pi's header, so the Jetson's

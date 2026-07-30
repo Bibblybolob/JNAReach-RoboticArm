@@ -58,9 +58,24 @@ divider at 3.33V. Adding your own series resistor on top makes it 1k+1k/2k =
 2.5V, and the ESP32's input threshold is 0.75 x VDD = 2.475V -- a 25mV margin,
 i.e. a line that reads as neither high nor low depending on temperature.
 
+Only D0 gets a resistor. D1 is an input and the arm only ever puts 3.3V on it,
+which cannot damage anything. One wire, one resistor -- and note it is the
+wire the Uno DRIVES, which is the pin silkscreened "RX".
+
 Clones vary, so measure rather than assume: UART idles high, so D0 with the
 resistor fitted and nothing transmitting should sit at ~3.3V. If it reads 5V
 the on-board resistor is absent and you need a 1k in series as well.
+
+No multimeter needed, though -- fit the resistor and re-run `loopback` with
+the jumper on. That is a STRICTER test than the arm, which is what makes it
+worth doing: the 16U2 reading it back is a 5V AVR wanting 0.6 x VCC = 3.00V,
+while the ESP32 wants 0.75 x VDD = 2.48V. A 1k/2k divider delivers 3.33V, so
+it clears the AVR by 0.33V and the ESP32 by 0.86V. If the Uno can still read
+its own divided output, the arm certainly can.
+
+Safe to run even with the arm connected: the test pattern contains 0xFE
+exactly four times per 1024 bytes and always followed by 0xFF, so it can never
+form the FE FE frame header and the ESP32 discards all of it.
 
 This is why `listen` exists as a separate mode: it uses only D1, an input, so
 it answers the pin-mapping question with no divider and no risk. Do it first.

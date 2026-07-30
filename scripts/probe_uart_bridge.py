@@ -327,6 +327,38 @@ def cmd_listen(args):
     return 1
 
 
+REPLY_LEN = 17     # a GET_ANGLES reply: FE FE 0E 20 + 12 payload + FA
+
+
+def _poke_once(port, baud, request, wait=0.25, read=512):
+    ser = open_port(port, baud)
+    try:
+        ser.reset_input_buffer()
+        ser.write(request)
+        ser.flush()
+        time.sleep(wait)
+        return ser.read(read)
+    finally:
+        ser.close()
+
+
+def _echo_test(port, baud, request, copies):
+    """Tell a real reply from your own transmission coming back.
+
+    The trap this exists for: bytes arriving looks like success, so it gets
+    read as "the wiring is fine, now fix the baud". But a floating receive line
+    running alongside a transmitting one picks up enough crosstalk to frame as
+    bytes, and two wires bridged echo outright. Both produce traffic that
+    arrives only while you are sending, which is exactly when you are looking.
+
+    Lengths separate them, because the two sides disagree about who decides it.
+    GET_ANGLES is 5 bytes out and 17 back, so N copies means an echo returns 5N
+    and the arm 17N. Sending a read command N times is safe -- it commands
+    nothing however many times it lands.
+    """
+    return len(_poke_once(port, baud, request * copies, wait=0.4, read=1024))
+
+
 def cmd_poke(args):
     """Send a real request and dump whatever comes back, raw, at each baud.
 
@@ -346,15 +378,7 @@ def cmd_poke(args):
                            if b != args.baud]
     seen = []
     for baud in bauds:
-        ser = open_port(args.port, baud)
-        try:
-            ser.reset_input_buffer()
-            ser.write(request)
-            ser.flush()
-            time.sleep(0.25)
-            got = ser.read(256)
-        finally:
-            ser.close()
+        got = _poke_once(args.port, baud, request)
         # _drain_frames prints as it decodes; hold that until after the
         # summary line so each baud reads top-down.
         detail = io.StringIO()
@@ -379,11 +403,41 @@ def cmd_poke(args):
         print('right -- go to serial_move_test.py.')
         return 0
     if noisy:
-        print(f'Bytes came back at {noisy[0]} but nothing framed as')
-        print('FE FE ... FA. Something IS transmitting, so the wiring is')
-        print('sound and this is a rate or a signal-quality problem rather')
-        print('than a dead line. That is real progress -- it rules out the')
-        print('whole orientation question.')
+        baud, copies = noisy[0], 4
+        sent = len(request) * copies
+        print(f'Bytes came back at {baud}, but nothing framed as FE FE ... FA.')
+        print('Before calling that a baud problem, rule out its more common')
+        print(f'cause: your own transmission returning. Sending {copies} '
+              f'copies makes\nthe two cases disagree about length.\n')
+        got = _echo_test(args.port, baud, request, copies)
+        print(f'  sent {sent} bytes, {got} came back')
+        print(f'  an echo returns {sent}; the arm returns '
+              f'{REPLY_LEN * copies}\n')
+
+        if abs(got - sent) <= 2:
+            print('That is an echo, not a reply. Nothing on the arm is')
+            print('answering you -- you are hearing yourself.\n')
+            print('  - Are both wires in the same hole, or touching? Check')
+            print('    continuity between them with the adapter unplugged.')
+            print('  - If not shorted, the receive wire is floating and')
+            print('    picking up crosstalk from the transmit wire beside it.')
+            print('    A floating line sits high and glitches low, which is')
+            print('    why the bytes come back as mostly 0xFF. Separate the')
+            print('    two wires and it goes away.')
+            print('  - Either way the receive wire is not on a driven pin, so')
+            print('    it is still on the wrong one.')
+            return 1
+
+        if abs(got - REPLY_LEN * copies) <= 2:
+            print('Reply-length traffic, so the arm IS answering and the')
+            print('bytes are being mangled in flight. Now it is worth')
+            print('suspecting rate and signal quality: check the baud, then')
+            print('shorten the wires and lose any divider above ~2k.')
+            return 1
+
+        print('Neither length. Something is transmitting that is neither you')
+        print('nor a clean reply -- suspect a second device on the bus, or a')
+        print('rate so far off that framing is arbitrary.')
         return 1
 
     print('Not one byte at any rate, so nothing is transmitting toward you.')

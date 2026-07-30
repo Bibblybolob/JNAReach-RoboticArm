@@ -388,7 +388,12 @@ def cmd_poke(args):
 
     print('Not one byte at any rate, so nothing is transmitting toward you.')
     print('Rate is not the issue -- a wrong baud produces garbage, not')
-    print('silence. In order of cost to check:\n')
+    print('silence.\n')
+    print('Zero is also more specific than it looks. A receive line held LOW')
+    print('is a continuous framing error, which the tty layer delivers as a')
+    print('flood of 0x00 -- ~100KB/s of it at 1000000 baud. Getting none of')
+    print('that means your RX line is sitting high or floating, so it is not')
+    print('shorted to ground and not on a stuck-low pin. What remains:\n')
     print('  1. SWAP THE TWO SIGNAL WIRES. Free, and it is the single most')
     print('     likely cause. Remember the Uno\'s labels invert when the 328P')
     print('     is held in reset, so "wire TX to RX" is exactly the mistake')

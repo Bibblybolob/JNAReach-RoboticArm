@@ -84,16 +84,7 @@ every later step assumes 22.04.
 sudo apt update && sudo apt full-upgrade -y
 ```
 
-## 2. Free the UART
-
-The 40-pin header's UART is claimed by a serial console on a fresh JetPack, and
-it will fight you for the port. This is the same class of problem as the
-Bluetooth bridge that used to hold the Pi's UART: the device exists, opens
-cleanly, and does not work.
-
-```bash
-sudo systemctl disable --now nvgetty
-```
+## 2. Claim the UART
 
 ```bash
 sudo usermod -aG dialout $USER
@@ -102,11 +93,24 @@ sudo usermod -aG dialout $USER
 **Log out and back in** — group membership only applies to new sessions. Then:
 
 ```bash
-ls -l /dev/ttyTHS*
+ls -l /dev/ttyTHS* && sudo fuser -v /dev/ttyTHS1
 ```
 
-`/dev/ttyTHS1` should be listed and your user should be able to open it. If
-`ls` shows it but a script says permission denied, the logout did not happen.
+`/dev/ttyTHS1` should be listed, `fuser` should report nothing holding it, and
+your user should be able to open it. If `ls` shows it but a script says
+permission denied, the logout did not happen.
+
+> **On an Orin Nano you almost certainly do not need `nvgetty`, and disabling
+> it may cost you something you need.** Most Jetson UART guides say to run
+> `systemctl disable nvgetty` — that advice is for the *original* Jetson Nano,
+> where the 40-pin header UART and the serial debug console were the same
+> port. On Orin they are different ports: the console is `/dev/ttyTCU0` and
+> `/dev/ttyTHS1` is free by default. `ttyTHS1` cannot be a kernel console on
+> Orin at all — `serial-tegra` declares no console.
+>
+> So `ttyTHS1` needs nothing done to it, and disabling the `ttyTCU0` console
+> throws away your headless recovery path. Only act if `fuser` shows something
+> actually holding the port.
 
 ## 3. Wire the arm
 
@@ -216,9 +220,45 @@ config step. This project has lost more time to flaky WiFi than to any bug in
 it, and the failure is always the same — a link that works until the moment
 you need it.
 
-If you must use WiFi, JetPack uses NetworkManager, so there is no
-Raspberry-Pi-style file you can drop on the boot partition. Configure it on
-the device (monitor and keyboard once, or over Ethernet first):
+### No Ethernet port to hand
+
+You still need a shell on the board once, to set WiFi up. In order of how
+little extra hardware they need:
+
+**USB device mode — nothing to buy.** Connect the Jetson's USB-C to your
+computer and it presents itself as a USB network adapter. It answers on a
+fixed address, so nothing has to be discovered:
+
+```bash
+ssh <user>@192.168.55.1
+```
+
+This is the standard headless Jetson path and it needs no display, no network
+and no adapter. It does need the first-boot setup to have been completed
+already, because until a user account exists there is nothing to log into.
+
+**The serial console, if setup has never been run.** A freshly flashed JetPack
+runs an oem-config wizard — user account, locale, licence — and until that is
+done there is no SSH and no USB networking. The console is on `/dev/ttyTCU0`
+via the dev kit's debug header, 115200 8N1, and any USB-TTL adapter reaches
+it. **The Arduino you used for the arm's UART works for this**: RESET to GND,
+D0/D1 as before.
+
+**A monitor and USB keyboard** does the same job with no fiddling, if you have
+one to hand.
+
+**A USB-Ethernet adapter, about $12.** Worth considering beyond first boot —
+it gives you the wired link this project keeps wishing it had, and it is the
+one option that fixes the underlying problem rather than working around it.
+
+**Phone USB tethering** gets the board online in seconds once you have a
+shell: plug the phone in, enable USB tethering, NetworkManager picks it up.
+Handy for the apt and pip steps even if WiFi is the long-term answer.
+
+### Setting up WiFi
+
+JetPack uses NetworkManager, so there is no Raspberry-Pi-style file you can
+drop on the boot partition. Configure it from whichever shell you got above:
 
 ```bash
 nmcli device wifi list

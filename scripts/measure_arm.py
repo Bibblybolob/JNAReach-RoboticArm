@@ -24,6 +24,23 @@ It reports:
 SAFETY: this MOVES THE ARM. joint1 sweeps +/-40 degrees from wherever it
 currently sits, and the arm must be clear to do that. Nothing else is touched.
 Keep a hand on the e-stop. Ctrl-C stops the script but NOT the arm mid-move.
+
+    ./scripts/measure_arm.py --serial-port /dev/ttyTHS1     # Jetson on UART
+    ./scripts/measure_arm.py --ip 192.168.0.15              # Pi over TCP
+
+WHY speed_at_100_deg_s MATTERS MORE THAN IT LOOKS
+
+The driver sizes every streamed step from it:
+
+    speed = (needed_deg_s / speed_at_100_deg_s) * 100
+
+so if the real figure is LOWER than the 120 currently assumed, the driver asks
+for proportionally less speed than it means to and the arm falls behind its own
+commanded goal. That shows up as `Jog target pinned to the measured pose`, as a
+servo whose corrections never seem to land, and as tracking that feels sluggish
+while every other number in the pipeline looks healthy -- detection rate fine,
+latency fine, jogs being issued at full size. Guessing it high is the failure
+mode that hides itself.
 """
 
 import argparse
@@ -33,7 +50,7 @@ import sys
 import time
 
 try:
-    from pymycobot import MyCobot280Socket
+    from pymycobot import MyCobot280, MyCobot280Socket
 except ImportError:
     sys.exit('pymycobot not installed: pip install pymycobot')
 
@@ -113,14 +130,27 @@ def main():
         '--ip', default=os.environ.get('MYCOBOT_IP', '192.168.0.15'),
         help='Pi address; defaults to $MYCOBOT_IP, then 192.168.0.15')
     ap.add_argument('--port', type=int, default=9000)
+    # The serial path. Without this the script could only measure the arm
+    # over TCP through the Pi -- which is not the connection the numbers are
+    # wanted for once the Jetson drives the UART directly, and the round-trip
+    # figures differ by the whole network leg.
+    ap.add_argument('--serial-port', metavar='DEV',
+                    help='drive the arm over serial instead of TCP, e.g. '
+                         '/dev/ttyTHS1 on a Jetson. Skips the Pi entirely.')
+    ap.add_argument('--baud', type=int, default=1000000,
+                    help='serial baud (default 1000000, what the arm uses)')
     ap.add_argument('--sweep', type=float, default=40.0,
                     help='degrees to sweep joint1 (default 40)')
     ap.add_argument('--skip-motion', action='store_true',
                     help='only measure link timing, never move the arm')
     args = ap.parse_args()
 
-    print(f'Connecting to {args.ip}:{args.port} ...')
-    mc = MyCobot280Socket(args.ip, args.port)
+    if args.serial_port:
+        print(f'Connecting over serial: {args.serial_port} at {args.baud} ...')
+        mc = MyCobot280(args.serial_port, str(args.baud))
+    else:
+        print(f'Connecting to {args.ip}:{args.port} ...')
+        mc = MyCobot280Socket(args.ip, args.port)
     time.sleep(0.5)
 
     start = mc.get_angles()

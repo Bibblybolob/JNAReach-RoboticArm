@@ -228,6 +228,68 @@ how gearbox teeth strip. Power-cycle the arm to make it limp.
 
 ---
 
+## Getting a shell somewhere else
+
+Taking the board to a lab, or to a building with a real lift, and needing to
+reach it once you are there — with no Ethernet and no monitor. Four routes,
+and the first needs no network at all.
+
+**1. USB-C works anywhere.** The Jetson presents itself as a USB network
+adapter on a fixed address, so a laptop and the cable you already have is a
+full shell regardless of what WiFi exists:
+
+```bash
+ssh <user>@192.168.55.1
+```
+
+From there, join whatever is local:
+
+```bash
+sudo nmcli device wifi connect "THEIR_SSID" --ask
+```
+
+**Rely on this one.** Every WiFi route below can be defeated by a network you
+do not control — client isolation alone breaks laptop-to-board SSH on most
+guest networks, and a captive portal or a venue with no WiFi defeats the rest.
+The cable cannot be.
+
+**2. Add the network before you go.** NetworkManager stores a profile for a
+network it cannot currently see and joins the moment it is in range, so the
+destination can be configured while you still have a working shell. The same
+script that seeds a card works against the live filesystem:
+
+```bash
+sudo ./scripts/seed_jetson_wifi.sh / "THEIR_SSID"
+```
+
+```bash
+sudo nmcli connection reload
+```
+
+It prompts for the passphrase with echo off, so nothing lands in shell history.
+
+**3. A phone hotspot as a standing fallback.** Seeded the same way, it becomes
+a network you carry rather than one you have to be granted:
+
+```bash
+sudo ./scripts/seed_jetson_wifi.sh / "YOUR_PHONE_HOTSPOT"
+```
+
+Turn the hotspot on, the board joins it, your laptop joins it, you have a
+shell. This is the one that works in places you have no say over.
+
+**4. The Jetson as its own access point.** No infrastructure needed at all,
+from a shell you already have:
+
+```bash
+sudo nmcli device wifi hotspot ifname wlan0 ssid jetson password "<choose one>"
+```
+
+Join `jetson` from your laptop, then `ssh <user>@10.42.0.1`. No internet on the
+board in this mode, so it is for control rather than for `apt`.
+
+---
+
 ## If you rebuild the board
 
 Condensed, because it is a one-off. The long-form version with every trap is in

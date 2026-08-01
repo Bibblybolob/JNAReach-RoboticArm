@@ -510,7 +510,7 @@ class Panel(Node):
               f'{label}' + (f' -- {msg}' if msg else ''))
         return res
 
-    def wait_for_nodes(self, timeout=45.0):
+    def wait_for_nodes(self, timeout=45.0, args=()):
         """Wait for the stack to be genuinely usable, not merely present.
 
         A node registers its name during construction, so every node is 'up'
@@ -538,6 +538,19 @@ class Panel(Node):
 
         if not named:
             warn('Not all nodes appeared; check the log with "l".')
+        elif _arg_is(args, 'connection', 'serial'):
+            # The TCP advice below is about a Pi that is not in this run.
+            port = _arg_value(args, 'serial_port') or '/dev/ttyUSB0'
+            uart = any(k in port for k in ('THS', 'AMA', 'ttyS'))
+            tool = (f'probe_uart_bridge.py poke --port {port}' if uart
+                    else f'probe_usb_arm.py --port {port}')
+            warn('Nodes are up but no /joint_states arrived -- the driver has '
+                 f'not reached the arm on {port}.\n'
+                 '     The port opening is not the same as the arm answering. '
+                 'Check it is powered,\n'
+                 '     that TX, RX and GROUND are all seated, and that nothing '
+                 'else holds the port.\n'
+                 f'     Test it without a stack:  ./scripts/{tool}')
         else:
             warn('Nodes are up but no /joint_states arrived -- the driver has '
                  'not reached the arm.\n'
@@ -742,14 +755,14 @@ def main():
             preflight(args)
             stack = Stack(args)
             stack.start()
-            panel.wait_for_nodes()
+            panel.wait_for_nodes(args=args)
         else:
             warn('Attaching to the existing stack as-is.')
     else:
         preflight(args)
         stack = Stack(args)
         stack.start()
-        panel.wait_for_nodes()
+        panel.wait_for_nodes(args=args)
 
     actions = {
         '1': panel.search,

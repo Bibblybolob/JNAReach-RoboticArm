@@ -576,14 +576,17 @@ class MyCobotHardwareNode(Node):
                  '  The node is running but every command will be refused '
                  'until this is fixed. This is the connection:=serial path, '
                  'so NOTHING about the Pi is relevant:\n'
-                 '    - the port opening does not mean the arm is on it. On '
-                 'this hardware the Atom exposes an FTDI port that answers '
-                 '-1 to every command at every baud -- it is the ESP32 '
-                 'console, not the robot protocol\n'
-                 '    - scripts/probe_usb_arm.py tests this directly, without '
-                 'starting a stack\n'
-                 '    - connection:=tcp is the path that works; it needs '
-                 'mycobot_server running on the Pi'
+                 '    - the port opening does not mean the arm is on it. '
+                 'get_angles() returning -1 means the port is fine and '
+                 'nothing answered\n'
+                 '    - is the ARM powered? A host reboot does not '
+                 'power-cycle it, and it is the commonest cause of this '
+                 'appearing after a restart that changed nothing else\n'
+                 '    - are all THREE wires seated? TX, RX and a shared '
+                 'ground. Two cannot work, and the failure is identical to '
+                 'wrong pins\n'
+                 f'    - test it without a stack: '
+                 f'./scripts/{self._probe_hint()}'
                  if self._connection == 'serial' else
                  f'Cannot reach the arm at {self._ip}:{self._port} -- {e}\n'
                  '  The node is running but every command will be refused '
@@ -1286,6 +1289,16 @@ class MyCobotHardwareNode(Node):
             mc.send_angles(angles_deg, speed, _async=True)
         else:
             mc.send_angles(angles_deg, speed)
+
+    def _probe_hint(self) -> str:
+        """The right probe for this port. Naming the wrong one costs an
+        evening: probe_usb_arm.py enumerates USB serial devices, and a UART on
+        a 40-pin header is not one -- it reports nothing found and reads as a
+        dead arm."""
+        port = self._serial_port
+        if any(k in port for k in ('THS', 'AMA', 'ttyS')):
+            return f'probe_uart_bridge.py poke --port {port}'
+        return f'probe_usb_arm.py --port {port}'
 
     def _publish_jog_applied(self, applied) -> None:
         """Report what was actually commanded, not what was asked for.

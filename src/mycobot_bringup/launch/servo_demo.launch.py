@@ -379,6 +379,21 @@ def generate_launch_description():
                     'steadiest point on a hand because it does not move when '
                     'fingers flex. 8 is the index fingertip -- more precise '
                     'to point with, but it makes the arm chase finger jitter')
+    ki_arg = DeclareLaunchArgument(
+        'ki', default_value='0.0',
+        description='Integral gain. 0 by default because this loop is dead-'
+                    'time limited: the integral winds up across the interval '
+                    'between commanding a jog and seeing it, which is exactly '
+                    'the interval that causes overshoot. Measured, not '
+                    'assumed -- see CLAUDE.md.')
+    kd_arg = DeclareLaunchArgument(
+        'kd', default_value='0.0',
+        description='Derivative gain. 0 by default; lead_time already does '
+                    'the anticipating, from measured target velocity rather '
+                    'than from differentiating a noisy error.')
+    integral_limit_arg = DeclareLaunchArgument(
+        'integral_limit', default_value='0.5',
+        description='Windup clamp on the integral vector magnitude.')
     reprobe_after_arg = DeclareLaunchArgument(
         'reprobe_after', default_value='20',
         description='Consecutive growing updates before re-measuring the '
@@ -534,6 +549,9 @@ def generate_launch_description():
             'max_frame_age': _f('max_frame_age'),
             'probe_retries': _i('probe_retries'),
             'max_reprobes': _i('max_reprobes'),
+            'ki': _f('ki'),
+            'kd': _f('kd'),
+            'integral_limit': _f('integral_limit'),
             'reprobe_after': _i('reprobe_after'),
             'reprobe_cooldown': _f('reprobe_cooldown'),
             'aim_offset_down_m': _f('aim_offset_down_m'),
@@ -631,6 +649,9 @@ def generate_launch_description():
         delegate_arg,
         hand_model_arg,
         target_landmark_arg,
+        ki_arg,
+        kd_arg,
+        integral_limit_arg,
         reprobe_after_arg,
         reprobe_cooldown_arg,
         aim_down_arg,

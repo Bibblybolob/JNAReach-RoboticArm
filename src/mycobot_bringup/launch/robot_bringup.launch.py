@@ -90,6 +90,12 @@ def generate_launch_description():
                     'false. 0 keeps the driver default')
     device_fps_arg = DeclareLaunchArgument('device_fps', default_value='30.0')
     device_width_arg = DeclareLaunchArgument('device_width', default_value='640')
+    # Driver timing. Both were hardcoded here, which silently overrode the
+    # node's own declared defaults -- changing the node did nothing.
+    command_interval_arg = DeclareLaunchArgument(
+        'command_interval', default_value='0.06')
+    speed_at_100_arg = DeclareLaunchArgument(
+        'speed_at_100_deg_s', default_value='52.0')
     rs_width_arg = DeclareLaunchArgument('rs_width', default_value='640')
     rs_height_arg = DeclareLaunchArgument('rs_height', default_value='480')
     rs_fps_arg = DeclareLaunchArgument('rs_fps', default_value='30')
@@ -151,14 +157,15 @@ def generate_launch_description():
             'publish_rate': 10.0,
             'publish_rate_during_motion': 2.0,
             'default_speed': 80,
-            'command_interval': 0.06,
+            'command_interval': _f('command_interval'),
             'lookahead': 0.12,
             'trajectory_speed': 60,
-            # Scale each streaming step's speed to its size instead of using a
-            # fixed value. speed_at_100_deg_s is a GUESS — measure it with
-            # scripts/measure_arm.py and set the real number here.
+            # Scale each streaming step's speed to its size rather than using
+            # a fixed value. speed_at_100_deg_s was MEASURED on 2026-08-01 at
+            # 52 deg/s; re-measure after a payload change with
+            # scripts/measure_arm.py --serial-port /dev/ttyTHS1.
             'adaptive_speed': True,
-            'speed_at_100_deg_s': 120.0,
+            'speed_at_100_deg_s': _f('speed_at_100_deg_s'),
             'speed_headroom': 1.3,
             'home_angles_deg': [0.0, 90.0, -90.0, 0.0, 0.0, 0.0],
             'home_speed': 30,
@@ -235,6 +242,8 @@ def generate_launch_description():
         device_exposure_arg,
         device_fps_arg,
         device_width_arg,
+        command_interval_arg,
+        speed_at_100_arg,
         rs_width_arg,
         rs_height_arg,
         rs_fps_arg,

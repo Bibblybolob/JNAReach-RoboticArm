@@ -274,6 +274,15 @@ def generate_launch_description():
         'serial_port', default_value='/dev/ttyUSB0')
     serial_baud_arg = DeclareLaunchArgument(
         'serial_baud', default_value='1000000')
+    command_interval_arg = DeclareLaunchArgument(
+        'command_interval', default_value='0.06',
+        description='Seconds between streamed arm commands. 0.06 is safe on '
+                    'the TCP path, where each command crosses the network; '
+                    'over serial a send measures 0.1ms, so 0.03 is free.')
+    speed_at_100_arg = DeclareLaunchArgument(
+        'speed_at_100_deg_s', default_value='52.0',
+        description='Measured 2026-08-01. Sizes every streamed step, so a '
+                    'value that is too high makes the arm trail its own goal.')
     rs_width_arg = DeclareLaunchArgument('rs_width', default_value='640')
     rs_height_arg = DeclareLaunchArgument('rs_height', default_value='480')
     rs_fps_arg = DeclareLaunchArgument('rs_fps', default_value='30')
@@ -426,6 +435,8 @@ def generate_launch_description():
             'device_fps': LaunchConfiguration('device_fps'),
             'device_width': LaunchConfiguration('device_width'),
             'device_height': LaunchConfiguration('device_height'),
+            'command_interval': LaunchConfiguration('command_interval'),
+            'speed_at_100_deg_s': LaunchConfiguration('speed_at_100_deg_s'),
             'rs_width': LaunchConfiguration('rs_width'),
             'rs_height': LaunchConfiguration('rs_height'),
             'rs_fps': LaunchConfiguration('rs_fps'),
@@ -539,6 +550,8 @@ def generate_launch_description():
         device_exposure_arg,
         device_fps_arg,
         device_width_arg,
+        command_interval_arg,
+        speed_at_100_arg,
         rs_width_arg,
         rs_height_arg,
         rs_fps_arg,

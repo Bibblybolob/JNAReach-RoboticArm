@@ -295,10 +295,34 @@ Tethering gets the board *online*; it does not get you *in*. USB device mode
 is still how you get a shell, and the two coexist — the 192.168.55.x link is a
 separate local network and survives the default route moving to the phone.
 
-### Setting up WiFi
+### Setting up WiFi before first boot
 
-JetPack uses NetworkManager, so there is no Raspberry-Pi-style file you can
-drop on the boot partition. Configure it from whichever shell you got above:
+You can have the board come up already on WiFi, without a console at all —
+but not the Raspberry Pi way. JetPack uses NetworkManager, so the config lives
+on the **root** filesystem rather than the boot partition. Put the Jetson's
+microSD (or its NVMe, via an adapter) in another machine, find the large ext4
+partition with `lsblk -f`, and:
+
+```bash
+sudo ./scripts/seed_jetson_wifi.sh /media/you/APP "YOUR_SSID"
+```
+
+It prompts for the passphrase with echo off, so it stays out of your shell
+history and out of `ps`. The reason this is a script rather than a snippet to
+copy: **NetworkManager silently ignores a connection file that is group- or
+world-readable** — no error, no log line, no network — and a missing uuid or
+the wrong extension fail the same quiet way.
+
+**A pre-seeded network does not give you SSH on a never-booted board.** A
+fresh JetPack runs an oem-config wizard — account, locale, licence — and waits
+there indefinitely, so there is no account to log into no matter what the
+network is doing. The script checks for this and says so. Complete first boot
+once over a monitor or the serial console, or reflash having run
+`l4t_create_default_user.sh`; the WiFi config will be waiting either way.
+
+### Setting up WiFi from a shell
+
+Configure it from whichever shell you got above:
 
 ```bash
 nmcli device wifi list

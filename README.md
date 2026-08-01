@@ -394,12 +394,39 @@ Everything is already on the `Jetson` branch, so the board pulls it directly
 rather than you copying files around:
 
 ```bash
-git clone -b Jetson https://github.com/Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project && cd ~/mycobot_project
+git clone -b Jetson git@github.com:Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project && cd ~/mycobot_project
 ```
 
-**No credentials are needed for that** — the repo is public, so clone and pull
-work with no account, token or key. Set your identity anyway, or commits made
-on the board land under the wrong name:
+**The repository is private, so the board needs credentials of its own.** Use
+a **read-only deploy key**: it is scoped to this one repository, cannot push,
+and is revocable by itself. A `gh auth login` token or an account SSH key both
+carry access to everything you own, onto a machine that lives on a bench.
+
+On the Jetson:
+
+```bash
+ssh-keygen -t ed25519 -C "jetson" -f ~/.ssh/id_ed25519 -N "" && cat ~/.ssh/id_ed25519.pub
+```
+
+Paste that into the repository's **Settings → Deploy keys → Add deploy key**,
+and leave *Allow write access* unchecked. No passphrase is deliberate —
+unattended pulls need the key usable without one, and read-only single-repo
+access is the right thing to leave unlocked. Then:
+
+```bash
+git clone -b Jetson git@github.com:<you>/<repo>.git ~/mycobot_project
+```
+
+**Or skip GitHub entirely.** Once the board is up on USB device mode you can
+push the tree straight down the cable, which needs no keys at all and is
+quicker than setting one up:
+
+```bash
+rsync -av --exclude build --exclude install --exclude log ~/JNAReach-RoboticArm/ <user>@192.168.55.1:~/mycobot_project/
+```
+
+Set your identity if you will commit on the board, or commits land under
+whatever git infers from the hostname:
 
 ```bash
 git config --global user.name "Your Name" && git config --global user.email "you@example.com"
@@ -407,23 +434,7 @@ git config --global user.name "Your Name" && git config --global user.email "you
 
 Afterwards the loop is `git push` on your desktop, `git pull` on the Jetson.
 Editing over SSH works too, but anything you change only on the board is one
-reflash from being gone — which is the main argument for not needing push
-access here at all.
-
-If you do want to push from the board, **use an SSH key rather than a token**.
-A key is scoped to the one device, revocable by itself, and cannot be read
-back out; a `gh auth login` token carries your whole account and sits on a
-machine that lives on a bench.
-
-```bash
-ssh-keygen -t ed25519 -C "jetson" && cat ~/.ssh/id_ed25519.pub
-```
-
-Add that at **github.com/settings/keys**, then switch the remote over:
-
-```bash
-git remote set-url origin git@github.com:<you>/<repo>.git
-```
+reflash from being gone — which is also why a read-only key costs you nothing.
 
 ### Run long jobs under tmux
 

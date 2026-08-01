@@ -539,6 +539,10 @@ class VisualServoNode(Node):
         # be a twitch.
         self.declare_parameter('probe_deg', 4.0)
         self.declare_parameter('probe_settle', 1.2)
+        # How many probes to attempt before giving up and assuming. The probe
+        # needs the target still and in view while two joints nudge, so a
+        # single momentary loss should not end the run.
+        self.declare_parameter('probe_retries', 3)
         # Start tracking the instant a hand is seen, instead of spending
         # several seconds twitching joints to measure the camera mounting.
         #
@@ -844,6 +848,9 @@ class VisualServoNode(Node):
         # None until probing succeeds; servoing refuses to run without it.
         self._jinv: np.ndarray | None = None
         self._probed = False
+        self._probe_failures = 0
+        self._probe_retries = int(
+            self.get_parameter('probe_retries').value)
         self._probing = False
 
         cb = ReentrantCallbackGroup()
@@ -1932,11 +1939,27 @@ class VisualServoNode(Node):
             if not self._probed:
                 ok, detail = self._probe()
                 if not ok:
+                    # Do not throw the session away over one bad probe. It
+                    # needs the target held still and in view for a couple of
+                    # seconds while two joints nudge, and a hand that drifts
+                    # out for a moment fails it -- after which homing to IDLE
+                    # means the arm never tracks at all, which reads as the
+                    # servo being broken rather than as a probe that needs
+                    # retrying.
+                    self._probe_failures += 1
+                    if self._probe_failures < self._probe_retries:
+                        self.get_logger().warn(
+                            f'Probe failed ({self._probe_failures} of '
+                            f'{self._probe_retries}): {detail} Retrying -- '
+                            f'hold your hand still and centred.')
+                        return
                     self.get_logger().error(
-                        f'Probe failed: {detail}. Returning home.')
-                    self._set_state(HOMING)
-                    self._go_home()
-                    return
+                        f'Probe failed {self._probe_failures} times: {detail} '
+                        f'Falling back to the assumed orientation, which is a '
+                        f'diagonal matrix and WRONG if the camera is mounted '
+                        f'rotated -- expect it to steer badly. Restart the '
+                        f'hunt to try probing again.')
+                    self._assume_orientation()
             self._had_lock = True
             self._set_state(TRACKING)
             return

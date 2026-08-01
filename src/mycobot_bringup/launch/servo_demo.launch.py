@@ -379,8 +379,13 @@ def generate_launch_description():
                     'steadiest point on a hand because it does not move when '
                     'fingers flex. 8 is the index fingertip -- more precise '
                     'to point with, but it makes the arm chase finger jitter')
+    probe_retries_arg = DeclareLaunchArgument(
+        'probe_retries', default_value='3',
+        description='Probes to attempt before falling back to the assumed '
+                    'orientation. One momentary loss of the target should not '
+                    'end the run.')
     max_frame_age_arg = DeclareLaunchArgument(
-        'max_frame_age', default_value='0.12',
+        'max_frame_age', default_value='0.2',
         description='Drop camera frames already older than this instead of '
                     'tracking on them. A stale detection describes a place '
                     'the hand has left; skipping it costs one detection and '
@@ -505,6 +510,7 @@ def generate_launch_description():
             'delegate': _s('delegate'),
             'target_landmark': _i('target_landmark'),
             'max_frame_age': _f('max_frame_age'),
+            'probe_retries': _i('probe_retries'),
         }],
         output='screen',
         respawn=True,
@@ -597,6 +603,7 @@ def generate_launch_description():
         delegate_arg,
         hand_model_arg,
         target_landmark_arg,
+        probe_retries_arg,
         max_frame_age_arg,
         show_window_arg,
         lost_timeout_arg,

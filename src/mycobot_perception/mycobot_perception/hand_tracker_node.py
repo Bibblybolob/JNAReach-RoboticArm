@@ -256,7 +256,18 @@ class HandTrackerNode(Node):
         #
         # Set to 0 to disable, and watch the 'tracker:' line to see how many
         # frames this is actually discarding.
-        self.declare_parameter('max_frame_age', 0.12)
+        #
+        # 0.12 was fitted to the Pi-over-WiFi pipeline. On a Jetson with a
+        # RealSense, frames arrive 72-104ms old -- capture, publish at the
+        # node's timer rate, then queue -- so 0.12 sat right on top of the
+        # normal distribution and threw away a third of them: `dropped 29
+        # stale of 85`, with detection at 5.5/s while inference only needed
+        # 20ms. Discarding frames that are merely a few ms late costs far more
+        # than their staleness does. 0.2 leaves the guard doing its job
+        # against a genuine stall while keeping the ordinary ones: measured on
+        # the same hardware, `dropped 0 stale of 137` and detection up from
+        # 5.5/s to 13.6/s.
+        self.declare_parameter('max_frame_age', 0.2)
         # ...but never starve the loop. If every frame is arriving stale --
         # a badly overloaded host, or clocks that disagree -- dropping them
         # all means publishing nothing at all, which is far worse than

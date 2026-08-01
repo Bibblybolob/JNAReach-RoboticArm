@@ -99,6 +99,11 @@ def generate_launch_description():
         'command_interval', default_value='0.06')
     speed_at_100_arg = DeclareLaunchArgument(
         'speed_at_100_deg_s', default_value='52.0')
+    rs_auto_exposure_arg = DeclareLaunchArgument(
+        'rs_auto_exposure', default_value='true')
+    rs_constant_fps_arg = DeclareLaunchArgument(
+        'rs_constant_fps', default_value='true')
+    rs_exposure_arg = DeclareLaunchArgument('rs_exposure', default_value='0.0')
     rs_width_arg = DeclareLaunchArgument('rs_width', default_value='640')
     rs_height_arg = DeclareLaunchArgument('rs_height', default_value='480')
     rs_fps_arg = DeclareLaunchArgument('rs_fps', default_value='30')
@@ -219,6 +224,9 @@ def generate_launch_description():
             'device_exposure': _f('device_exposure'),
             'device_fps': _f('device_fps'),
             'device_width': _i('device_width'),
+            'rs_auto_exposure': _b('rs_auto_exposure'),
+            'rs_constant_fps': _b('rs_constant_fps'),
+            'rs_exposure': _f('rs_exposure'),
             'rs_width': _i('rs_width'),
             'rs_height': _i('rs_height'),
             'rs_fps': _i('rs_fps'),
@@ -251,6 +259,9 @@ def generate_launch_description():
         max_jog_speed_arg,
         command_interval_arg,
         speed_at_100_arg,
+        rs_auto_exposure_arg,
+        rs_constant_fps_arg,
+        rs_exposure_arg,
         rs_width_arg,
         rs_height_arg,
         rs_fps_arg,

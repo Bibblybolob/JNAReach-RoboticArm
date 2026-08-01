@@ -45,6 +45,29 @@ def make_fake_rs(width=640, height=480, fx=380.0, fy=380.0, usb='3.2',
         name = 'name'
         usb_type_descriptor = 'usb'
 
+    class Option:
+        enable_auto_exposure = 'enable_auto_exposure'
+        auto_exposure_priority = 'auto_exposure_priority'
+        exposure = 'exposure'
+
+    class Sensor:
+        """Records what was set, and refuses options it does not advertise --
+        a D405's stereo sensor does not carry the same set as a D435's RGB
+        module, so the code must probe rather than assume."""
+        def __init__(self, name, supported):
+            self._name, self._supported = name, set(supported)
+            self.set_options = {}
+
+        def get_info(self, which):
+            return self._name
+
+        def supports(self, option):
+            return option in self._supported
+
+        def set_option(self, option, value):
+            assert self.supports(option), f'set unsupported {option}'
+            self.set_options[option] = value
+
     class Intrinsics:
         def __init__(self):
             self.fx, self.fy = fx, fy
@@ -60,12 +83,25 @@ def make_fake_rs(width=640, height=480, fx=380.0, fy=380.0, usb='3.2',
             return VideoStreamProfile()
 
     class Device:
+        def __init__(self):
+            self.sensors = [
+                Sensor('Stereo Module', ['enable_auto_exposure',
+                                         'auto_exposure_priority',
+                                         'exposure']),
+                Sensor('Motion Module', []),      # supports nothing
+            ]
+
         def get_info(self, which):
             return {'name': name, 'usb': usb}[which]
 
+        def query_sensors(self):
+            return self.sensors
+
+    _device = Device()
+
     class PipelineProfile:
         def get_device(self):
-            return Device()
+            return _device
 
         def get_stream(self, which):
             return StreamProfile()
@@ -118,6 +154,8 @@ def make_fake_rs(width=640, height=480, fx=380.0, fy=380.0, usb='3.2',
             pass
 
     rs.stream, rs.format, rs.camera_info = Stream, Format, CameraInfoEnum
+    rs.option = Option
+    rs._device = _device
     rs.pipeline, rs.config = Pipeline, Config
     rs.align = lambda which: types.SimpleNamespace(process=lambda f: f)
     return rs
@@ -185,6 +223,7 @@ def run_reader_once(node):
 PARAMS = {
     'rs_width': 640, 'rs_height': 480, 'rs_fps': 30, 'rs_serial': '',
     'rs_depth': True, 'rs_align_depth_to_color': False,
+    'rs_auto_exposure': True, 'rs_constant_fps': True, 'rs_exposure': 0.0,
 }
 
 
@@ -269,6 +308,45 @@ def test_missing_pyrealsense2_is_survivable():
     assert log.has('jetson'), 'should warn about ARM64 wheels'
     assert node._latest_frame is None
     print('  missing pyrealsense2 reported without taking the node down')
+
+
+def test_auto_exposure_does_not_get_to_cap_the_frame_rate():
+    """The trap the V4L2 path documents and this one originally missed.
+
+    A sensor in dim light lengthens exposure past the frame period and quietly
+    delivers a fraction of the rate it agreed to, while still reporting the
+    profile. Measured on a D405 indoors: 14-18 fps of a requested 30, with a
+    third of frames arriving too stale for the tracker to use and detection
+    down at 5.5/s against inference that only needs 19ms.
+
+    auto_exposure_priority=0 tells it to hold the rate and accept a darker
+    image, which keeps auto-exposure's adaptability without its frame cost."""
+    rs = make_fake_rs()
+    sys.modules['pyrealsense2'] = rs
+    log = Recorder()
+    run_reader_once(build_node(PARAMS, log))
+    stereo, motion = rs._device.sensors
+    assert stereo.set_options.get('enable_auto_exposure') == 1.0, \
+        stereo.set_options
+    assert stereo.set_options.get('auto_exposure_priority') == 0.0, \
+        f'frame rate not pinned: {stereo.set_options}'
+    assert not motion.set_options, 'set an option the sensor does not support'
+    assert log.has('exposure:'), log.lines
+    print('  auto on: priority pinned to 0, rate held')
+
+
+def test_manual_exposure_is_applied_when_asked_for():
+    rs = make_fake_rs()
+    sys.modules['pyrealsense2'] = rs
+    params = dict(PARAMS, rs_auto_exposure=False, rs_exposure=1500.0)
+    run_reader_once(build_node(params, Recorder()))
+    stereo = rs._device.sensors[0]
+    assert stereo.set_options.get('enable_auto_exposure') == 0.0, \
+        stereo.set_options
+    assert stereo.set_options.get('exposure') == 1500.0, stereo.set_options
+    assert 'auto_exposure_priority' not in stereo.set_options, \
+        'pinned the rate while auto-exposure was off'
+    print('  auto off: exposure set to 1500us, priority left alone')
 
 
 if __name__ == '__main__':

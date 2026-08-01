@@ -292,6 +292,19 @@ def generate_launch_description():
         'speed_at_100_deg_s', default_value='52.0',
         description='Measured 2026-08-01. Sizes every streamed step, so a '
                     'value that is too high makes the arm trail its own goal.')
+    rs_auto_exposure_arg = DeclareLaunchArgument(
+        'rs_auto_exposure', default_value='true',
+        description='Auto-exposure is a FRAME RATE control: in dim light the '
+                    'sensor lengthens exposure past the frame period and '
+                    'silently delivers a fraction of the requested rate.')
+    rs_constant_fps_arg = DeclareLaunchArgument(
+        'rs_constant_fps', default_value='true',
+        description='Hold the requested rate even on auto-exposure, accepting '
+                    'a darker image instead. Usually enough on its own.')
+    rs_exposure_arg = DeclareLaunchArgument(
+        'rs_exposure', default_value='0.0',
+        description='Microseconds. Only used with rs_auto_exposure:=false. '
+                    'Too short breaks detection outright, so measure.')
     rs_width_arg = DeclareLaunchArgument('rs_width', default_value='640')
     rs_height_arg = DeclareLaunchArgument('rs_height', default_value='480')
     rs_fps_arg = DeclareLaunchArgument('rs_fps', default_value='30')
@@ -448,6 +461,9 @@ def generate_launch_description():
             'max_jog_deg': LaunchConfiguration('max_jog_deg'),
             'max_jog_speed_deg_s': LaunchConfiguration('max_jog_speed_deg_s'),
             'speed_at_100_deg_s': LaunchConfiguration('speed_at_100_deg_s'),
+            'rs_auto_exposure': LaunchConfiguration('rs_auto_exposure'),
+            'rs_constant_fps': LaunchConfiguration('rs_constant_fps'),
+            'rs_exposure': LaunchConfiguration('rs_exposure'),
             'rs_width': LaunchConfiguration('rs_width'),
             'rs_height': LaunchConfiguration('rs_height'),
             'rs_fps': LaunchConfiguration('rs_fps'),
@@ -565,6 +581,9 @@ def generate_launch_description():
         max_jog_speed_arg,
         command_interval_arg,
         speed_at_100_arg,
+        rs_auto_exposure_arg,
+        rs_constant_fps_arg,
+        rs_exposure_arg,
         rs_width_arg,
         rs_height_arg,
         rs_fps_arg,

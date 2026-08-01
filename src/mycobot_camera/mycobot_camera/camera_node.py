@@ -132,6 +132,28 @@ class CameraNode(Node):
         # sensor on a different baseline, alignment is required for a pixel in
         # one image to mean anything in the other.
         self.declare_parameter('rs_align_depth_to_color', False)
+        # AUTO-EXPOSURE IS A FRAME RATE CONTROL. The same trap as the V4L2
+        # path, and it was missed here: a sensor in dim light lengthens its
+        # exposure to brighten the image, and frame time cannot be shorter
+        # than exposure time, so the camera quietly delivers a fraction of the
+        # rate it was asked for while still reporting the profile it agreed
+        # to. Measured on a D405 indoors: 14-18 fps of a requested 30, with a
+        # third of frames arriving too stale for the tracker to use.
+        #
+        # Two ways out, and the first is usually enough. auto_exposure_priority
+        # 0 tells the sensor to hold the frame rate and accept a darker image
+        # rather than the other way round -- auto exposure otherwise, so the
+        # picture still adapts. Setting rs_auto_exposure:=false with an
+        # explicit rs_exposure pins it hard.
+        self.declare_parameter('rs_auto_exposure', True)
+        # Hold the requested frame rate even on auto. Only meaningful while
+        # rs_auto_exposure is true.
+        self.declare_parameter('rs_constant_fps', True)
+        # Microseconds. 0 leaves whatever the sensor chose. Only used when
+        # rs_auto_exposure is false. Too short breaks detection outright, so
+        # measure rather than assume: camera_node reports the rate it really
+        # captures.
+        self.declare_parameter('rs_exposure', 0.0)
 
         self._source = self.get_parameter('source').get_parameter_value().string_value
         self._url = self.get_parameter('camera_url').get_parameter_value().string_value
@@ -469,6 +491,8 @@ class CameraNode(Node):
                         f'3 for full rate -- expect a silently reduced frame '
                         f'rate, which caps the whole servo loop.')
 
+                self._apply_rs_exposure(rs, dev)
+
                 # Factory intrinsics. Nothing else in this project has ever
                 # had them, so this is what unblocks depth downstream.
                 intr = (profile.get_stream(rs.stream.color)
@@ -524,6 +548,53 @@ class CameraNode(Node):
                         pipeline.stop()
                     except Exception:
                         pass
+
+    def _apply_rs_exposure(self, rs, dev) -> None:
+        """Stop the sensor trading frame rate for brightness.
+
+        Applied to every sensor that advertises the option rather than to a
+        named one: on a D405 colour and depth come from the same stereo pair,
+        so there is no separate RGB sensor to reach for, and the option lives
+        wherever librealsense decided to put it for that model.
+        """
+        auto = bool(self.get_parameter('rs_auto_exposure').value)
+        constant = bool(self.get_parameter('rs_constant_fps').value)
+        exposure = float(self.get_parameter('rs_exposure').value)
+        applied = []
+        for sensor in dev.query_sensors():
+            name = 'sensor'
+            try:
+                name = sensor.get_info(rs.camera_info.name)
+            except Exception:
+                pass
+
+            def opt(option, value, label):
+                try:
+                    if sensor.supports(option):
+                        sensor.set_option(option, value)
+                        applied.append(f'{name}: {label}={value:g}')
+                except Exception as e:
+                    self.get_logger().warn(
+                        f'{name}: could not set {label} -- '
+                        f'{e.__class__.__name__}: {e}')
+
+            opt(rs.option.enable_auto_exposure, 1.0 if auto else 0.0,
+                'auto_exposure')
+            if auto and constant:
+                # 0 = hold the frame rate, darkening the image if it must.
+                # 1 = the default, which lets exposure grow past the frame
+                # period and silently halves or thirds the rate.
+                opt(rs.option.auto_exposure_priority, 0.0,
+                    'auto_exposure_priority')
+            if not auto and exposure > 0.0:
+                opt(rs.option.exposure, exposure, 'exposure_us')
+
+        if applied:
+            self.get_logger().info('exposure: ' + '; '.join(applied))
+        else:
+            self.get_logger().warn(
+                'No sensor accepted an exposure option. If the captured rate '
+                'comes in well under what was asked for, that is why.')
 
     def _set_intrinsics(self, fx, fy, cx, cy, coeffs):
         self._k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]

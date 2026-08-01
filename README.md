@@ -426,6 +426,26 @@ MediaPipe 1.0 and OpenCV 5 each break ROS Humble's compiled `cv_bridge`, in
 ways whose error messages point somewhere else entirely. If a node dies on
 import after you upgrade something, check those three first.
 
+> **JetPack already ships NumPy and OpenCV, and both already satisfy those
+> pins** — measured on R36.3.0: NumPy 1.21.5 and OpenCV 4.8.0, the latter from
+> apt as `libopencv-python`. Installing MediaPipe pulls `opencv-contrib-python`
+> in over the top of it, because MediaPipe depends on it and pip will not use
+> the apt copy.
+>
+> That is usually fine — both are OpenCV 4, and it is OpenCV **5** that breaks
+> `cv_bridge` — and JetPack's build has **no CUDA** here (`cv2.cuda`
+> `getCudaEnabledDeviceCount()` returns 0), so shadowing it costs no
+> acceleration. But check rather than assume, because the failure appears far
+> from the cause:
+>
+> ```bash
+> python3 -c "import cv2, numpy, mediapipe; from cv_bridge import CvBridge; CvBridge(); print('ok', cv2.__version__, numpy.__version__)"
+> ```
+>
+> If that raises anything, the pip and apt OpenCVs are disagreeing — remove
+> `opencv-contrib-python` and reinstall MediaPipe with `--no-deps`, supplying
+> its other dependencies by hand.
+
 ```bash
 colcon build --symlink-install && source install/setup.bash
 ```

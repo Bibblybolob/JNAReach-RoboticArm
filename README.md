@@ -225,13 +225,38 @@ you need it.
 You still need a shell on the board once, to set WiFi up. In order of how
 little extra hardware they need:
 
+**A cable straight to your desktop, if it has a spare Ethernet port.** Most
+do, often two, and the dev kit has gigabit. Connect them directly and share
+the desktop's own connection — no switch, no router, no hotspot:
+
+```bash
+nmcli connection show                       # find the wired connection's name
+```
+
+```bash
+sudo nmcli connection modify "<wired-conn>" ipv4.method shared && sudo nmcli connection up "<wired-conn>"
+```
+
+The desktop then serves DHCP and NATs for the Jetson. This is the most
+reliable option on the list by a distance, and it is the wired link the rest
+of this project keeps wishing for.
+
 **USB device mode — nothing to buy.** Connect the Jetson's USB-C to your
-computer and it presents itself as a USB network adapter. It answers on a
-fixed address, so nothing has to be discovered:
+computer and it presents itself as *both* a USB network adapter and a serial
+console. It answers on a fixed address, so nothing has to be discovered:
 
 ```bash
 ssh <user>@192.168.55.1
 ```
+
+> **The device name you type is your computer's, not the Jetson's.**
+> `/dev/ttyTHS1` and `/dev/ttyTCU0` exist on the *Jetson*; from the host you
+> open whatever the cable presents, which is `/dev/ttyACM0` for USB device
+> mode or `/dev/ttyUSB0` for most USB-TTL adapters. `screen /dev/ttyTHS1` on a
+> desktop can never work, and `screen` exiting instantly with "[screen is
+> terminating]" almost always means the device does not exist — check with
+> `ls /dev/ttyACM* /dev/ttyUSB*` before suspecting anything subtler. If it
+> does exist and screen still exits, that is `dialout` membership.
 
 This is the standard headless Jetson path and it needs no display, no network
 and no adapter. It does need the first-boot setup to have been completed

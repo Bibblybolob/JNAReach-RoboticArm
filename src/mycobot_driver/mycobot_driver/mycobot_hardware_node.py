@@ -977,7 +977,20 @@ class MyCobotHardwareNode(Node):
             # Clamp to the joint's travel. This is not about being cautious
             # with the workspace -- driving a servo into its hard stop and
             # holding it there is how you damage it.
-            target_deg[idx] = max(lo, min(hi, target_deg[idx] + delta))
+            wanted = target_deg[idx] + delta
+            target_deg[idx] = max(lo, min(hi, wanted))
+            # A joint sitting on its limit still accepts commands and still
+            # reports success; it simply cannot move further that way. For a
+            # servo loop that means tracking works in one direction and not
+            # the other, which presents as "it follows me left but not right"
+            # rather than as anything resembling a limit.
+            if abs(wanted - target_deg[idx]) > 1e-6:
+                self.get_logger().warn(
+                    f'{name} is at its travel limit ({target_deg[idx]:.1f} of '
+                    f'{lo:.0f}..{hi:.0f}) and cannot go further that way. '
+                    f'Tracking will work in one direction only until it comes '
+                    f'back off the stop -- home the arm to recentre it.',
+                    throttle_duration_sec=5.0)
             moved = True
 
         if not moved:

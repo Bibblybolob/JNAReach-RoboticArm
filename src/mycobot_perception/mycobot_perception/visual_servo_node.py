@@ -1448,6 +1448,39 @@ class VisualServoNode(Node):
                     'pick a different vertical_joint.'
                 )
 
+            # A determinant that merely clears zero is not enough. Geometry
+            # says a probe_deg nudge should move the target about
+            # probe_deg/assumed_deg of a half-frame, so compare against that
+            # rather than against an absolute floor. Measured on hardware: a
+            # good probe gave column magnitudes near 0.10 with det 0.0075,
+            # while a probe taken at 3.7 detections/s with the arm lagging
+            # produced columns an order of magnitude apart -- and inverting
+            # that scales every command by the same factor, which drove joint1
+            # into its travel limit.
+            expected = self._probe_deg / max(self._assumed_deg, 1e-6)
+            mags = [float(np.linalg.norm(j[:, i])) for i in range(2)]
+            ratios = [m / expected for m in mags]
+            if min(ratios) < 0.3:
+                return False, (
+                    f'Probe motion too small to trust: joints moved the target '
+                    f'{mags[0]:.3f} and {mags[1]:.3f} of a half-frame, against '
+                    f'{expected:.3f} expected for a {self._probe_deg:.0f}deg '
+                    f'nudge. Inverting this scales every command by the '
+                    f'shortfall. Usually the arm did not complete the nudge -- '
+                    f'look for `Jog target pinned` in the driver log -- or a '
+                    f'joint is sitting on its travel limit. Retry.'
+                )
+            if max(ratios) > 3.0:
+                return False, (
+                    f'Probe motion too LARGE to be the arm: joints moved the '
+                    f'target {mags[0]:.3f} and {mags[1]:.3f} of a half-frame, '
+                    f'{max(ratios):.1f}x the {expected:.3f} a '
+                    f'{self._probe_deg:.0f}deg nudge can produce through this '
+                    f'lens. The target moved during the probe, so the matrix '
+                    f'describes your hand rather than the mounting. HOLD STILL '
+                    f'and retry.'
+                )
+
             # Scale to per-degree, since the probe used probe_deg steps.
             self._set_jacobian(np.linalg.inv(j) * self._probe_deg)
 

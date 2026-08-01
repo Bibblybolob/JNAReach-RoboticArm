@@ -580,8 +580,12 @@ hardware as of this writing; the port may be power-only.
 
 ## Known-unfinished
 
-- `speed_at_100_deg_s: 120.0` in the driver is an unmeasured guess.
-  `scripts/measure_arm.py` exists to measure it and has never been run.
+- ~~`speed_at_100_deg_s` is an unmeasured guess~~ — **measured 2026-08-01 and
+  now 52.0**, joint1 over `/dev/ttyTHS1` with a D405 on the flange: 51.6 deg/s
+  at speed=100, 40.6 at 60, 29.0 at 30. It had been 120, so the driver asked
+  for 43% of the speed it intended and the arm trailed its own commanded goal.
+  Re-measure after any payload change:
+  `./scripts/measure_arm.py --serial-port /dev/ttyTHS1`.
 - No camera intrinsics — `scripts/calibrate_camera.py` unused, so
   `/hand/point_cam` stays silent and depth is unavailable.
 - `obstacles.yaml` is empty; `src/mycobot_bringup/config/network.yaml` is read

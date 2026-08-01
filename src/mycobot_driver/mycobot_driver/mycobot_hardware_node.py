@@ -121,10 +121,27 @@ class MyCobotHardwareNode(Node):
         # until the next command, so the arm is still moving when it arrives.
         self.declare_parameter('adaptive_speed', True)
         # Degrees/second the fastest joint achieves at send_angles speed=100.
-        # THIS IS A GUESS AND SHOULD BE MEASURED — see scripts/measure_arm.py.
+        #
+        # MEASURED, finally, on 2026-08-01: 52 deg/s. joint1 swept 40 degrees
+        # over /dev/ttyTHS1 with a D405 on the flange —
+        #
+        #     speed=100:  39.0 deg in 0.76s = 51.6 deg/s
+        #     speed= 60:  38.3 deg in 0.94s = 40.6 deg/s
+        #     speed= 30:  38.3 deg in 1.32s = 29.0 deg/s
+        #
+        # It had been a guess of 120 since this node was written. The error is
+        # not subtle in its effect: speed is sized as needed/speed_at_100*100,
+        # so assuming 120 against a real 52 asked for 43% of the intended
+        # speed, and the arm trailed its own commanded goal by more than the
+        # divergence leash allows. That reads as a slow arm rather than as a
+        # wrong constant.
+        #
+        # Re-measure after changing the payload — a heavier end effector will
+        # move this. scripts/measure_arm.py --serial-port /dev/ttyTHS1.
+        #
         # Too high makes every step under-speed (arm lags, motion drags);
         # too low makes it over-speed (arm sprints and stops = jerk).
-        self.declare_parameter('speed_at_100_deg_s', 120.0)
+        self.declare_parameter('speed_at_100_deg_s', 52.0)
         # Command slightly more speed than strictly needed so the arm leads
         # rather than trails the schedule. 1.0 = exact, 1.3 = 30% margin.
         self.declare_parameter('speed_headroom', 1.3)

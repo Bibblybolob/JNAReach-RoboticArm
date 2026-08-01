@@ -316,9 +316,26 @@ the wrong extension fail the same quiet way.
 **A pre-seeded network does not give you SSH on a never-booted board.** A
 fresh JetPack runs an oem-config wizard — account, locale, licence — and waits
 there indefinitely, so there is no account to log into no matter what the
-network is doing. The script checks for this and says so. Complete first boot
-once over a monitor or the serial console, or reflash having run
-`l4t_create_default_user.sh`; the WiFi config will be waiting either way.
+network is doing. The script checks for this and says so.
+
+**On a board that has never booted, the order saves you a second trip:**
+
+1. **Seed the WiFi first**, while the card is already out. Answer `y` to the
+   no-user warning; the config sits dormant and takes effect the instant setup
+   finishes.
+2. **Complete oem-config once.** A monitor and USB keyboard is the path with
+   no ambiguity in it. Failing that, the carrier board's **debug UART header**
+   (3-pin GND/RX/TX, *not* the 40-pin header) carries the wizard in text mode
+   at 115200 — any USB-TTL adapter reaches it, including the Arduino used for
+   the arm. Worth plugging the USB-C into a desktop first and checking `ls
+   /dev/ttyACM*`, since L4T device mode sometimes offers a console anyway and
+   that costs nothing to try.
+3. **It joins WiFi by itself** on the next boot, and you are on SSH.
+
+Reversing 1 and 2 means finding a console, finishing setup, then finding it
+again to configure the network. Or reflash having run
+`l4t_create_default_user.sh`, which pre-creates the account and skips
+oem-config entirely.
 
 ### Setting up WiFi from a shell
 

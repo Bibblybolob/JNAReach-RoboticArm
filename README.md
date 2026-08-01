@@ -397,9 +397,33 @@ rather than you copying files around:
 git clone -b Jetson https://github.com/Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project && cd ~/mycobot_project
 ```
 
+**No credentials are needed for that** — the repo is public, so clone and pull
+work with no account, token or key. Set your identity anyway, or commits made
+on the board land under the wrong name:
+
+```bash
+git config --global user.name "Your Name" && git config --global user.email "you@example.com"
+```
+
 Afterwards the loop is `git push` on your desktop, `git pull` on the Jetson.
 Editing over SSH works too, but anything you change only on the board is one
-reflash from being gone.
+reflash from being gone — which is the main argument for not needing push
+access here at all.
+
+If you do want to push from the board, **use an SSH key rather than a token**.
+A key is scoped to the one device, revocable by itself, and cannot be read
+back out; a `gh auth login` token carries your whole account and sits on a
+machine that lives on a bench.
+
+```bash
+ssh-keygen -t ed25519 -C "jetson" && cat ~/.ssh/id_ed25519.pub
+```
+
+Add that at **github.com/settings/keys**, then switch the remote over:
+
+```bash
+git remote set-url origin git@github.com:<you>/<repo>.git
+```
 
 ### Run long jobs under tmux
 

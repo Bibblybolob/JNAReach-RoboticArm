@@ -132,11 +132,26 @@ echo
 echo "  mode 600 and root-owned, which is the part NetworkManager is fussy"
 echo "  about -- anything more permissive and it ignores the file in silence."
 echo
-echo "Unmount cleanly before pulling the card, or the write may not have"
-echo "reached it:"
-echo
-echo "    sudo umount $ROOTFS"
-echo
-echo "On the Jetson afterwards, to confirm it took:"
-echo
-echo "    nmcli connection show --active"
+
+if [ "$ROOTFS" = "/" ]; then
+    # Run against the LIVE filesystem, which is how you add a network you are
+    # not near yet -- somewhere you are travelling to, with no monitor and no
+    # Ethernet to fall back on. NetworkManager has to be told to re-read.
+    echo "Live filesystem. Load it now:"
+    echo
+    echo "    sudo nmcli connection reload"
+    echo
+    echo "It will join automatically when that network is in range. Check with:"
+    echo
+    echo "    nmcli connection show | grep -i \"$SSID\""
+    echo "    nmcli device wifi list        # once you are there"
+else
+    echo "Unmount cleanly before pulling the card, or the write may not have"
+    echo "reached it:"
+    echo
+    echo "    sudo umount $ROOTFS"
+    echo
+    echo "On the Jetson afterwards, to confirm it took:"
+    echo
+    echo "    nmcli connection show --active"
+fi

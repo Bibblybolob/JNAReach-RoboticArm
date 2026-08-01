@@ -231,6 +231,19 @@ def _arg_is(args, name, value):
     return any(a.replace(' ', '') == f'{name}:={value}' for a in args)
 
 
+def _arg_value(args, name):
+    """The value passed for a launch argument, or None. Used so messages can
+    name what was actually asked for instead of a guess -- reporting
+    source:=device to someone who typed source:=realsense sends them looking
+    for a bug that is not there."""
+    prefix = f'{name}:='
+    for a in args:
+        a = a.replace(' ', '')
+        if a.startswith(prefix):
+            return a[len(prefix):]
+    return None
+
+
 def preflight(args=()):
     """Prove the Pi is serving what this run needs, and nothing more.
 
@@ -240,22 +253,31 @@ def preflight(args=()):
 
     But WHAT this run needs from the Pi depends on how it was invoked, and
     checking for more than that turns the preflight from a help into an
-    obstacle. connection:=serial drives the arm over USB; source:=device opens
-    a local camera. With both, the Pi is not in the picture at all and every
-    check below is asking after a machine this run will never speak to.
+    obstacle. connection:=serial drives the arm over a serial port;
+    source:=device or source:=realsense opens a local camera. With both, the
+    Pi is not in the picture at all and every check below is asking after a
+    machine this run will never speak to.
     """
     serial_arm = _arg_is(args, 'connection', 'serial')
-    local_cam = (_arg_is(args, 'source', 'device')
-                 or _arg_is(args, 'source', 'realsense'))
+    source = _arg_value(args, 'source') or 'mjpeg'
+    local_cam = source in ('device', 'realsense')
 
     if serial_arm and local_cam:
-        say('connection:=serial and source:=device -- the Pi is not in this '
-            'run at all, so nothing about it is checked.')
-        print(f'{DIM}    The arm is driven over USB and the camera is local. '
-              f'If the arm does not\n    respond, the driver will say so; '
-              f'scripts/probe_usb_arm.py tests it\n    directly. Stop '
-              f'mycobot_server on the Pi -- two masters on one bus is '
-              f'erratic.{OFF}')
+        port = _arg_value(args, 'serial_port') or '/dev/ttyUSB0'
+        say(f'connection:=serial source:={source} -- the Pi is not in this '
+            f'run at all, so nothing about it is checked.')
+        # Name the port rather than saying "USB". On a Jetson this is
+        # /dev/ttyTHS1, the 40-pin header UART, and pointing at
+        # probe_usb_arm.py there sends you to the wrong tool -- that one
+        # enumerates USB serial devices, of which there are none on this path.
+        uart = 'THS' in port or 'AMA' in port or 'ttyS' in port
+        tool = ('probe_uart_bridge.py poke --port ' + port) if uart else (
+            'probe_usb_arm.py --port ' + port)
+        print(f'{DIM}    Arm on {port}, camera local. If the arm does not '
+              f'respond:\n        ./scripts/{tool}\n'
+              f'    Nothing else may drive that port at the same time -- a '
+              f'getty, a\n    second probe, or a Pi still wired to the same '
+              f'lines.{OFF}')
         return
 
     say(f'Checking Pi at {IP} ...')
@@ -284,7 +306,7 @@ def preflight(args=()):
 
     if serial_arm:
         say('connection:=serial -- skipping the arm TCP check; the driver '
-            'opens the USB serial port instead.')
+            'opens the serial port instead.')
         return
 
     say('Waiting for arm TCP on :9000 ...')

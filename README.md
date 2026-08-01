@@ -203,11 +203,74 @@ echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && source ~/.bashrc
 > `ros-humble-ros-base` plus `ros-humble-cv-bridge` is enough for the servo
 > loop and saves a few GB.
 
-## 6. Get the code and build
+## 6. Get the board on a network, and get the code onto it
+
+The Jetson needs networking for apt, pip, git and your shell. It is **not**
+part of the control loop — the arm is on `/dev/ttyTHS1` — and that separation
+is most of the point of this topology. When WiFi drops now you lose a
+terminal, not the robot. On the old layout the arm was *behind* the Pi's WiFi,
+and losing it lost everything.
+
+**Use Ethernet.** Plug the Jetson into the router and it is done; there is no
+config step. This project has lost more time to flaky WiFi than to any bug in
+it, and the failure is always the same — a link that works until the moment
+you need it.
+
+If you must use WiFi, JetPack uses NetworkManager, so there is no
+Raspberry-Pi-style file you can drop on the boot partition. Configure it on
+the device (monitor and keyboard once, or over Ethernet first):
 
 ```bash
-git clone https://github.com/Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project && cd ~/mycobot_project
+nmcli device wifi list
 ```
+
+```bash
+sudo nmcli device wifi connect "YOUR_SSID" --ask
+```
+
+`--ask` prompts for the passphrase instead of leaving it in your shell
+history. To make it survive reboots as the preferred network:
+
+```bash
+sudo nmcli connection modify "YOUR_SSID" connection.autoconnect yes
+```
+
+**Finding it without a monitor.** JetPack runs Avahi, so try mDNS first:
+
+```bash
+ssh <user>@<hostname>.local
+```
+
+Failing that, sweep the subnet from your desktop — a Jetson's Ethernet MAC
+starts `48:b0:2d` (NVIDIA):
+
+```bash
+ip neigh | grep -i '48:b0:2d'
+```
+
+### Getting the code across
+
+Everything is already on the `Jetson` branch, so the board pulls it directly
+rather than you copying files around:
+
+```bash
+git clone -b Jetson https://github.com/Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project && cd ~/mycobot_project
+```
+
+Afterwards the loop is `git push` on your desktop, `git pull` on the Jetson.
+Editing over SSH works too, but anything you change only on the board is one
+reflash from being gone.
+
+### Run long jobs under tmux
+
+```bash
+sudo apt install -y tmux && tmux new -s arm
+```
+
+An SSH session that dies takes its child processes with it — including a
+running stack, mid-motion. Inside tmux the stack survives; reattach with
+`tmux attach -t arm`. Given how this project's networking has behaved, treat
+this as required rather than optional.
 
 ```bash
 pip install -r requirements.txt

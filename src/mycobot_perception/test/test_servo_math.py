@@ -35,7 +35,7 @@ SRC = os.path.join(
 
 WANTED = ('_record_sent', '_sent_between', '_compensate', '_set_jacobian',
           '_reset_sign_estimate', '_update_sign_estimate', '_update_velocity',
-          '_deg_from_intrinsics', '_search_sweep')
+          '_deg_from_intrinsics', '_search_sweep', '_aim_offset_px')
 
 GAIN = 0.7
 DEG = 25.0
@@ -542,6 +542,48 @@ def test_the_search_sweep_reverses_once_and_comes_back():
     assert abs(s._search_travel) <= 95.0, (
         f'swept past its range to {s._search_travel:.1f}deg')
     assert s.reversals >= 2, 'never reversed over a long sweep'
+
+
+# ---------------------------------------------------------------------------
+# Metric aim offset -- hovering a real distance off the target
+# ---------------------------------------------------------------------------
+
+def _aimer(down=0.0, right=0.0, rng=0.1, fx=393.8, fy=393.4):
+    s = _Servo()
+    s._aim_down_m, s._aim_right_m, s._aim_range_m = down, right, rng
+    s._fx, s._fy = fx, fy
+    return s
+
+
+def test_a_metric_offset_scales_with_range():
+    """A fixed PIXEL offset is a different physical offset at every distance,
+    which is exactly what must not happen when hovering off a button."""
+    inch = 0.0254
+    at10 = _aimer(down=inch, rng=0.10)._aim_offset_px()[1]
+    at30 = _aimer(down=inch, rng=0.30)._aim_offset_px()[1]
+    assert abs(abs(at10) - 99.9) < 1.0, at10
+    assert abs(abs(at30) - 33.3) < 1.0, at30
+    assert abs(at10 / at30 - 3.0) < 0.01, 'offset did not scale with range'
+
+
+def test_hovering_below_aims_above_in_the_image():
+    """Camera below the target means the target sits HIGH in frame, so the
+    aim point moves up. Getting this backwards drives into the wall."""
+    dx, dy = _aimer(down=0.0254)._aim_offset_px()
+    assert dy < 0, f'aiming down-image to hover below: {dy}'
+    assert dx == 0.0
+
+
+def test_zero_offset_is_exactly_the_old_behaviour():
+    assert _aimer()._aim_offset_px() == (0.0, 0.0)
+
+
+def test_no_intrinsics_means_no_offset_rather_than_a_wrong_one():
+    s = _aimer(down=0.0254)
+    s._fx = s._fy = None
+    assert s._aim_offset_px() == (0.0, 0.0)
+    s = _aimer(down=0.0254, rng=0.0)
+    assert s._aim_offset_px() == (0.0, 0.0)
 
 
 if __name__ == '__main__':

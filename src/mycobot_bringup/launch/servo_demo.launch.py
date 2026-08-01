@@ -379,6 +379,16 @@ def generate_launch_description():
                     'steadiest point on a hand because it does not move when '
                     'fingers flex. 8 is the index fingertip -- more precise '
                     'to point with, but it makes the arm chase finger jitter')
+    aim_down_arg = DeclareLaunchArgument(
+        'aim_offset_down_m', default_value='0.0',
+        description='Hold the camera this many METRES below the target rather '
+                    'than centred on it. 0.0254 is one inch.')
+    aim_right_arg = DeclareLaunchArgument(
+        'aim_offset_right_m', default_value='0.0')
+    aim_range_arg = DeclareLaunchArgument(
+        'aim_range_m', default_value='0.1',
+        description='Standoff the offsets are computed at. A D405 cannot '
+                    'measure below ~70mm, so this is told, not read.')
     max_reprobes_arg = DeclareLaunchArgument(
         'max_reprobes', default_value='4',
         description='Re-measure the Jacobian when tracking stops converging. '
@@ -517,6 +527,9 @@ def generate_launch_description():
             'max_frame_age': _f('max_frame_age'),
             'probe_retries': _i('probe_retries'),
             'max_reprobes': _i('max_reprobes'),
+            'aim_offset_down_m': _f('aim_offset_down_m'),
+            'aim_offset_right_m': _f('aim_offset_right_m'),
+            'aim_range_m': _f('aim_range_m'),
         }],
         output='screen',
         respawn=True,
@@ -609,6 +622,9 @@ def generate_launch_description():
         delegate_arg,
         hand_model_arg,
         target_landmark_arg,
+        aim_down_arg,
+        aim_right_arg,
+        aim_range_arg,
         max_reprobes_arg,
         probe_retries_arg,
         max_frame_age_arg,

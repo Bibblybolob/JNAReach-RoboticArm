@@ -547,6 +547,14 @@ class VisualServoNode(Node):
         # re-measure when tracking stops converging. Bounded so a genuinely
         # bad mounting does not re-probe forever.
         self.declare_parameter('max_reprobes', 4)
+        # --- Metric aim offset, for hovering off a target rather than on it.
+        # Metres. Positive down_m holds the camera that far BELOW the target.
+        self.declare_parameter('aim_offset_down_m', 0.0)
+        self.declare_parameter('aim_offset_right_m', 0.0)
+        # The standoff the offsets are computed at. NOT measured from the
+        # camera: a D405 sees nothing closer than ~70mm, so at the distances
+        # this feature is for there is no depth to read. See _aim_offset_px.
+        self.declare_parameter('aim_range_m', 0.1)
         # Start tracking the instant a hand is seen, instead of spending
         # several seconds twitching joints to measure the camera mounting.
         #
@@ -854,6 +862,12 @@ class VisualServoNode(Node):
         self._probed = False
         self._probe_failures = 0
         self._reprobes = 0
+        self._fx = self._fy = None
+        self._aim_down_m = float(
+            self.get_parameter('aim_offset_down_m').value)
+        self._aim_right_m = float(
+            self.get_parameter('aim_offset_right_m').value)
+        self._aim_range_m = float(self.get_parameter('aim_range_m').value)
         self._max_reprobes = int(self.get_parameter('max_reprobes').value)
         self._probe_retries = int(
             self.get_parameter('probe_retries').value)
@@ -1112,6 +1126,7 @@ class VisualServoNode(Node):
         if fx <= 0.0 or fy <= 0.0:
             return
 
+        self._fx, self._fy = fx, fy
         h = math.degrees(math.atan2(msg.width / 2.0, fx))
         v = math.degrees(math.atan2(msg.height / 2.0, fy))
         old_h, old_v = self._assumed_deg, self._assumed_v_deg
@@ -1208,9 +1223,42 @@ class VisualServoNode(Node):
         if time.monotonic() - self._last_point_time > self._timeout:
             return None
         px, py = self._last_point
-        ex = (px - self._width / 2.0) / (self._width / 2.0)
-        ey = (py - self._height / 2.0) / (self._height / 2.0)
+        dx, dy = self._aim_offset_px()
+        ex = (px + dx - self._width / 2.0) / (self._width / 2.0)
+        ey = (py + dy - self._height / 2.0) / (self._height / 2.0)
         return ex, ey
+
+    def _aim_offset_px(self) -> tuple[float, float]:
+        """Hold the camera a metric distance off the target, not on it.
+
+        For pressing a button the camera wants to sit below and to one side of
+        what it is looking at, by a real distance rather than a number of
+        pixels -- and the pixel equivalent of 25mm changes with range:
+
+            offset_px = offset_m * focal_px / Z
+
+        which on this lens (fy 393) is 100px at 100mm standoff and 33px at
+        300mm. A fixed pixel offset would mean a different physical offset at
+        every distance, which is the thing that has to be avoided.
+
+        Needs both intrinsics and a range. Intrinsics arrive on CameraInfo;
+        range comes from aim_range_m, since the D405 CANNOT SUPPLY IT AT THE
+        DISTANCES THIS IS FOR -- its minimum is about 70mm and a one-inch
+        standoff is 25mm, so the target sits 45mm inside the blind zone
+        exactly when the offset matters most. Servo to a measurable standoff,
+        take the fix there, and run the last leg open-loop.
+
+        Both offsets default to 0, which is the old behaviour exactly.
+        """
+        if not (self._aim_down_m or self._aim_right_m):
+            return 0.0, 0.0
+        if self._fx is None or self._fy is None or self._aim_range_m <= 0.0:
+            return 0.0, 0.0
+        # Positive aim_down_m puts the camera BELOW the target, which means
+        # aiming ABOVE it in the image -- the target must sit high in frame.
+        dy = -self._aim_down_m * self._fy / self._aim_range_m
+        dx = -self._aim_right_m * self._fx / self._aim_range_m
+        return dx, dy
 
     def _wait_for_fresh_point(self, timeout=2.0):
         """Block until a target sighting newer than now arrives."""

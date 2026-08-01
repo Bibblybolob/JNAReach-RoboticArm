@@ -1,32 +1,20 @@
 # JNAReach — myCobot 280 on a Jetson Orin Nano
 
-A ROS 2 Humble workspace that drives a myCobot 280 arm with an eye-in-hand
-camera. The arm finds a hand, centres it in view, and closes in — no camera
-calibration required. Working toward pressing elevator buttons autonomously.
+A ROS 2 Humble workspace that drives a myCobot 280 with an eye-in-hand camera.
+The arm finds a hand, centres it in view, and closes in. Working toward
+pressing elevator buttons autonomously.
 
-Everything runs on one board. The Jetson watches through a RealSense on USB
-and drives the arm through the Jetson's own UART pins, so there is no network
-anywhere in the control loop.
-
-> **The Raspberry-Pi-over-WiFi setup this replaced is archived in
-> [legacy/README_pi_network.md](legacy/README_pi_network.md).** The code still
-> supports it in full and it is still what the launch files default to — see
-> [If the UART gives trouble](#if-the-uart-gives-trouble).
-
-This guide assumes a **freshly flashed Jetson Orin Nano and nothing else.**
-
----
-
-## What talks to what
+Everything runs on one board: the Jetson watches through a RealSense on USB
+and drives the arm through its own UART pins, so **there is no network
+anywhere in the control loop.**
 
 ```
 Jetson Orin Nano (JetPack 6 / Ubuntu 22.04, aarch64)
 ┌────────────────────────────────────────────┐
 │  camera_node        ◄── USB 3 ── RealSense D405
-│  hand_tracker_node       (colour + depth + factory intrinsics)
+│  hand_tracker_node                          │
 │  visual_servo_node                          │
 │  mycobot_hardware_node                      │
-│         │                                   │
 │         └── /dev/ttyTHS1, 1000000 baud      │
 └─────────┬───────────────────────────────────┘
           │  3 wires: pin 8 TX, pin 10 RX, pin 6 GND
@@ -34,525 +22,22 @@ Jetson Orin Nano (JetPack 6 / Ubuntu 22.04, aarch64)
    M5Stack Atom (ESP32) ──► servo bus ──► 6 joints
 ```
 
-Two things follow from this shape and are worth holding onto:
-
-**The Jetson is the master on the arm's serial bus.** Nothing else may drive
-those lines at the same time — not a Raspberry Pi still wired in, not a getty,
-not a second probe script. Two masters on one UART behaves erratically rather
-than failing cleanly.
-
-**The camera is the control rate.** The servo loop acts once per detection, so
-whatever rate MediaPipe achieves is the rate the arm is told anything. Below
-about 6 detections/second, nothing tuned in the servo helps.
-
 ---
 
-## Before you start
-
-| | |
-|---|---|
-| **Jetson Orin Nano** (Super) | with its own 19V supply. JetPack 6 or newer |
-| **myCobot 280** | arm, Atom/ESP32 and servos, on its own power supply |
-| **3 jumper wires** | female-to-female, for TX / RX / GND |
-| **RealSense D405** | and a **USB 3** cable. USB 2 silently halves the frame rate |
-| **microSD or NVMe** | flashed with JetPack 6 |
-
-> ### One honest warning
->
-> **The UART link has not yet been verified end to end on this hardware.** The
-> software for it is written and tested, the pin mapping is confirmed against
-> both vendors' documentation, and the wiring is three wires — but at the time
-> of writing no arm has answered over it. [Step 4](#4-prove-the-link-before-you-command-anything)
-> exists to tell you whether yours does, and to tell you *how* it is failing
-> if it does not. Do not skip it.
-
----
-
-## 1. Confirm JetPack and Ubuntu
-
-```bash
-lsb_release -d && uname -m && cat /etc/nv_tegra_release
-```
-
-You want **Ubuntu 22.04** and **aarch64**. That is JetPack 6, and it matters
-more than anything else in this document: ROS 2 Humble is built for 22.04, and
-there is no supported way to get it onto the 20.04 of JetPack 5 or the 18.04 of
-the original Jetson Nano. If you see either, reflash before going further —
-every later step assumes 22.04.
-
-```bash
-sudo apt update && sudo apt full-upgrade -y
-```
-
-**Check the root filesystem actually fills the card:**
-
-```bash
-df -h /
-```
-
-A 64GB card should show ~57G, not 22G. If it shows 22G the partition was
-never grown — normally `nvresizefs` does that during first-boot setup, so any
-route that skips the wizard skips the resize too:
-
-```bash
-sudo /usr/lib/nvidia/resizefs/nvresizefs.sh
-```
-
-Worth doing before anything else. Out of space, `apt` fails partway through
-installing ROS with `You don't have enough free space in
-/var/cache/apt/archives/`, which reads like an apt problem and is not one. It
-resizes online, so no reboot.
-
-## 2. Claim the UART
-
-```bash
-sudo usermod -aG dialout $USER
-```
-
-**Log out and back in** — group membership only applies to new sessions. Then:
-
-```bash
-ls -l /dev/ttyTHS* && sudo fuser -v /dev/ttyTHS1
-```
-
-`/dev/ttyTHS1` should be listed, `fuser` should report nothing holding it, and
-your user should be able to open it. If `ls` shows it but a script says
-permission denied, the logout did not happen.
-
-> **On an Orin Nano you almost certainly do not need `nvgetty`, and disabling
-> it may cost you something you need.** Most Jetson UART guides say to run
-> `systemctl disable nvgetty` — that advice is for the *original* Jetson Nano,
-> where the 40-pin header UART and the serial debug console were the same
-> port. On Orin they are different ports: the console is `/dev/ttyTCU0` and
-> `/dev/ttyTHS1` is free by default. `ttyTHS1` cannot be a kernel console on
-> Orin at all — `serial-tegra` declares no console.
->
-> So `ttyTHS1` needs nothing done to it, and disabling the `ttyTCU0` console
-> throws away your headless recovery path. Only act if `fuser` shows something
-> actually holding the port.
-
-## 3. Wire the arm
-
-Power **off** both the Jetson and the arm before wiring.
-
-Three wires, straight through — Jetson pin *N* to arm pin *N*:
-
-| Jetson 40-pin | | arm's 40-pin connector |
-|---|---|---|
-| **pin 8** — UART1 TX | → | **pin 8** |
-| **pin 10** — UART1 RX | ← | **pin 10** |
-| **pin 6** — GND | ↔ | **pin 6** (or any ground) |
-
-**Do not cross TX and RX.** The usual advice is to cross them, and it is wrong
-here. The arm's connector is documented with the Raspberry Pi's pinout, where
-"UART TX" names the *Pi* transmitting — so the labels describe the host, not
-the arm. The Jetson is standing in for the Pi, so its transmit goes exactly
-where the Pi's transmit went.
-
-**Ground is not optional.** A receiver decides high-or-low against its own
-ground; with no shared reference the two boards float and the arm reads
-garbage or nothing. Two wires cannot work, and the failure looks identical to
-wrong pins.
-
-Both boards are 3.3V, so no level shifting is needed. Counting down the even
-row, the three pins you want are the **3rd, 4th and 5th** positions — and the
-1st and 2nd are 5V, so a two-position miscount puts a signal wire on a power
-rail.
-
-## 4. Prove the link before you command anything
-
-The protocol has **no checksum**. A flipped bit in a joint angle is not a
-dropped message — it is a different angle, which the arm accepts and drives
-to. So the link gets tested before it gets trusted.
-
-**First, the Jetson alone.** Disconnect the arm and jumper pin 8 to pin 10:
-
-```bash
-./scripts/probe_uart_bridge.py loopback --port /dev/ttyTHS1
-```
-
-Byte-exact is a pass. This catches a UART that is not driving at all — there is
-a known JetPack 7 / L4T R39.2 bug where the ttyTHS1 TX pad does not drive on
-the Orin Nano Super, and it presents as transmitting into silence with
-everything apparently correct.
-
-**Then wire the arm and ask it something.** Read-only, commands no motion:
-
-```bash
-./scripts/probe_uart_bridge.py poke --port /dev/ttyTHS1
-```
-
-| what you see | what it means |
-|---|---|
-| **frames decoded** | wiring and baud are both right — go to step 5 |
-| **an echo** (same byte count you sent) | you are hearing yourself. Wires bridged, or the receive wire is floating and picking up crosstalk |
-| **bytes but no frames** | something is transmitting — a rate or signal-quality problem, not orientation |
-| **silence at every rate** | nothing is driving your receive line. Swap the two signal wires first |
-
-If you need to hunt for the right pin, this asks twice a second while you move
-a wire down the header:
-
-```bash
-./scripts/probe_uart_bridge.py hunt --port /dev/ttyTHS1
-```
-
-## 5. Install ROS 2 Humble
-
-Identical to the desktop instructions — the apt source line derives the
-architecture, so it serves arm64 packages without modification.
-
-```bash
-sudo apt install -y software-properties-common curl && sudo add-apt-repository -y universe
-```
-
-```bash
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
-```
-
-```bash
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
-```
-
-```bash
-sudo apt update && sudo apt install -y ros-humble-desktop ros-humble-moveit python3-colcon-common-extensions python3-rosdep
-```
-
-```bash
-echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && source ~/.bashrc
-```
-
-> On a Jetson, `ros-humble-desktop` pulls in RViz and a lot of graphics stack.
-> If the board is headless and you never plan to plan with MoveIt on it,
-> `ros-humble-ros-base` plus `ros-humble-cv-bridge` is enough for the servo
-> loop and saves a few GB.
-
-## 6. Get the board on a network, and get the code onto it
-
-The Jetson needs networking for apt, pip, git and your shell. It is **not**
-part of the control loop — the arm is on `/dev/ttyTHS1` — and that separation
-is most of the point of this topology. When WiFi drops now you lose a
-terminal, not the robot. On the old layout the arm was *behind* the Pi's WiFi,
-and losing it lost everything.
-
-**Use Ethernet.** Plug the Jetson into the router and it is done; there is no
-config step. This project has lost more time to flaky WiFi than to any bug in
-it, and the failure is always the same — a link that works until the moment
-you need it.
-
-### No Ethernet port to hand
-
-You still need a shell on the board once, to set WiFi up. In order of how
-little extra hardware they need:
-
-**A cable straight to your desktop, if it has a spare Ethernet port.** Most
-do, often two, and the dev kit has gigabit. Connect them directly and share
-the desktop's own connection — no switch, no router, no hotspot:
-
-```bash
-nmcli connection show                       # find the wired connection's name
-```
-
-```bash
-sudo nmcli connection modify "<wired-conn>" ipv4.method shared && sudo nmcli connection up "<wired-conn>"
-```
-
-The desktop then serves DHCP and NATs for the Jetson. This is the most
-reliable option on the list by a distance, and it is the wired link the rest
-of this project keeps wishing for.
-
-**USB device mode — nothing to buy.** Connect the Jetson's USB-C to your
-computer and it presents itself as *both* a USB network adapter and a serial
-console. It answers on a fixed address, so nothing has to be discovered:
-
-```bash
-ssh <user>@192.168.55.1
-```
-
-> **The device name you type is your computer's, not the Jetson's.**
-> `/dev/ttyTHS1` and `/dev/ttyTCU0` exist on the *Jetson*; from the host you
-> open whatever the cable presents, which is `/dev/ttyACM0` for USB device
-> mode or `/dev/ttyUSB0` for most USB-TTL adapters. `screen /dev/ttyTHS1` on a
-> desktop can never work, and `screen` exiting instantly with "[screen is
-> terminating]" almost always means the device does not exist — check with
-> `ls /dev/ttyACM* /dev/ttyUSB*` before suspecting anything subtler. If it
-> does exist and screen still exits, that is `dialout` membership.
-
-This is the standard headless Jetson path and it needs no display, no network
-and no adapter. It does need the first-boot setup to have been completed
-already, because until a user account exists there is nothing to log into.
-
-**The serial console, if setup has never been run.** A freshly flashed JetPack
-runs an oem-config wizard — user account, locale, licence — and until that is
-done there is no SSH and no USB networking. The console is on `/dev/ttyTCU0`
-via the dev kit's debug header, 115200 8N1, and any USB-TTL adapter reaches
-it. **The Arduino you used for the arm's UART works for this**: RESET to GND,
-D0/D1 as before.
-
-**A monitor and USB keyboard** does the same job with no fiddling, if you have
-one to hand.
-
-**A USB-Ethernet adapter, about $12.** Worth considering beyond first boot —
-it gives you the wired link this project keeps wishing it had, and it is the
-one option that fixes the underlying problem rather than working around it.
-
-**Phone tethering** gets the board online in seconds once you have a shell,
-which is handy for the apt and pip steps even if WiFi is the long-term answer.
-On **Android**, plug the phone into a USB-A port and turn on Settings →
-Hotspot & tethering → USB tethering; the toggle is greyed out until the cable
-is in, and NetworkManager takes a lease with nothing installed.
-
-On **iPhone it is a catch-22** — Linux needs `usbmuxd` and
-`libimobiledevice` to reach a Personal Hotspot over USB, and installing them
-needs the internet you are trying to obtain. Use the phone's **WiFi** hotspot
-instead, which needs no packages at all:
-
-```bash
-sudo nmcli device wifi connect "YOUR_PHONE_HOTSPOT" --ask
-```
-
-Tethering gets the board *online*; it does not get you *in*. USB device mode
-is still how you get a shell, and the two coexist — the 192.168.55.x link is a
-separate local network and survives the default route moving to the phone.
-
-### Setting up WiFi before first boot
-
-You can have the board come up already on WiFi, without a console at all —
-but not the Raspberry Pi way. JetPack uses NetworkManager, so the config lives
-on the **root** filesystem rather than the boot partition. Put the Jetson's
-microSD (or its NVMe, via an adapter) in another machine, find the large ext4
-partition with `lsblk -f`, and:
-
-```bash
-sudo ./scripts/seed_jetson_wifi.sh /media/you/APP "YOUR_SSID"
-```
-
-It prompts for the passphrase with echo off, so it stays out of your shell
-history and out of `ps`. The reason this is a script rather than a snippet to
-copy: **NetworkManager silently ignores a connection file that is group- or
-world-readable** — no error, no log line, no network — and a missing uuid or
-the wrong extension fail the same quiet way.
-
-**A pre-seeded network does not give you SSH on a never-booted board.** A
-fresh JetPack runs an oem-config wizard — account, locale, licence — and waits
-there indefinitely, so there is no account to log into no matter what the
-network is doing. The script checks for this and says so.
-
-**On a board that has never booted, the order saves you a second trip:**
-
-1. **Seed the WiFi first**, while the card is already out. Answer `y` to the
-   no-user warning; the config sits dormant and takes effect the instant setup
-   finishes.
-2. **Complete oem-config once.** A monitor and USB keyboard is the path with
-   no ambiguity in it. Failing that, the carrier board's **debug UART header**
-   (3-pin GND/RX/TX, *not* the 40-pin header) carries the wizard in text mode
-   at 115200 — any USB-TTL adapter reaches it, including the Arduino used for
-   the arm. Worth plugging the USB-C into a desktop first and checking `ls
-   /dev/ttyACM*`, since L4T device mode sometimes offers a console anyway and
-   that costs nothing to try.
-3. **It joins WiFi by itself** on the next boot, and you are on SSH.
-
-Reversing 1 and 2 means finding a console, finishing setup, then finding it
-again to configure the network. Or reflash having run
-`l4t_create_default_user.sh`, which pre-creates the account and skips
-oem-config entirely.
-
-### Setting up WiFi from a shell
-
-Configure it from whichever shell you got above:
-
-```bash
-nmcli device wifi list
-```
-
-```bash
-sudo nmcli device wifi connect "YOUR_SSID" --ask
-```
-
-`--ask` prompts for the passphrase instead of leaving it in your shell
-history. To make it survive reboots as the preferred network:
-
-```bash
-sudo nmcli connection modify "YOUR_SSID" connection.autoconnect yes
-```
-
-**Finding it without a monitor.** JetPack runs Avahi, so try mDNS first:
-
-```bash
-ssh <user>@<hostname>.local
-```
-
-Failing that, sweep the subnet from your desktop — a Jetson's Ethernet MAC
-starts `48:b0:2d` (NVIDIA):
-
-```bash
-ip neigh | grep -i '48:b0:2d'
-```
-
-### Getting the code across
-
-Everything is already on the `Jetson` branch, so the board pulls it directly
-rather than you copying files around:
-
-```bash
-git clone -b Jetson git@github.com:Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project && cd ~/mycobot_project
-```
-
-**The repository is private, so the board needs credentials of its own.** Use
-a **read-only deploy key**: it is scoped to this one repository, cannot push,
-and is revocable by itself. A `gh auth login` token or an account SSH key both
-carry access to everything you own, onto a machine that lives on a bench.
-
-On the Jetson:
-
-```bash
-ssh-keygen -t ed25519 -C "jetson" -f ~/.ssh/id_ed25519 -N "" && cat ~/.ssh/id_ed25519.pub
-```
-
-Paste that into the repository's **Settings → Deploy keys → Add deploy key**,
-and leave *Allow write access* unchecked. No passphrase is deliberate —
-unattended pulls need the key usable without one, and read-only single-repo
-access is the right thing to leave unlocked. Then:
-
-```bash
-git clone -b Jetson git@github.com:<you>/<repo>.git ~/mycobot_project
-```
-
-**Or skip GitHub entirely.** Once the board is up on USB device mode you can
-push the tree straight down the cable, which needs no keys at all and is
-quicker than setting one up:
-
-```bash
-rsync -av --exclude build --exclude install --exclude log ~/JNAReach-RoboticArm/ <user>@192.168.55.1:~/mycobot_project/
-```
-
-Set your identity if you will commit on the board, or commits land under
-whatever git infers from the hostname:
-
-```bash
-git config --global user.name "Your Name" && git config --global user.email "you@example.com"
-```
-
-Afterwards the loop is `git push` on your desktop, `git pull` on the Jetson.
-Editing over SSH works too, but anything you change only on the board is one
-reflash from being gone — which is also why a read-only key costs you nothing.
-
-### Run long jobs under tmux
-
-```bash
-sudo apt install -y tmux && tmux new -s arm
-```
-
-An SSH session that dies takes its child processes with it — including a
-running stack, mid-motion. Inside tmux the stack survives; reattach with
-`tmux attach -t arm`. Given how this project's networking has behaved, treat
-this as required rather than optional.
-
-```bash
-pip install -r requirements.txt
-```
-
-**Every dependency has an aarch64 wheel** — MediaPipe, NumPy, OpenCV and
-pyrealsense2 all install from PyPI on the Jetson with no source build. That
-was not always true and is worth knowing, because building MediaPipe or
-librealsense from source on ARM is most of a day.
-
-**The upper bounds in `requirements.txt` are load-bearing.** NumPy 2,
-MediaPipe 1.0 and OpenCV 5 each break ROS Humble's compiled `cv_bridge`, in
-ways whose error messages point somewhere else entirely. If a node dies on
-import after you upgrade something, check those three first.
-
-> **JetPack already ships NumPy and OpenCV, and both already satisfy those
-> pins** — measured on R36.3.0: NumPy 1.21.5 and OpenCV 4.8.0, the latter from
-> apt as `libopencv-python`. Installing MediaPipe pulls `opencv-contrib-python`
-> in over the top of it, because MediaPipe depends on it and pip will not use
-> the apt copy.
->
-> That is usually fine — both are OpenCV 4, and it is OpenCV **5** that breaks
-> `cv_bridge` — and JetPack's build has **no CUDA** here (`cv2.cuda`
-> `getCudaEnabledDeviceCount()` returns 0), so shadowing it costs no
-> acceleration. But check rather than assume, because the failure appears far
-> from the cause:
->
-> ```bash
-> python3 -c "import cv2, numpy, mediapipe; from cv_bridge import CvBridge; CvBridge(); print('ok', cv2.__version__, numpy.__version__)"
-> ```
->
-> If that raises anything, the pip and apt OpenCVs are disagreeing — remove
-> `opencv-contrib-python` and reinstall MediaPipe with `--no-deps`, supplying
-> its other dependencies by hand.
-
-```bash
-colcon build --symlink-install && source install/setup.bash
-```
-
-**Use `--symlink-install`.** Without it colcon *copies* Python files, so edits
-have no effect until you rebuild — and you will lose an hour to a change that
-"didn't apply" when it was simply never installed.
-
-```bash
-echo "source ~/mycobot_project/install/setup.bash" >> ~/.bashrc
-```
-
-## 7. The camera
-
-Plug the D405 into a **USB 3** port and check librealsense sees it:
-
-```bash
-python3 -c "import pyrealsense2 as rs; ctx=rs.context(); print([d.get_info(rs.camera_info.name) for d in ctx.devices])"
-```
-
-An empty list with the camera plugged in is almost always udev permissions:
-
-```bash
-sudo apt install -y librealsense2-udev-rules 2>/dev/null || echo "see librealsense/scripts/setup_udev_rules.sh"
-```
-
-Three things about the D405 specifically:
-
-- **Depth is valid from about 7cm to 50cm.** Right for pressing buttons, wrong
-  for following a hand across a room — but **hand detection does not care**,
-  because MediaPipe works on the colour image and never looks at depth. A hand
-  at 2m tracks exactly as well; only the range reading goes away.
-- **Its colour comes from the same stereo imagers as depth**, so the two are
-  natively registered. `rs_align_depth_to_color` stays off; on a D435/D455 it
-  would be mandatory.
-- **The lens is much wider than the webcam the servo was tuned against** — the
-  frame edge is roughly 43° out instead of 25°. The same normalised error
-  therefore commands nearly twice the rotation, so **expect to retune.**
-  `camera_node` measures the real field of view from the intrinsics and warns
-  when it looks like this.
-
-This is also what finally supplies **camera intrinsics**. `CameraInfo` used to
-go out with width and height and nothing else, which is why `/hand/point_cam`
-was always silent. librealsense hands the factory calibration over with the
-stream, so no chequerboard is needed.
-
-## 8. First motion
-
-One joint, small, and verified — with the link measured before anything moves:
-
-```bash
-./scripts/serial_move_test.py --port /dev/ttyTHS1
-```
-
-It reads the arm's angles 20 times with the arm still, checks every reply
-agrees, and only then moves joint 1 by 15° and puts it back. **If the replies
-disagree it refuses to move**, because corruption that shows up as a bad
-reading would show up in a command as an angle the arm drives to.
-
-Keep clear of the arm. It is stiff when powered — that is normal, the servos
-hold position — and forcing a joint by hand against a powered servo is how
-gearbox teeth strip.
-
----
-
-## Running it
+## Run it
 
 ```bash
 ./run.py connection:=serial serial_port:=/dev/ttyTHS1 serial_baud:=1000000 source:=realsense
 ```
 
-That is the whole thing: preflight, build check, launch, and a menu.
+Long, because the launch defaults still point at the old Raspberry Pi setup.
+Worth an alias:
+
+```bash
+echo "alias jnareach='~/mycobot_project/run.py connection:=serial serial_port:=/dev/ttyTHS1 serial_baud:=1000000 source:=realsense'" >> ~/.bashrc
+```
+
+That one script does preflight, a build check, the launch, and then a menu:
 
 ```
   1) Search for a hand      2) Home the arm       3) Stop servoing
@@ -561,43 +46,76 @@ That is the whole thing: preflight, build check, launch, and a menu.
   l) Live log               q) Quit (shuts the stack down)
 ```
 
-The arm stays **idle at home** until you press `1`. Home is
-`[0, 90, -90, 0, 0, 0]` degrees, commanded from wherever the arm happens to
-be — the largest single move it makes, so check the path is clear.
-
-> **That command line is long because the launch defaults still point at the
-> Raspberry Pi.** They have deliberately not been changed: until the UART link
-> is proven on your hardware, the network path is the fallback that works, and
-> silently removing it would leave you with nothing. Once step 4 passes,
-> flipping the defaults in `servo_demo.launch.py` is a two-line change. In the
-> meantime, an alias earns its keep:
->
-> ```bash
-> echo "alias jnareach='~/mycobot_project/run.py connection:=serial serial_port:=/dev/ttyTHS1 serial_baud:=1000000 source:=realsense'" >> ~/.bashrc
-> ```
+The arm stays **idle at home until you press `1`.** Home is
+`[0, 90, -90, 0, 0, 0]` degrees, commanded from wherever it happens to be —
+the largest single move it makes, so check the path is clear.
 
 Prefer `./run.py` over a bare `ros2 launch`: it catches the kinds of stale copy
 that have each cost a debugging session, and it validates launch argument
 names, which `ros2 launch` silently ignores when misspelled.
 
-`8` samples the camera and detection rates. Since the servo acts once per
-detection, **the detection rate is your control rate** — read it before
-touching any gain.
+**Run it under tmux.** An SSH session that dies takes its children with it,
+including a stack mid-motion:
 
-### Tuning
+```bash
+tmux new -s arm
+```
 
-Live, without relaunching:
+### The two numbers to read first
+
+Press `8`. The servo loop acts once per detection, so **the detection rate is
+your control rate.** Below about 6/s nothing tuned in the servo helps, and
+`model_complexity:=0` or a smaller frame will move that number more than any
+gain will.
+
+---
+
+## Check the link if the arm misbehaves
+
+The protocol has **no checksum** — a flipped bit in a joint angle is not a
+dropped message, it is a different angle that the arm accepts and drives to.
+So when something is odd, test the link rather than the tuning.
+
+```bash
+./scripts/probe_uart_bridge.py poke --port /dev/ttyTHS1
+```
+
+Read-only, commands no motion.
+
+| what you see | what it means |
+|---|---|
+| **frames decoded** | wiring and baud are both right |
+| **an echo** (same byte count you sent) | hearing yourself — wires bridged, or the receive wire is floating and picking up crosstalk |
+| **bytes but no frames** | something is transmitting: a rate or signal-quality problem, not orientation |
+| **silence at every rate** | nothing is driving your receive line — swap the two signal wires first |
+
+```bash
+./scripts/serial_move_test.py --port /dev/ttyTHS1
+```
+
+Moves joint 1 by 15° and puts it back, but only after reading the angles 20
+times with the arm still and confirming every reply agrees. **If they disagree
+it refuses to move**, which is the right behaviour on a protocol with no
+checksum.
+
+Other modes: `loopback` (jumper pin 8 to pin 10, arm disconnected — proves the
+Jetson's own UART), and `hunt` (asks twice a second while you move a wire down
+the header).
+
+---
+
+## Tuning
+
+Live, without relaunching — the servo takes runtime parameter changes:
 
 ```bash
 ./scripts/tune_servo.py
 ```
 
 It scores the loop while it tracks: mean distance from centre, worst miss, and
-**sign flips per second**. The last is the point — a mean alone rewards a loop
-that has given up, since a servo parked off-centre scores like one buzzing
+**sign flips per second**. That last one is the point — a mean alone rewards a
+loop that has given up, since a servo parked off-centre scores like one buzzing
 evenly around centre.
-
-The values that matter, as they actually are in the code:
 
 | Argument | Default | Effect |
 |---|---|---|
@@ -608,21 +126,34 @@ The values that matter, as they actually are in the code:
 | `max_step_deg` | 5.0 | biggest single jog; must not exceed the driver's `max_jog_deg` |
 | `deadband` | 0.04 | image error below which it stops correcting |
 | `rate` | 30.0 | keep at or above the camera's frame rate |
-| `assumed_deg_per_error` | 25.0 | **wrong for a D405** — see step 7, and measure with `skip_probe:=false` |
+| `assumed_deg_per_error` | 25.0 | **wrong for a D405** — see below |
 | `approach_enabled` | false | close in as well as centring |
 | `show_window` | false | OpenCV window from the tracker |
 
 **There is no PID, and adding one makes it worse.** The binding constraint is
 dead time, not gain: two or three detections arrive still reporting the old
 error while a correction is in flight, so a loop that re-commands that
-correction overshoots by construction. An integral term winds up across
-exactly that interval. Instead the node remembers every jog it sent and adds
-back the image motion not yet visible.
+correction overshoots by construction. An integral term winds up across exactly
+that interval. Instead the node remembers every jog it sent and adds back the
+image motion not yet visible.
 
-Full reasoning, and the traps, are in
-[CLAUDE.md](CLAUDE.md#visual-servoing--read-before-retuning) and the module
-docstring of `visual_servo_node.py`. **Read them before retuning** — most of
-what looks like an obvious improvement has already been tried and measured.
+**The D405's lens invalidates the gains above.** Error is normalised per axis,
+so 1.0 means "at the frame edge" on any camera — but that edge is ~25° away on
+the webcam these were fitted against and ~43° on a D405. The same normalised
+error commands nearly twice the rotation, so expect ringing until you
+re-measure:
+
+```bash
+./run.py connection:=serial serial_port:=/dev/ttyTHS1 source:=realsense skip_probe:=false
+```
+
+`camera_node` computes the real field of view from the camera's intrinsics and
+warns when it looks like this.
+
+Full reasoning and the traps are in
+[CLAUDE.md](CLAUDE.md#visual-servoing--read-before-retuning). **Read it before
+retuning** — most of what looks like an obvious improvement has been tried and
+measured.
 
 ```bash
 python3 src/mycobot_perception/test/test_servo_math.py
@@ -648,84 +179,116 @@ mounted camera.
 | `/servo/search` | Trigger | start hunting for a hand |
 | `/servo/enable` | SetBool | master stop for servoing |
 | `/camera/image_raw` | Image | colour feed |
-| `/camera/camera_info` | CameraInfo | now carries real intrinsics under `source:=realsense` |
+| `/camera/camera_info` | CameraInfo | real intrinsics under `source:=realsense` |
 | `/camera/depth_raw` | Image | 16UC1 depth, only with `rs_depth:=true` |
 | `/hand/point_px` | PointStamped | x,y = pixel; **z = palm width in pixels** |
 | `/hand/annotated` | Image | landmarks drawn, for debugging |
 
-**Only joint1, joint5 and joint3 are ever commanded** — pan, tilt, and
-approach when enabled. Joints 2, 4 and 6 are untouched by design: two DOF
-centre a target in an image and a third changes range. "Some motors are not
+**Only joint1, joint5 and joint3 are ever commanded** — pan, tilt, and approach
+when enabled. Joints 2, 4 and 6 are untouched by design: two DOF centre a
+target in an image and a third changes range. "Some motors are not
 contributing" is that, not a fault.
 
 ---
 
 ## Troubleshooting
 
-**The arm does not answer, `-1` from everything.** Work through
-[step 4](#4-prove-the-link-before-you-command-anything) rather than guessing —
-`-1` means "no valid angles" and covers nothing arriving, bytes at the wrong
-rate, and a frame with an unexpected command id. Those want opposite fixes.
-
-**It answers sometimes.** Shorten the wires. Anything above about 2kΩ of
-series resistance will not carry 1000000 baud — a bit is 1µs and a 10k divider
-takes 600ns to settle.
-
 **Permission denied on `/dev/ttyTHS1`.** `dialout` membership, and you did not
-log out. `id | grep dialout` settles it.
+log out after adding yourself. `id | grep dialout` settles it.
 
-**The port exists but nothing works.** `nvgetty` came back, or something else
-holds it: `sudo fuser -v /dev/ttyTHS1`.
+**The port exists but nothing works.** Something else holds it:
+`sudo fuser -v /dev/ttyTHS1`.
 
-**The camera is not found.** USB 3 port, USB 3 cable, and udev rules. A D405
-on USB 2 will often still enumerate and then run at a fraction of the rate,
-which caps the whole servo loop — `camera_node` warns when it sees this.
+**The arm answers sometimes.** Shorten the wires. Above about 2kΩ of series
+resistance nothing carries 1000000 baud — a bit is 1µs and a 10k divider takes
+600ns to settle.
 
-**Tracking is slow or trails.** Read the `tracker:` and `pipeline:` log lines
-before touching a gain. Below ~6 detections/s nothing in the servo helps;
-`model_complexity:=0` and a smaller frame move that number more than anything
-else.
-
-**It oscillates after switching to the D405.** Expected — the lens is nearly
-twice as wide as the one the gains were fitted to. Measure the real response
-with `skip_probe:=false`.
-
-**A joint is commanded but does not move.** Stop and find out why. Both the
-lag compensator and the velocity feedforward subtract jogs they assume
-executed, so a stuck axis becomes a runaway: the servo books the missing image
-motion as the target moving fast and leads harder.
-
-### If the UART gives trouble
-
-The Raspberry Pi path is unchanged and still works. It is what the launch
-files default to, so it is one command away:
+**The camera is not found.** USB 3 port, USB 3 cable, udev rules. A D405 on USB
+2 often still enumerates and then runs at a fraction of the rate, which caps
+the whole servo loop; `camera_node` warns when it sees this.
 
 ```bash
-MYCOBOT_IP=192.168.0.15 ./run.py
+python3 -c "import pyrealsense2 as rs; print([d.get_info(rs.camera_info.name) for d in rs.context().devices])"
 ```
 
-Setup for it is in [legacy/README_pi_network.md](legacy/README_pi_network.md).
+**Tracking is slow or trails.** Read the `tracker:` and `pipeline:` log lines
+before touching a gain.
+
+**It oscillates.** If you just switched to the D405, that is the lens — see
+Tuning above.
+
+**A joint is commanded but does not move.** Stop and find out why. Both the lag
+compensator and the velocity feedforward subtract jogs they assume executed, so
+a stuck axis becomes a runaway: the servo books the missing image motion as the
+target moving fast and leads harder.
+
+**The arm is stiff and will not move by hand.** Normal — the servos hold
+position when powered. Do not force a joint against a powered servo; that is
+how gearbox teeth strip. Power-cycle the arm to make it limp.
+
+---
+
+## If you rebuild the board
+
+Condensed, because it is a one-off. The long-form version with every trap is in
+the git history of this file.
+
+1. **JetPack 6 / Ubuntu 22.04 / aarch64.** `lsb_release -d && uname -m`.
+   Humble is built for 22.04 and there is no supported way onto anything older.
+2. **Resize the rootfs.** `df -h /` should show ~57G of a 64GB card, not 22G.
+   If the first-boot wizard was skipped, so was the resize:
+   `sudo /usr/lib/nvidia/resizefs/nvresizefs.sh`. Otherwise apt runs out of
+   space partway through installing ROS and blames its own cache.
+3. **`sudo usermod -aG dialout $USER`**, then log out and back in. You do
+   *not* need to disable `nvgetty` on an Orin — that advice is for the original
+   Jetson Nano, and here it would disable the `ttyTCU0` console instead.
+4. **ROS 2 Humble** from apt, exactly as on a desktop; the source line derives
+   the architecture. `ros-humble-ros-base` plus `ros-humble-cv-bridge` is
+   enough for the servo loop and saves ~4GB over `desktop`.
+5. **`pip install -r requirements.txt`** plus `pip install pyrealsense2`.
+   Everything has an aarch64 wheel — nothing needs building from source. The
+   upper bounds are load-bearing: NumPy 2, MediaPipe 1.0 and OpenCV 5 each
+   break `cv_bridge` in ways whose error messages point elsewhere.
+6. **`colcon build --symlink-install`.** Without the symlink flag colcon
+   *copies* Python files and your edits do nothing until you rebuild.
+
+**Headless first boot**, if there is no monitor: seed the WiFi and the user
+account onto the card before booting it, then it comes up on the network with a
+working login.
+
+```bash
+sudo ./scripts/seed_jetson_wifi.sh /mnt/jetson "YOUR_SSID"
+sudo ./scripts/seed_jetson_user.sh /mnt/jetson <username>
+```
+
+The second one exists because a fresh JetPack boots into `nv-oem-config.target`,
+which declares `Conflicts=multi-user.target` — so `ssh.service` can never start
+and the USB serial console has no getty behind it. The board pings, serves
+DHCP, and refuses SSH forever. Both scripts explain themselves at the top.
+
+**Wiring**, if it ever comes apart: Jetson pin 8 → arm pin 8, pin 10 → pin 10,
+pin 6 → ground. **Not crossed** — the arm's connector is labelled with the
+Pi's pinout, where "UART TX" means the *host* transmits, and the Jetson stands
+in for the host. Ground is not optional; without a shared reference the two
+boards float and the arm reads nothing.
 
 ---
 
 ## Known-unfinished
 
-- **The UART link is unproven on real hardware.** Everything else here follows
-  from it working.
 - `speed_at_100_deg_s: 120.0` in the driver is an unmeasured guess.
   `scripts/measure_arm.py` exists to measure it and has never been run.
-- The home pose is defined in five places that must agree; consolidating it is
-  outstanding.
-- `obstacles.yaml` is empty, and `src/mycobot_bringup/config/network.yaml` is
-  read by nothing and disagrees with the defaults.
+- The home pose is defined in five places that must agree.
+- `obstacles.yaml` is empty; `src/mycobot_bringup/config/network.yaml` is read
+  by nothing and disagrees with the defaults.
 - Approach is implemented but off by default until tracking is solid.
-- The 2x2 image Jacobian has never been measured with `skip_probe:=false`,
+- **The 2×2 image Jacobian has never been measured** with `skip_probe:=false`,
   which matters more with the D405's wider lens than it did before.
 
-`librealsense/` is gitignored. It was cloned to build `pyrealsense2` from
-source before it turned out PyPI serves an aarch64 wheel — if you have that
-827MB directory and did not build anything from it, you can delete it.
+The Raspberry-Pi-over-network setup this replaced still works and is what the
+launch files default to; it is archived in
+[legacy/README_pi_network.md](legacy/README_pi_network.md).
 
 Development notes, measured results, and the reasoning behind the control law
-are in [CLAUDE.md](CLAUDE.md). It is written for whoever touches this next,
-and most of the traps in it were found the expensive way.
+are in [CLAUDE.md](CLAUDE.md). Most of the traps in it were found the
+expensive way.

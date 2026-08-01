@@ -16,15 +16,21 @@ loop. [README.md](README.md) is written for that and is the install guide.
     source:=realsense
 ```
 
-**But the launch defaults still point at the Raspberry Pi, deliberately.** As
-of this writing the UART link has never been verified end to end against real
-hardware — see [Putting a Jetson on the arm's UART](#putting-a-jetson-on-the-arms-uart)
-— so the network path remains the route that is known to work, and removing it
-would leave nothing. Flipping the defaults is a two-line change in
-`servo_demo.launch.py` once the link is proven.
+**The UART link is verified on real hardware as of 2026-08-01.** `poke`
+returned a well-formed `GET_ANGLES` reply at 1000000 baud —
+`fe fe 0e 20 ff 48 cb 21 fc be 0e dd 25 0b f1 b8 fa`, decoding to six
+plausible joint angles with joint2 resting a third of a degree past its −135°
+software limit, which is an arm hanging under gravity and not something noise
+produces. `serial_move_test.py` then commanded motion successfully. Jetson →
+UART → ESP32 → servos, no Pi and no network in the command path.
 
-So both paths are live, and confusing which one is running is the most common
-source of wasted time:
+**The launch defaults still point at the Raspberry Pi**, so the long form
+above is needed until someone flips them — a two-line change in
+`servo_demo.launch.py`. Both paths therefore remain live, and confusing which
+one is running is a standing source of wasted time:
+
+
+
 
 | | Where | Holds |
 |---|---|---|

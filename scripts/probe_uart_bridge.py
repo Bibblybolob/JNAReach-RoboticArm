@@ -415,6 +415,18 @@ def cmd_poke(args):
         print(f'  an echo returns {sent}; the arm returns '
               f'{REPLY_LEN * copies}\n')
 
+        if got > 4 * max(sent, 1):
+            print('Far more came back than either case predicts. That is not')
+            print('data -- it is a line with two transmitters on it, or a')
+            print('floating receive line picking up noise.\n')
+            print('  - Are the signal wires CROSSED? Two outputs wired')
+            print('    together produce exactly this, and it varies with baud')
+            print('    because the garbage frames differently at each rate.')
+            print('  - Straight through for a board replacing the Pi: pin 8')
+            print('    to pin 8, pin 10 to pin 10.')
+            print('  - Or something else is still driving the same lines.')
+            return 1
+
         if abs(got - sent) <= 2:
             print('That is an echo, not a reply. Nothing on the arm is')
             print('answering you -- you are hearing yourself.\n')
@@ -449,17 +461,33 @@ def cmd_poke(args):
     print('flood of 0x00 -- ~100KB/s of it at 1000000 baud. Getting none of')
     print('that means your RX line is sitting high or floating, so it is not')
     print('shorted to ground and not on a stuck-low pin. What remains:\n')
-    print('  1. SWAP THE TWO SIGNAL WIRES. Free, and it is the single most')
-    print('     likely cause. Remember the Uno\'s labels invert when the 328P')
-    print('     is held in reset, so "wire TX to RX" is exactly the mistake')
-    print('     here -- but if you followed that, swapping is the fix.')
-    print('  2. Is RESET actually strapped to GND? Without it the 328P runs')
-    print('     whatever sketch it last had, and a sketch that calls')
-    print('     Serial.begin() drives D1 against the arm. Loopback passes')
-    print('     either way, so a clean loopback does NOT prove this.')
-    print('  3. Are these the right two wires? With the Pi gone, the arm\'s')
-    print('     TX idles HIGH -- so with a meter to ground, the wire sitting')
-    print('     at a steady 3.3V is the one your D1 wants.')
+    uart = any(k in args.port for k in ('THS', 'AMA', 'ttyS'))
+    if uart:
+        # A board UART, not a USB adapter: no 328P, no inverted labels.
+        print('  1. Is the ARM powered? A host reboot does not power-cycle')
+        print('     it, so this is the commonest way the fault appears after')
+        print('     a restart that changed nothing else.')
+        print('  2. All THREE wires seated -- TX, RX and a shared ground?')
+        print('     Two cannot work, and it fails identically to wrong pins.')
+        print('  3. Straight through, NOT crossed: pin 8 to pin 8, pin 10 to')
+        print('     pin 10. The arm\'s connector is labelled with the Pi\'s')
+        print('     pinout, where the names describe the HOST, so a board')
+        print('     standing in for the Pi transmits where the Pi did.')
+        print('  4. Does this port drive at all? Disconnect the arm, jumper')
+        print('     pin 8 to pin 10, and run `loopback`. That separates a')
+        print('     dead UART from a wiring fault.')
+    else:
+        print('  1. SWAP THE TWO SIGNAL WIRES. Free, and the single most')
+        print('     likely cause. An Uno\'s labels invert when the 328P is')
+        print('     held in reset, so "wire TX to RX" is exactly the mistake')
+        print('     here -- but if you followed that, swapping is the fix.')
+        print('  2. Is RESET actually strapped to GND? Without it the 328P')
+        print('     runs whatever sketch it last had, and one that calls')
+        print('     Serial.begin() drives D1 against the arm. Loopback passes')
+        print('     either way, so a clean loopback does NOT prove this.')
+        print('  3. Are these the right two wires? The arm\'s TX idles HIGH,')
+        print('     so with a meter to ground, the wire sitting at a steady')
+        print('     3.3V is the one your receive line wants.')
     return 1
 
 

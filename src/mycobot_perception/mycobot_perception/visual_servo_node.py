@@ -1757,7 +1757,14 @@ class VisualServoNode(Node):
 
         # Reverse at the ends of the sweep. Range is measured from wherever the
         # search started, so it stays near the home pose instead of wandering.
-        if abs(self._search_travel) >= self._search_range / 2.0:
+        # Reverse only while still heading OUTWARD. Testing the distance
+        # alone flips the direction on every tick for as long as travel sits
+        # past the limit, which at rate:=60 was nine reversals in 150ms and a
+        # sweep that stalled at the end of its range instead of turning
+        # around. Once the direction points back inward there is nothing left
+        # to correct.
+        if (abs(self._search_travel) >= self._search_range / 2.0
+                and self._search_travel * self._search_dir > 0.0):
             self._search_dir *= -1.0
             self.get_logger().info(
                 f'Search sweep reversing at {self._search_travel:+.0f}deg')

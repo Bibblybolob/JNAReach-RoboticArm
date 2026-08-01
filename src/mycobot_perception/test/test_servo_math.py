@@ -24,6 +24,7 @@ rather than a transcription of it.
 
 import ast
 import math
+import time
 import os
 
 import numpy as np
@@ -34,7 +35,7 @@ SRC = os.path.join(
 
 WANTED = ('_record_sent', '_sent_between', '_compensate', '_set_jacobian',
           '_reset_sign_estimate', '_update_sign_estimate', '_update_velocity',
-          '_deg_from_intrinsics')
+          '_deg_from_intrinsics', '_search_sweep')
 
 GAIN = 0.7
 DEG = 25.0
@@ -50,7 +51,7 @@ def _load():
     assert not missing, f'not found in visual_servo_node: {sorted(missing)}'
     # CameraInfo appears only in an annotation, which Python evaluates at
     # def time; a placeholder is enough to let the function compile.
-    ns = {'np': np, 'math': math, 'CameraInfo': object}
+    ns = {'np': np, 'math': math, 'time': time, 'CameraInfo': object}
     exec(compile(ast.Module(body=funcs, type_ignores=[]), SRC, 'exec'), ns)
     return ns
 
@@ -486,6 +487,61 @@ def test_inverted_axis_still_caught_through_noise():
         s = make()
         feed(s, ratio=-1.0, noise=0.08, rng=rng)
         assert s._sign_verdict[0]
+
+
+# ---------------------------------------------------------------------------
+# The search sweep must turn around, not vibrate at the end of its range
+# ---------------------------------------------------------------------------
+
+def test_the_search_sweep_reverses_once_and_comes_back():
+    """Observed at rate:=60: nine "Search sweep reversing at +90deg" lines in
+    150ms, and a joint that crept instead of sweeping.
+
+    Testing distance alone (abs(travel) >= range/2) flips the direction on
+    EVERY tick for as long as travel sits past the limit -- and a step landing
+    beyond it leaves travel oscillating either side, so it never falls back
+    inside and the flipping never stops. The sweep stalls exactly where it
+    should turn around."""
+    import types
+
+    class _Sweep(_Servo):
+        pass
+    _Sweep._search_sweep = _NS['_search_sweep']
+
+    clock = {'t': 0.0}
+    _NS['_search_sweep'].__globals__['time'] = types.SimpleNamespace(
+        monotonic=lambda: clock['t'])
+
+    def sweep(start, ticks, dt=1.0 / 60.0):
+        s = _Sweep()
+        s._search_travel, s._search_dir = start, 1.0
+        s._search_range, s._search_joint = 180.0, 'joint5'
+        s._sweep_seconds, s._search_max_step = 15.0, 5.0
+        s._last_sweep_time = None
+        s.reversals = 0
+        s._send_jog = lambda j, d: None
+        log = _Log()
+        s.get_logger = lambda: log
+        clock['t'] = 0.0
+        for _ in range(ticks + 1):          # +1: the first tick only seeds dt
+            s._search_sweep()
+            clock['t'] += dt
+        s.reversals = sum('reversing' in m for m in LOGS)
+        return s
+
+    LOGS.clear()
+    s = sweep(90.0, 40)                     # start exactly on the boundary
+    assert s._search_dir == -1.0, 'never settled on the inward direction'
+    assert s._search_travel < 89.0, (
+        f'travel stuck at {s._search_travel:.2f} -- vibrating at the limit '
+        f'instead of returning')
+    assert s.reversals == 1, f'{s.reversals} reversals, expected 1'
+
+    LOGS.clear()
+    s = sweep(0.0, 4000)                    # and it still turns around at all
+    assert abs(s._search_travel) <= 95.0, (
+        f'swept past its range to {s._search_travel:.1f}deg')
+    assert s.reversals >= 2, 'never reversed over a long sweep'
 
 
 if __name__ == '__main__':

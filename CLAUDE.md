@@ -1,19 +1,41 @@
 # JNAReach-RoboticArm
 
-ROS 2 Humble workspace driving a **myCobot 280 Pi** over the network, with an
-eye-in-hand camera doing visual servoing. The long-term goal is autonomously
-**pressing elevator buttons**; hand-following is the stepping stone that
-proves the perception-to-motion loop works.
+ROS 2 Humble workspace driving a **myCobot 280** with an eye-in-hand camera
+doing visual servoing. The long-term goal is autonomously **pressing elevator
+buttons**; hand-following is the stepping stone that proves the
+perception-to-motion loop works.
 
 ## Layout
 
-Three machines, and confusing them is the most common source of wasted time.
+**The target topology is a Jetson Orin Nano doing everything** — RealSense on
+USB, arm on the Jetson's own UART at `/dev/ttyTHS1`, no network in the control
+loop. [README.md](README.md) is written for that and is the install guide.
+
+```bash
+./run.py connection:=serial serial_port:=/dev/ttyTHS1 serial_baud:=1000000 \
+    source:=realsense
+```
+
+**But the launch defaults still point at the Raspberry Pi, deliberately.** As
+of this writing the UART link has never been verified end to end against real
+hardware — see [Putting a Jetson on the arm's UART](#putting-a-jetson-on-the-arms-uart)
+— so the network path remains the route that is known to work, and removing it
+would leave nothing. Flipping the defaults is a two-line change in
+`servo_demo.launch.py` once the link is proven.
+
+So both paths are live, and confusing which one is running is the most common
+source of wasted time:
 
 | | Where | Holds |
 |---|---|---|
-| Dev / runtime | Ubuntu 22.04 VM, `~/JNAReach-RoboticArm` | the ROS workspace, everything in `src/` |
-| Robot | Raspberry Pi in the arm base, `~/JON/mycobot_project`, default `192.168.0.15` | `pi/server.py` (arm TCP, port 9000) and `pi/camera_stream.py` (MJPEG, port 8080) |
-| Arm | myCobot 280 Pi | driven by pymycobot from the Pi |
+| Dev / runtime | Ubuntu 22.04, `~/JNAReach-RoboticArm` | the ROS workspace, everything in `src/` |
+| Robot *(network path)* | Raspberry Pi in the arm base, `~/JON/mycobot_project`, default `192.168.0.15` | `pi/server.py` (arm TCP, port 9000) and `pi/camera_stream.py` (MJPEG, port 8080) |
+| Arm | myCobot 280 | pymycobot, from whichever host is master |
+
+Anything below about the Pi, MJPEG transit, or `redeploy_pi.sh` applies to the
+network path only. The measured servo results apply to both — they are about
+the control law, not the transport — **except** that they were all fitted
+against a narrow-FOV webcam, which a RealSense D405 is not.
 
 **`pi/` is not part of the ROS build.** Editing those files does nothing until
 `./scripts/redeploy_pi.sh` copies them over and restarts the units. `run.py`
@@ -615,10 +637,11 @@ hardware as of this writing; the port may be power-only.
       `skip_probe:=false` as the fix. **Re-measure before trusting any tuning
       in this file.**
 
-    `pyrealsense2` is deliberately not in `requirements.txt` as a hard
-    dependency — there is no official ARM64 wheel, so requiring it would break
-    install on the very platform this is for. The node reports it missing and
-    keeps running.
+    `pyrealsense2` is left optional in `requirements.txt` because the mjpeg
+    and device sources do not need it; the node reports it missing and keeps
+    running. **PyPI does serve an aarch64 wheel** (checked at 2.58.3), so
+    `pip install pyrealsense2` works on a Jetson with no source build. An
+    earlier note here claimed the opposite and was wrong.
 
     ```bash
     python3 src/mycobot_camera/test/test_realsense_source.py
@@ -636,6 +659,15 @@ hardware as of this writing; the port may be power-only.
     topology, not FLOPS, and the biggest single win available is the Jetson
     driving the arm as well as watching it — that is the leg the servo's
     ~250ms round trip actually lives in.
-  - MediaPipe on ARM64/Jetson is an integration risk worth checking early:
-    Google publishes no Jetson wheels, so it is community builds or building
-    from source. TensorRT or Isaac ROS are the native alternatives.
+  - **MediaPipe on ARM64 is not the integration risk this file used to claim.**
+    Checked against PyPI: every version the pin allows (0.10.9 through 0.10.18)
+    publishes a `cp310 manylinux_2_17_aarch64` wheel, so `pip install -r
+    requirements.txt` completes on a Jetson with nothing built from source.
+    NumPy, OpenCV and pyrealsense2 are the same. The earlier claim that Google
+    ships no Jetson wheels was wrong, and it was steering toward a day of
+    building from source that is not needed.
+
+    What remains true is narrower: the stock wheels are **CPU-only**, so
+    `delegate:=gpu` still needs a custom build. Given the CPU path measures
+    8-19ms against a 33ms budget, that is worth little — TensorRT or Isaac ROS
+    are the answer if inference ever does become the constraint.

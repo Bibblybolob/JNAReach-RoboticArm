@@ -1,45 +1,185 @@
-# JNAReach — myCobot 280 Pi
+# JNAReach — myCobot 280 on a Jetson Orin Nano
 
-A ROS 2 workspace for driving a myCobot 280 Pi over the network, with
-eye-in-hand visual servoing. The arm finds a hand with a flange-mounted camera,
-centres it in view, and closes in — no camera calibration required.
+A ROS 2 Humble workspace that drives a myCobot 280 arm with an eye-in-hand
+camera. The arm finds a hand, centres it in view, and closes in — no camera
+calibration required. Working toward pressing elevator buttons autonomously.
 
-Working toward pressing elevator buttons autonomously.
+Everything runs on one board. The Jetson watches through a RealSense on USB
+and drives the arm through the Jetson's own UART pins, so there is no network
+anywhere in the control loop.
 
-This guide assumes **a freshly installed Ubuntu 22.04** and nothing else. If
-you already have ROS 2 Humble, skip to [Get the code](#3-get-the-code).
+> **The Raspberry-Pi-over-WiFi setup this replaced is archived in
+> [legacy/README_pi_network.md](legacy/README_pi_network.md).** The code still
+> supports it in full and it is still what the launch files default to — see
+> [If the UART gives trouble](#if-the-uart-gives-trouble).
 
-Documentation for the older gripper/food-handling version of this workspace is
-in [legacy/README_ros2_workspace.md](legacy/README_ros2_workspace.md).
-
----
-
-## How the pieces fit together
-
-```
-Desktop / VM (Ubuntu 22.04)          Raspberry Pi (on the arm)
-┌──────────────────────────┐         ┌──────────────────────────┐
-│ mycobot_hardware_node    │◄──TCP──►│ server.py       :9000    │──► arm servos
-│   joint states           │  9000   │  (bridges TCP to serial) │
-│   trajectories, jogging  │         │                          │
-│                          │         │                          │
-│ camera_node              │◄──HTTP──│ camera_stream.py  :8080  │◄── USB webcam
-│ hand_tracker_node        │  8080   │  (MJPEG server)          │
-│ visual_servo_node        │         └──────────────────────────┘
-│ move_group (MoveIt2)     │
-└──────────────────────────┘
-```
-
-**The Pi's TCP server accepts exactly one client.** Only one thing may talk to
-the arm at a time — the driver, or a script like `measure_arm.py`, never both.
-This constraint shapes a lot of the design.
+This guide assumes a **freshly flashed Jetson Orin Nano and nothing else.**
 
 ---
 
-## 1. Install ROS 2 Humble
+## What talks to what
+
+```
+Jetson Orin Nano (JetPack 6 / Ubuntu 22.04, aarch64)
+┌────────────────────────────────────────────┐
+│  camera_node        ◄── USB 3 ── RealSense D405
+│  hand_tracker_node       (colour + depth + factory intrinsics)
+│  visual_servo_node                          │
+│  mycobot_hardware_node                      │
+│         │                                   │
+│         └── /dev/ttyTHS1, 1000000 baud      │
+└─────────┬───────────────────────────────────┘
+          │  3 wires: pin 8 TX, pin 10 RX, pin 6 GND
+          ▼
+   M5Stack Atom (ESP32) ──► servo bus ──► 6 joints
+```
+
+Two things follow from this shape and are worth holding onto:
+
+**The Jetson is the master on the arm's serial bus.** Nothing else may drive
+those lines at the same time — not a Raspberry Pi still wired in, not a getty,
+not a second probe script. Two masters on one UART behaves erratically rather
+than failing cleanly.
+
+**The camera is the control rate.** The servo loop acts once per detection, so
+whatever rate MediaPipe achieves is the rate the arm is told anything. Below
+about 6 detections/second, nothing tuned in the servo helps.
+
+---
+
+## Before you start
+
+| | |
+|---|---|
+| **Jetson Orin Nano** (Super) | with its own 19V supply. JetPack 6 or newer |
+| **myCobot 280** | arm, Atom/ESP32 and servos, on its own power supply |
+| **3 jumper wires** | female-to-female, for TX / RX / GND |
+| **RealSense D405** | and a **USB 3** cable. USB 2 silently halves the frame rate |
+| **microSD or NVMe** | flashed with JetPack 6 |
+
+> ### One honest warning
+>
+> **The UART link has not yet been verified end to end on this hardware.** The
+> software for it is written and tested, the pin mapping is confirmed against
+> both vendors' documentation, and the wiring is three wires — but at the time
+> of writing no arm has answered over it. [Step 4](#4-prove-the-link-before-you-command-anything)
+> exists to tell you whether yours does, and to tell you *how* it is failing
+> if it does not. Do not skip it.
+
+---
+
+## 1. Confirm JetPack and Ubuntu
 
 ```bash
-sudo apt update && sudo apt install -y software-properties-common curl && sudo add-apt-repository -y universe
+lsb_release -d && uname -m && cat /etc/nv_tegra_release
+```
+
+You want **Ubuntu 22.04** and **aarch64**. That is JetPack 6, and it matters
+more than anything else in this document: ROS 2 Humble is built for 22.04, and
+there is no supported way to get it onto the 20.04 of JetPack 5 or the 18.04 of
+the original Jetson Nano. If you see either, reflash before going further —
+every later step assumes 22.04.
+
+```bash
+sudo apt update && sudo apt full-upgrade -y
+```
+
+## 2. Free the UART
+
+The 40-pin header's UART is claimed by a serial console on a fresh JetPack, and
+it will fight you for the port. This is the same class of problem as the
+Bluetooth bridge that used to hold the Pi's UART: the device exists, opens
+cleanly, and does not work.
+
+```bash
+sudo systemctl disable --now nvgetty
+```
+
+```bash
+sudo usermod -aG dialout $USER
+```
+
+**Log out and back in** — group membership only applies to new sessions. Then:
+
+```bash
+ls -l /dev/ttyTHS*
+```
+
+`/dev/ttyTHS1` should be listed and your user should be able to open it. If
+`ls` shows it but a script says permission denied, the logout did not happen.
+
+## 3. Wire the arm
+
+Power **off** both the Jetson and the arm before wiring.
+
+Three wires, straight through — Jetson pin *N* to arm pin *N*:
+
+| Jetson 40-pin | | arm's 40-pin connector |
+|---|---|---|
+| **pin 8** — UART1 TX | → | **pin 8** |
+| **pin 10** — UART1 RX | ← | **pin 10** |
+| **pin 6** — GND | ↔ | **pin 6** (or any ground) |
+
+**Do not cross TX and RX.** The usual advice is to cross them, and it is wrong
+here. The arm's connector is documented with the Raspberry Pi's pinout, where
+"UART TX" names the *Pi* transmitting — so the labels describe the host, not
+the arm. The Jetson is standing in for the Pi, so its transmit goes exactly
+where the Pi's transmit went.
+
+**Ground is not optional.** A receiver decides high-or-low against its own
+ground; with no shared reference the two boards float and the arm reads
+garbage or nothing. Two wires cannot work, and the failure looks identical to
+wrong pins.
+
+Both boards are 3.3V, so no level shifting is needed. Counting down the even
+row, the three pins you want are the **3rd, 4th and 5th** positions — and the
+1st and 2nd are 5V, so a two-position miscount puts a signal wire on a power
+rail.
+
+## 4. Prove the link before you command anything
+
+The protocol has **no checksum**. A flipped bit in a joint angle is not a
+dropped message — it is a different angle, which the arm accepts and drives
+to. So the link gets tested before it gets trusted.
+
+**First, the Jetson alone.** Disconnect the arm and jumper pin 8 to pin 10:
+
+```bash
+./scripts/probe_uart_bridge.py loopback --port /dev/ttyTHS1
+```
+
+Byte-exact is a pass. This catches a UART that is not driving at all — there is
+a known JetPack 7 / L4T R39.2 bug where the ttyTHS1 TX pad does not drive on
+the Orin Nano Super, and it presents as transmitting into silence with
+everything apparently correct.
+
+**Then wire the arm and ask it something.** Read-only, commands no motion:
+
+```bash
+./scripts/probe_uart_bridge.py poke --port /dev/ttyTHS1
+```
+
+| what you see | what it means |
+|---|---|
+| **frames decoded** | wiring and baud are both right — go to step 5 |
+| **an echo** (same byte count you sent) | you are hearing yourself. Wires bridged, or the receive wire is floating and picking up crosstalk |
+| **bytes but no frames** | something is transmitting — a rate or signal-quality problem, not orientation |
+| **silence at every rate** | nothing is driving your receive line. Swap the two signal wires first |
+
+If you need to hunt for the right pin, this asks twice a second while you move
+a wire down the header:
+
+```bash
+./scripts/probe_uart_bridge.py hunt --port /dev/ttyTHS1
+```
+
+## 5. Install ROS 2 Humble
+
+Identical to the desktop instructions — the apt source line derives the
+architecture, so it serves arm64 packages without modification.
+
+```bash
+sudo apt install -y software-properties-common curl && sudo add-apt-repository -y universe
 ```
 
 ```bash
@@ -54,114 +194,107 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-a
 sudo apt update && sudo apt install -y ros-humble-desktop ros-humble-moveit python3-colcon-common-extensions python3-rosdep
 ```
 
-Source ROS in every new shell — put it in `.bashrc` so you stop thinking about it:
-
 ```bash
 echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && source ~/.bashrc
 ```
 
-## 2. Install Python dependencies
+> On a Jetson, `ros-humble-desktop` pulls in RViz and a lot of graphics stack.
+> If the board is headless and you never plan to plan with MoveIt on it,
+> `ros-humble-ros-base` plus `ros-humble-cv-bridge` is enough for the servo
+> loop and saves a few GB.
+
+## 6. Get the code and build
+
+```bash
+git clone https://github.com/Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project && cd ~/mycobot_project
+```
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`ultralytics` is only needed for the YOLO food/object detector, which the
-elevator work does not use:
+**Every dependency has an aarch64 wheel** — MediaPipe, NumPy, OpenCV and
+pyrealsense2 all install from PyPI on the Jetson with no source build. That
+was not always true and is worth knowing, because building MediaPipe or
+librealsense from source on ARM is most of a day.
+
+**The upper bounds in `requirements.txt` are load-bearing.** NumPy 2,
+MediaPipe 1.0 and OpenCV 5 each break ROS Humble's compiled `cv_bridge`, in
+ways whose error messages point somewhere else entirely. If a node dies on
+import after you upgrade something, check those three first.
 
 ```bash
-pip install ultralytics
-```
-
-## 3. Get the code
-
-```bash
-git clone https://github.com/Bibblybolob/JNAReach-RoboticArm.git ~/mycobot_project
-```
-
-## 4. Build
-
-```bash
-cd ~/mycobot_project && colcon build --symlink-install && source install/setup.bash
+colcon build --symlink-install && source install/setup.bash
 ```
 
 **Use `--symlink-install`.** Without it colcon *copies* Python files, so edits
-have no effect until you rebuild — and you will lose time to a change that
-"didn't apply" when in fact it was never installed.
-
-Add the workspace to your shell too:
+have no effect until you rebuild — and you will lose an hour to a change that
+"didn't apply" when it was simply never installed.
 
 ```bash
 echo "source ~/mycobot_project/install/setup.bash" >> ~/.bashrc
 ```
 
-## 5. Find the Pi and set its address
+## 7. The camera
 
-The Pi may have **both** WiFi and Ethernet, on different subnets. You need the
-address your desktop can actually reach — check your router, or on the Pi:
-
-```bash
-hostname -I
-```
-
-Then, on the desktop:
+Plug the D405 into a **USB 3** port and check librealsense sees it:
 
 ```bash
-export MYCOBOT_IP=192.168.0.15
+python3 -c "import pyrealsense2 as rs; ctx=rs.context(); print([d.get_info(rs.camera_info.name) for d in ctx.devices])"
 ```
 
-Every launch file reads `$MYCOBOT_IP`. Put it in `.bashrc`. A `robot_ip:=...`
-launch argument overrides it for one run.
-
-If the address comes from DHCP it will change on reboot; a router reservation
-saves repeating this.
-
-## 6. Set up the Pi
-
-One-time, if the Pi has never been configured:
+An empty list with the camera plugged in is almost always udev permissions:
 
 ```bash
-ssh er@$MYCOBOT_IP 'mkdir -p ~/JON/mycobot_project/pi' && scp -r pi/* er@$MYCOBOT_IP:~/JON/mycobot_project/pi/ && ssh er@$MYCOBOT_IP 'bash ~/JON/mycobot_project/pi/setup_pi.sh'
+sudo apt install -y librealsense2-udev-rules 2>/dev/null || echo "see librealsense/scripts/setup_udev_rules.sh"
 ```
 
-Afterwards, and whenever anything in `pi/` changes, this deploys the scripts,
-installs the systemd units, frees ports 9000/8080 and restarts both services:
+Three things about the D405 specifically:
+
+- **Depth is valid from about 7cm to 50cm.** Right for pressing buttons, wrong
+  for following a hand across a room — but **hand detection does not care**,
+  because MediaPipe works on the colour image and never looks at depth. A hand
+  at 2m tracks exactly as well; only the range reading goes away.
+- **Its colour comes from the same stereo imagers as depth**, so the two are
+  natively registered. `rs_align_depth_to_color` stays off; on a D435/D455 it
+  would be mandatory.
+- **The lens is much wider than the webcam the servo was tuned against** — the
+  frame edge is roughly 43° out instead of 25°. The same normalised error
+  therefore commands nearly twice the rotation, so **expect to retune.**
+  `camera_node` measures the real field of view from the intrinsics and warns
+  when it looks like this.
+
+This is also what finally supplies **camera intrinsics**. `CameraInfo` used to
+go out with width and height and nothing else, which is why `/hand/point_cam`
+was always silent. librealsense hands the factory calibration over with the
+stream, so no chequerboard is needed.
+
+## 8. First motion
+
+One joint, small, and verified — with the link measured before anything moves:
 
 ```bash
-./scripts/redeploy_pi.sh
+./scripts/serial_move_test.py --port /dev/ttyTHS1
 ```
 
-## 7. Check both services before going further
+It reads the arm's angles 20 times with the arm still, checks every reply
+agrees, and only then moves joint 1 by 15° and puts it back. **If the replies
+disagree it refuses to move**, because corruption that shows up as a bad
+reading would show up in a command as an angle the arm drives to.
 
-Camera — expect `HTTP 200`:
-
-```bash
-curl -s -m 3 -o /dev/null -w 'camera HTTP %{http_code}\n' "http://$MYCOBOT_IP:8080/?action=snapshot"
-```
-
-Arm — expect a list of six joint angles. This only reads, it does not move:
-
-```bash
-python3 scripts/measure_arm.py --ip $MYCOBOT_IP --skip-motion
-```
-
-Both working means the hard part is done. If either fails, see
-[Troubleshooting](#troubleshooting) — every failure listed there is one that
-actually happened during development.
+Keep clear of the arm. It is stiff when powered — that is normal, the servos
+hold position — and forcing a joint by hand against a powered servo is how
+gearbox teeth strip.
 
 ---
 
 ## Running it
 
-### Finger following (one command)
-
 ```bash
-./run.py
+./run.py connection:=serial serial_port:=/dev/ttyTHS1 serial_baud:=1000000 source:=realsense
 ```
 
-That is the whole thing. It checks the Pi is actually serving both ports,
-launches the stack (output to `/tmp/mycobot_stack.log`), waits for the nodes,
-then gives you a menu:
+That is the whole thing: preflight, build check, launch, and a menu.
 
 ```
   1) Search for a hand      2) Home the arm       3) Stop servoing
@@ -170,129 +303,78 @@ then gives you a menu:
   l) Live log               q) Quit (shuts the stack down)
 ```
 
-The arm stays **idle at home** until you press `1`.
+The arm stays **idle at home** until you press `1`. Home is
+`[0, 90, -90, 0, 0, 0]` degrees, commanded from wherever the arm happens to
+be — the largest single move it makes, so check the path is clear.
 
-> **The Pi runs its own copy of the code.** `pi/server.py` and
-> `pi/camera_stream.py` live on the robot, not in the workspace, so editing
-> them here changes nothing until `./scripts/redeploy_pi.sh` pushes them
-> across. Several arm-side fixes — the client idle timeout most of all — exist
-> only in that copy, which makes it possible to "fix" a disconnect, rebuild,
-> and see no change whatsoever. `run.py` now checksums those files against the
-> robot at startup and offers to redeploy if they differ.
+> **That command line is long because the launch defaults still point at the
+> Raspberry Pi.** They have deliberately not been changed: until the UART link
+> is proven on your hardware, the network path is the fallback that works, and
+> silently removing it would leave you with nothing. Once step 4 passes,
+> flipping the defaults in `servo_demo.launch.py` is a two-line change. In the
+> meantime, an alias earns its keep:
+>
+> ```bash
+> echo "alias jnareach='~/mycobot_project/run.py connection:=serial serial_port:=/dev/ttyTHS1 serial_baud:=1000000 source:=realsense'" >> ~/.bashrc
+> ```
 
-Checking the ports up front turns two confusing ROS-level symptoms —
-`Waiting for /arm/jog_enable` and a servo node that never sees a frame — into
-one clear message naming the service that is down.
+Prefer `./run.py` over a bare `ros2 launch`: it catches the kinds of stale copy
+that have each cost a debugging session, and it validates launch argument
+names, which `ros2 launch` silently ignores when misspelled.
 
-`7` shows which nodes are up and live joint angles. `8` samples the camera and
-detection rates; the gap tells you whether MediaPipe is the bottleneck, and
-since the servo loop acts once per detection, the detection rate *is* your
-control rate. `l` tails the launch output, so you keep the diagnostics without
-them drowning the menu. `q` shuts the stack down cleanly, so nothing is left
-holding the arm's single client slot.
+`8` samples the camera and detection rates. Since the servo acts once per
+detection, **the detection rate is your control rate** — read it before
+touching any gain.
 
-Extra arguments pass through, e.g. `./run.py gain:=1.5`. If a stack is already
-running it attaches to it rather than starting a second one.
+### Tuning
 
-The raw equivalents still work if you prefer them:
-
-```bash
-ros2 launch mycobot_bringup servo_demo.launch.py
-ros2 service call /servo/search std_srvs/srv/Trigger
-```
-
-It sweeps until it sees a hand, twitches a few joints to learn how the camera
-is mounted (**hold your hand still for this**), then centres and closes in.
-After 15s with no sighting it returns home. Stop it at any time:
+Live, without relaunching:
 
 ```bash
-ros2 service call /servo/enable std_srvs/srv/SetBool "{data: false}"
+./scripts/tune_servo.py
 ```
 
-Useful overrides:
+It scores the loop while it tracks: mean distance from centre, worst miss, and
+**sign flips per second**. The last is the point — a mean alone rewards a loop
+that has given up, since a servo parked off-centre scores like one buzzing
+evenly around centre.
+
+The values that matter, as they actually are in the code:
 
 | Argument | Default | Effect |
 |---|---|---|
-| `gain` | 0.7 | **fraction** of the full centring correction per sighting, not degrees; raise toward 0.9 to follow harder |
-| `max_step_deg` | 5.0 | biggest single jog; times the detection rate, this caps how fast the camera can slew |
-| `command_lag` | 0.15 | seconds from sending a jog to seeing it; **keep below the true lag** — see below |
-| `lag_compensation` | true | predict where the hand will be once sent jogs land; turn off only with `gain:=0.3` |
-| `auto_sign` | true | detect and flip an inverted axis from the tracking motion itself |
-| `deadband` | 0.04 | image error it stops correcting below; lower to sit nearer dead centre |
-| `assumed_deg_per_error` | 25.0 | degrees that would fully centre a frame-edge target ≈ half the camera FOV; geometry, not tuning |
-| `target_landmark` | 9 | palm centre; `8` steers at the index fingertip instead |
-| `max_frame_age` | 0.12 | drop camera frames already staler than this rather than tracking on them |
-| `lost_timeout` | 15.0 | seconds before giving up and homing |
-| `target_size_fraction` | 0.45 | how close to get; higher is closer |
-| `approach_enabled` | false | set true to close in as well as centring |
-| `search_on_start` | false | start hunting without the trigger |
+| `gain` | 0.45 | **fraction** of the full correction at the centre, not degrees |
+| `progressive_gain` | 2.0 | raises gain with distance; keep `gain * (1 + progressive_gain * 0.29)` near 0.7 |
+| `lead_time` | 0.15 | aims ahead of a moving hand; `0.0` is proportional-only |
+| `command_lag` | 0.15 | seconds from sending a jog to seeing it — **keep below the true lag** |
+| `max_step_deg` | 5.0 | biggest single jog; must not exceed the driver's `max_jog_deg` |
+| `deadband` | 0.04 | image error below which it stops correcting |
+| `rate` | 30.0 | keep at or above the camera's frame rate |
+| `assumed_deg_per_error` | 25.0 | **wrong for a D405** — see step 7, and measure with `skip_probe:=false` |
+| `approach_enabled` | false | close in as well as centring |
 | `show_window` | false | OpenCV window from the tracker |
 
-**There is no PID.** Tracking is proportional control plus a model of the
-loop's own delay. Each time the hand is seen, the camera moves a fixed
-*fraction* of the way to having it centred; nothing accumulates between
-sightings.
+**There is no PID, and adding one makes it worse.** The binding constraint is
+dead time, not gain: two or three detections arrive still reporting the old
+error while a correction is in flight, so a loop that re-commands that
+correction overshoots by construction. An integral term winds up across
+exactly that interval. Instead the node remembers every jog it sent and adds
+back the image motion not yet visible.
 
-The reason is dead time. Capture on the Pi, JPEG over the network, decode,
-MediaPipe on CPU, then a jog the arm takes time to execute — several tenths of
-a second pass between an observation and the camera finishing its response to
-it, and detections keep arriving during that gap still reporting the *old*
-error. Re-commanding a correction that is already on its way is overshoot by
-construction: the arm sails past centre, comes back, and oscillates. An
-integral term winds up across exactly that interval and makes it worse.
-
-Backing the gain off to 0.3 stops the oscillation but makes the arm trail a
-moving hand. So instead the node remembers every jog it sends and, on each
-detection, adds back the image motion those jogs have not produced yet —
-correcting where the hand *will* be rather than where it was. Simulating the
-pipeline (`src/mycobot_perception/test/`, and the notes in
-`visual_servo_node.py`):
-
-| | settles |
-|---|---|
-| gain 1.44, no compensation — the original PID | never |
-| gain 0.30, no compensation | 1.3 s |
-| gain 0.70, no compensation | never |
-| gain 0.70, with compensation | 0.7 s |
-
-**`command_lag` is asymmetric — set it low.** Too low is harmless: some
-in-flight motion goes uncounted and the loop corrects a little harder than
-needed. Too high is not: the window sweeps in jogs that have *already* landed
-and are already visible in the measurement, the compensator counts them twice,
-decides it overshot, and reverses — which is the flicking it exists to
-prevent. In simulation, 0.35 s and above oscillates at every gain above 0.3,
-while 0.10–0.15 is stable from gain 0.5 to 1.1. A slow pipeline is not a
-reason to raise it; it is a reason to fix the pipeline.
-
-**If it still lags,** read the two report lines rather than guessing:
-
-```
-tracker:  8.4 detections/s, 91ms per frame, 40ms old on arrival, dropped 12 stale of 118
-pipeline: 8.4 detections/s, frames 63ms old when acted on
-```
-
-Below ~6 detections/s nothing tuned in the servo will help — the arm simply
-is not being told where the hand is often enough. `model_complexity:=0` and a
-smaller camera frame are the two things that move that number.
-
-### MoveIt2 planning and RViz
+Full reasoning, and the traps, are in
+[CLAUDE.md](CLAUDE.md#visual-servoing--read-before-retuning) and the module
+docstring of `visual_servo_node.py`. **Read them before retuning** — most of
+what looks like an obvious improvement has already been tried and measured.
 
 ```bash
-ros2 launch mycobot_bringup moveit_bringup.launch.py
+python3 src/mycobot_perception/test/test_servo_math.py
+python3 src/mycobot_driver/test/test_jog_profile.py
+python3 src/mycobot_camera/test/test_realsense_source.py
 ```
 
-Heavier, and unnecessary for servoing — visual servoing bypasses MoveIt
-entirely, jogging joints straight from image error.
-
-### Homing
-
-```bash
-ros2 service call /arm/home std_srvs/srv/SetBool "{data: true}"
-```
-
-Moves to a fixed pose, `[0, 90, -90, -90, 0, 0]` degrees. This is commanded
-from wherever the arm happens to be, which makes it the largest single move the
-arm makes — check the path is clear.
+Run these after any change to the control law. A flipped sign does not crash —
+it drives the target out of frame, which is indistinguishable from a badly
+mounted camera.
 
 ---
 
@@ -301,150 +383,91 @@ arm makes — check the path is clear.
 | Name | Type | Purpose |
 |---|---|---|
 | `/joint_states` | JointState | 6 arm joints |
-| `/arm_controller/follow_joint_trajectory` | FollowJointTrajectory | MoveIt execution |
 | `/arm/home` | SetBool | move to the fixed home pose |
 | `/arm/jog` | JointJog | relative joint moves, in **degrees** |
 | `/arm/jog_enable` | SetBool | gate for jogging |
+| `/arm/jog_applied` | JointJog | what the driver really commanded — **diagnostics only** |
 | `/servo/search` | Trigger | start hunting for a hand |
 | `/servo/enable` | SetBool | master stop for servoing |
-| `/camera/image_raw` | Image | camera feed |
-| `/hand/point_px` | PointStamped | x,y = fingertip pixel; **z = palm width in pixels** |
+| `/camera/image_raw` | Image | colour feed |
+| `/camera/camera_info` | CameraInfo | now carries real intrinsics under `source:=realsense` |
+| `/camera/depth_raw` | Image | 16UC1 depth, only with `rs_depth:=true` |
+| `/hand/point_px` | PointStamped | x,y = pixel; **z = palm width in pixels** |
 | `/hand/annotated` | Image | landmarks drawn, for debugging |
 
----
-
-## Calibration (optional)
-
-Servoing needs none of this. These unlock metric 3D work later.
-
-**Arm speed** — replaces two guessed constants with measured values. Moves the
-arm; stop the driver first, since only one client may connect:
-
-```bash
-python3 scripts/measure_arm.py --ip $MYCOBOT_IP
-```
-
-**Camera intrinsics** — needed before any pixel can become a ray:
-
-```bash
-python3 scripts/calibrate_camera.py --stream "http://$MYCOBOT_IP:8080/?action=stream"
-```
+**Only joint1, joint5 and joint3 are ever commanded** — pan, tilt, and
+approach when enabled. Joints 2, 4 and 6 are untouched by design: two DOF
+centre a target in an image and a third changes range. "Some motors are not
+contributing" is that, not a fault.
 
 ---
 
 ## Troubleshooting
 
-**"Connection refused" on port 9000, but the camera on 8080 works.**
-The Pi has two interfaces and the old `server.py` bound only to the wlan0
-address, so it was listening on an address the desktop could not route to.
-Fixed by binding `0.0.0.0` — but the fix must be deployed:
-`./scripts/redeploy_pi.sh`.
+**The arm does not answer, `-1` from everything.** Work through
+[step 4](#4-prove-the-link-before-you-command-anything) rather than guessing —
+`-1` means "no valid angles" and covers nothing arriving, bytes at the wrong
+rate, and a frame with an unexpected command id. Those want opposite fixes.
 
-**The arm was reachable, then stopped accepting connections.**
-The server accepts one client, and older versions had no receive timeout, so a
-client that died without closing blocked it forever. Redeploy, then check
-nothing else holds the socket — a leftover `measure_arm.py` or a second driver
-will lock everything else out.
+**It answers sometimes.** Shorten the wires. Anything above about 2kΩ of
+series resistance will not carry 1000000 baud — a bit is 1µs and a 10k divider
+takes 600ns to settle.
 
-**The Pi's IP changed and nothing connects.**
-It will, eventually — the Pi takes a DHCP lease, and a router reboot or a
-lease expiry reassigns it. This repo has already chased that address three
-times. Short-term fix is `export MYCOBOT_IP=<new address>`; every launch file,
-script and node default reads it.
+**Permission denied on `/dev/ttyTHS1`.** `dialout` membership, and you did not
+log out. `id | grep dialout` settles it.
 
-Three ways to stop it mattering, best first:
+**The port exists but nothing works.** `nvgetty` came back, or something else
+holds it: `sudo fuser -v /dev/ttyTHS1`.
 
-1. **DHCP reservation on the router.** Bind the Pi's MAC to a fixed address.
-   Nothing on the Pi or in this repo changes, and it survives reflashing.
-2. **mDNS.** `MYCOBOT_IP` accepts a hostname, and every consumer of it
-   (`ping`, `ssh`, `socket.create_connection`, the MJPEG URL, pymycobot)
-   resolves names fine. Find the Pi's hostname with
-   `ssh er@<current-ip> hostname`, then `export MYCOBOT_IP=<hostname>.local`
-   and the address can move freely.
-3. **Static IP on the Pi**, or a direct Ethernet link with static addresses on
-   both ends — which sidesteps DHCP entirely and is worth doing anyway.
+**The camera is not found.** USB 3 port, USB 3 cable, and udev rules. A D405
+on USB 2 will often still enumerate and then run at a fraction of the rate,
+which caps the whole servo loop — `camera_node` warns when it sees this.
 
-**A service is dead after a reboot with no error.**
-The units used to start before the network had an address, fail, exhaust
-systemd's start limit, and be abandoned permanently. Fixed in the current
-units; `redeploy_pi.sh` installs them.
+**Tracking is slow or trails.** Read the `tracker:` and `pipeline:` log lines
+before touching a gain. Below ~6 detections/s nothing in the servo helps;
+`model_complexity:=0` and a smaller frame move that number more than anything
+else.
 
-**Config changes have no effect.**
-Stale build. Rebuild with `--symlink-install`, and check what is actually
-installed rather than what is in `src/`:
+**It oscillates after switching to the D405.** Expected — the lens is nearly
+twice as wide as the one the gains were fitted to. Measure the real response
+with `skip_probe:=false`.
 
-```bash
-grep -rn "192.168" ~/mycobot_project/install/*/lib/python3*/site-packages/*/camera_node.py
-```
+**A joint is commanded but does not move.** Stop and find out why. Both the
+lag compensator and the velocity feedforward subtract jogs they assume
+executed, so a stuck axis becomes a runaway: the servo books the missing image
+motion as the target moving fast and leads harder.
 
-**"Waiting for /arm/jog_enable (is the driver running?)"**
-The driver could not reach the arm. It now stays up and retries every 5s
-instead of dying, and prints the address it failed on.
+### If the UART gives trouble
 
-**A node dies on import: `_ARRAY_API not found`, `KeyError: 16`, or
-`module 'mediapipe' has no attribute 'solutions'`.**
-Python dependency versions, not ROS. `pip` installs into `~/.local`, which
-shadows the system packages ROS 2 Humble's compiled extensions were built
-against — so upgrading numpy, opencv or mediapipe breaks nodes that worked,
-with errors that point at ROS instead of at the upgrade. `cv_bridge` is the
-usual casualty, and it takes both `camera_node` and `hand_tracker_node` with
-it. Fix:
+The Raspberry Pi path is unchanged and still works. It is what the launch
+files default to, so it is one command away:
 
 ```bash
-pip install -r requirements.txt
+MYCOBOT_IP=192.168.0.15 ./run.py
 ```
 
-That pins `numpy<2`, `mediapipe<1.0` and `opencv-contrib-python<5`. The
-reasoning for each bound is in the file.
-
-**Repeated "Lost connection to the arm ... Broken pipe" and camera read
-timeouts.**
-The link is not flaky — the host is stalling. `server.py` drops a client that
-has been silent too long (to stop a dead client locking out the single-client
-server forever), and a loaded desktop VM freezes every ROS node for tens of
-seconds at a time, which looks identical to a dead client from the Pi's side.
-The tell is that *both* the driver and the servo node go completely silent for
-the same window, despite independent timers that log every 2–3s.
-
-Mitigated on three fronts: the server's idle timeout is now 120s with TCP
-keepalive tuned to reap a genuinely dead peer in ~60s, the driver sends a
-keepalive read every 5s so the link rarely goes idle, and the camera's read
-timeout is 30s. If it still happens, fix the stall rather than the timeouts —
-run `free -h` and `vmstat 1` while the stack is up, and if it is swapping give
-the VM more RAM (≥4 GB) and ≥2 vCPUs.
-
-**Servo enabled but the arm does not move.**
-Both consoles now say why — the driver names the reason a jog was rejected, and
-the servo says whether it is inside the deadband, has no target, or has no
-Jacobian. `On target` means it is already centred: move your hand toward the
-frame edge.
-
-**Probe fails with "Jacobian is singular".**
-From that pose the two joints move the image in nearly the same direction, so
-they cannot steer independently. Move the arm elsewhere and re-trigger.
-
-**MediaPipe sees nothing.**
-Check `/camera/image_raw` first — with a flange-mounted camera it is often
-pointing somewhere unexpected. MediaPipe also needs the *whole* hand, so back
-off to 30–50cm.
+Setup for it is in [legacy/README_pi_network.md](legacy/README_pi_network.md).
 
 ---
 
-## Notes and current state
+## Known-unfinished
 
-**No collision geometry.** `obstacles.yaml` is empty. Self-collision checking
-still applies, but nothing in the environment is modelled — the planner will
-happily drive through your bench. Add real measured geometry before working
-near anything you care about.
+- **The UART link is unproven on real hardware.** Everything else here follows
+  from it working.
+- `speed_at_100_deg_s: 120.0` in the driver is an unmeasured guess.
+  `scripts/measure_arm.py` exists to measure it and has never been run.
+- The home pose is defined in five places that must agree; consolidating it is
+  outstanding.
+- `obstacles.yaml` is empty, and `src/mycobot_bringup/config/network.yaml` is
+  read by nothing and disagrees with the defaults.
+- Approach is implemented but off by default until tracking is solid.
+- The 2x2 image Jacobian has never been measured with `skip_probe:=false`,
+  which matters more with the D405's wider lens than it did before.
 
-**Two constants are still guesses**, both flagged in their files:
-`speed_at_100_deg_s` in the driver, and `max_velocity` in `joint_limits.yaml`.
-`measure_arm.py` replaces both with measured values in about five minutes.
+`librealsense/` is gitignored. It was cloned to build `pyrealsense2` from
+source before it turned out PyPI serves an aarch64 wheel — if you have that
+827MB directory and did not build anything from it, you can delete it.
 
-**Depth is approximate.** With one camera there is no true range — apparent
-palm size stands in for it. An OAK-D Pro would replace that step; the code is
-structured so only the pixel→3D conversion changes.
-
-**The gripper has been removed** from the URDF, SRDF, controllers, and driver.
-Those four must stay consistent: a controller or SRDF referencing a joint the
-URDF does not define stops `move_group` from starting.
+Development notes, measured results, and the reasoning behind the control law
+are in [CLAUDE.md](CLAUDE.md). It is written for whoever touches this next,
+and most of the traps in it were found the expensive way.

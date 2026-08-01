@@ -3,6 +3,13 @@ build/
 install/
 log/
 
+# Vendored librealsense source tree. Cloned here to build pyrealsense2 on
+# ARM64, where Intel ships no wheel. 827MB of someone else's history has no
+# business in this repo's -- and it sits directly in the path of the `git add
+# -A` this project commits with, so it is ignored rather than merely
+# uncommitted. See the README for what to do with it.
+librealsense/
+
 # Python
 __pycache__/
 *.pyc

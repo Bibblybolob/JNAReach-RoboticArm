@@ -427,10 +427,10 @@ class CameraNode(Node):
                 'source:=realsense needs pyrealsense2, which is not '
                 'installed:\n'
                 '    pip install pyrealsense2\n'
-                'On Jetson/ARM64 there are no official wheels -- build '
-                'librealsense from source with -DBUILD_PYTHON_BINDINGS=ON, '
-                'the same integration risk as MediaPipe on that platform. '
-                'This node will publish nothing until then.')
+                'PyPI serves an aarch64 wheel, so this works on a Jetson '
+                'without building librealsense. This node publishes nothing '
+                'until it is installed; the mjpeg and device sources are '
+                'unaffected.')
             return
 
         width = int(self.get_parameter('rs_width').value)

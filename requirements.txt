@@ -35,12 +35,13 @@ opencv-contrib-python<5
 pymycobot
 requests
 
-# Only needed for source:=realsense. Deliberately NOT a hard dependency: the
-# mjpeg and device paths are unaffected by its absence, and on Jetson/ARM64
-# there is no official wheel, so requiring it here would break install on the
-# platform this project is moving to. camera_node reports it as missing and
-# keeps running.
+# Only needed for source:=realsense, and left optional because the mjpeg and
+# device paths are unaffected by its absence -- camera_node reports it missing
+# and keeps running rather than failing to start.
 #
 #   pip install pyrealsense2
 #
-# On ARM64, build librealsense from source with -DBUILD_PYTHON_BINDINGS=ON.
+# PyPI DOES serve an aarch64 wheel (checked at 2.58.3), so this installs on a
+# Jetson without building librealsense from source. Earlier notes here said
+# otherwise and were wrong; a source build is now only needed if you want a
+# backend or a version the wheel does not carry.

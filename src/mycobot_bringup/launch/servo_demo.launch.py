@@ -379,6 +379,13 @@ def generate_launch_description():
                     'steadiest point on a hand because it does not move when '
                     'fingers flex. 8 is the index fingertip -- more precise '
                     'to point with, but it makes the arm chase finger jitter')
+    reprobe_after_arg = DeclareLaunchArgument(
+        'reprobe_after', default_value='20',
+        description='Consecutive growing updates before re-measuring the '
+                    'Jacobian. A moving hand produces six routinely, so this '
+                    'has to sit well above the sign heuristic.')
+    reprobe_cooldown_arg = DeclareLaunchArgument(
+        'reprobe_cooldown', default_value='20.0')
     aim_down_arg = DeclareLaunchArgument(
         'aim_offset_down_m', default_value='0.0',
         description='Hold the camera this many METRES below the target rather '
@@ -527,6 +534,8 @@ def generate_launch_description():
             'max_frame_age': _f('max_frame_age'),
             'probe_retries': _i('probe_retries'),
             'max_reprobes': _i('max_reprobes'),
+            'reprobe_after': _i('reprobe_after'),
+            'reprobe_cooldown': _f('reprobe_cooldown'),
             'aim_offset_down_m': _f('aim_offset_down_m'),
             'aim_offset_right_m': _f('aim_offset_right_m'),
             'aim_range_m': _f('aim_range_m'),
@@ -622,6 +631,8 @@ def generate_launch_description():
         delegate_arg,
         hand_model_arg,
         target_landmark_arg,
+        reprobe_after_arg,
+        reprobe_cooldown_arg,
         aim_down_arg,
         aim_right_arg,
         aim_range_arg,

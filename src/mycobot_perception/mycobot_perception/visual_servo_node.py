@@ -547,6 +547,12 @@ class VisualServoNode(Node):
         # re-measure when tracking stops converging. Bounded so a genuinely
         # bad mounting does not re-probe forever.
         self.declare_parameter('max_reprobes', 4)
+        # Consecutive growing updates before a re-probe. Well above the sign
+        # heuristic's 6: a moving hand produces six of these routinely.
+        self.declare_parameter('reprobe_after', 20)
+        # And never twice inside this many seconds -- a probe costs about five
+        # and gives up the lock while it runs.
+        self.declare_parameter('reprobe_cooldown', 20.0)
         # --- Metric aim offset, for hovering off a target rather than on it.
         # Metres. Positive down_m holds the camera that far BELOW the target.
         self.declare_parameter('aim_offset_down_m', 0.0)
@@ -869,6 +875,11 @@ class VisualServoNode(Node):
             self.get_parameter('aim_offset_right_m').value)
         self._aim_range_m = float(self.get_parameter('aim_range_m').value)
         self._max_reprobes = int(self.get_parameter('max_reprobes').value)
+        self._reprobe_after = int(self.get_parameter('reprobe_after').value)
+        self._reprobe_cooldown = float(
+            self.get_parameter('reprobe_cooldown').value)
+        self._last_reprobe = 0.0
+        self._probe_abandoned = False
         self._probe_retries = int(
             self.get_parameter('probe_retries').value)
         self._probing = False
@@ -1917,8 +1928,19 @@ class VisualServoNode(Node):
         # re-measuring at the current pose is the correct response. Flipping
         # an axis is not: after a probe the matrix is off-diagonal and there
         # is no per-axis sign to flip.
-        if not self._skip_probe and max(self._growing) >= 6:
+        # Deliberately much less trigger-happy than the sign heuristic below.
+        # At 6 updates this fired constantly -- error grows for six detections
+        # any time a hand moves -- and the servo spent the whole run probing
+        # instead of tracking: probe, track, re-probe, fail, fall back,
+        # re-probe. A re-probe costs ~5 seconds and abandons the lock, so it
+        # has to be reserved for sustained divergence, with a cooldown, and
+        # switched off entirely once probing has already been given up on.
+        now_s = time.monotonic()
+        if (not self._skip_probe and not self._probe_abandoned
+                and max(self._growing) >= self._reprobe_after
+                and now_s - self._last_reprobe > self._reprobe_cooldown):
             if self._reprobes < self._max_reprobes:
+                self._last_reprobe = now_s
                 self._reprobes += 1
                 self._growing = [0, 0]
                 self.get_logger().warn(
@@ -2034,6 +2056,7 @@ class VisualServoNode(Node):
                         f'diagonal matrix and WRONG if the camera is mounted '
                         f'rotated -- expect it to steer badly. Restart the '
                         f'hunt to try probing again.')
+                    self._probe_abandoned = True
                     self._assume_orientation()
             self._had_lock = True
             self._set_state(TRACKING)

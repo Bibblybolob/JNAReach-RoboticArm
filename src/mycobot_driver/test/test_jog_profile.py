@@ -50,7 +50,8 @@ def _load(*names):
 
 
 _NS = _load('profile_step', '_jog_profile_tick', '_jog_reset_profile',
-            '_publish_jog_applied', '_step_speed')
+            '_publish_jog_applied', '_step_speed',
+              '_send_angles')
 profile_step = _NS['profile_step']
 
 
@@ -253,9 +254,11 @@ def test_faster_acceleration_arrives_sooner():
 class _StubArm:
     def __init__(self):
         self.sent = []
+        self.async_flags = []
 
-    def send_angles(self, angles, speed):
+    def send_angles(self, angles, speed, _async=False):
         self.sent.append((list(angles), speed))
+        self.async_flags.append(_async)
 
 
 class _StubLog:
@@ -283,6 +286,10 @@ class _StubNode:
         self._jog_vel = [0.0] * 6
         self._jog_lookahead = 0.12
         self._jog_cmd_deg = [0.0] * 6
+        # The driver routes every command through _send_angles now, which asks
+        # for a non-blocking write on the serial path. Default to serial here
+        # because that is the configuration this project runs.
+        self._async_commands = True
         self._jog_target_deg = list(target) if target else [0.0] * 6
         self._joint_limits_deg = [(-168.0, 168.0)] * 6
         self._adaptive_jog_speed = True
@@ -318,7 +325,7 @@ class _StubNode:
 
 
 for _n in ('profile_step', '_jog_profile_tick', '_jog_reset_profile',
-           '_step_speed'):
+           '_step_speed', '_send_angles'):
     setattr(_StubNode, _n, _NS[_n])
 _StubNode.profile_step = staticmethod(_NS['profile_step'])
 
@@ -424,6 +431,36 @@ def test_the_jog_chain_compounds_off_the_profile_not_the_lookahead():
     for _ in range(3):
         n._jog_profile_tick()
     assert abs(math.degrees(n._last_angles_rad[0]) - n._jog_cmd_deg[0]) < 1e-9
+
+
+def test_serial_commands_do_not_wait_for_a_reply():
+    """pymycobot marks SEND_ANGLES has_reply=True, so without _async it goes
+    into _res -> _read and blocks on the port until the serial timeout. There
+    is no reply to collect: measured on a Jetson driving /dev/ttyTHS1,
+    get_angles returns in 12.9ms while send_angles hangs indefinitely.
+
+    Blocking on every jog caps the driver below its own command_interval and
+    the arm falls behind its commanded goal -- which surfaces as `Jog target
+    pinned to the measured pose` and reads as a slow arm rather than a
+    blocking write."""
+    n = _StubNode(target=[60.0, 0, 0, 0, 0, 0])
+    n._jog_profile_tick()
+    assert n._mc.async_flags, 'nothing was commanded'
+    assert all(n._mc.async_flags), \
+        f'serial path waited for a reply: {n._mc.async_flags}'
+    print('  serial: send_angles(_async=True), never blocks on a read')
+
+
+def test_tcp_commands_are_left_exactly_as_they_were():
+    """The Pi's server.py mediates the TCP path and it has years of use behind
+    it, so it keeps the blocking call rather than being changed untested."""
+    n = _StubNode(target=[60.0, 0, 0, 0, 0, 0])
+    n._async_commands = False
+    n._jog_profile_tick()
+    assert n._mc.async_flags, 'nothing was commanded'
+    assert not any(n._mc.async_flags), \
+        f'tcp path changed behaviour: {n._mc.async_flags}'
+    print('  tcp: unchanged')
 
 
 if __name__ == '__main__':

@@ -304,6 +304,9 @@ class MyCobotHardwareNode(Node):
             'serial_port').get_parameter_value().string_value
         self._serial_baud = self.get_parameter(
             'serial_baud').get_parameter_value().integer_value
+        # Serial talks to the arm directly, where SEND_ANGLES has no reply to
+        # wait for. See _send_angles.
+        self._async_commands = (self._connection == 'serial')
         if self._connection not in ('tcp', 'serial'):
             raise ValueError(
                 f"connection must be 'tcp' or 'serial', got "
@@ -974,7 +977,7 @@ class MyCobotHardwareNode(Node):
 
         try:
             with self._lock:
-                mc.send_angles(target_deg, speed)
+                self._send_angles(mc, target_deg, speed)
             self._last_tx_time = time.monotonic()
             # Name the requested joint and its delta, not just the resulting
             # target vector. Without that there is no way to tell "the jog
@@ -1192,7 +1195,7 @@ class MyCobotHardwareNode(Node):
 
         try:
             with self._lock:
-                mc.send_angles(target_deg, speed)
+                self._send_angles(mc, target_deg, speed)
             self._last_tx_time = time.monotonic()
             self._last_jog_time = time.monotonic()
             # The PROFILED position, not the lookahead-extended command:
@@ -1214,6 +1217,32 @@ class MyCobotHardwareNode(Node):
         except Exception as e:
             self.get_logger().warn(
                 f'jog rejected: {e}', throttle_duration_sec=2.0)
+
+    def _send_angles(self, mc, angles_deg, speed) -> None:
+        """send_angles, without waiting for a reply that never comes.
+
+        pymycobot marks SEND_ANGLES has_reply=True, so by default _mesg goes
+        into _res -> _read and blocks on the port until the serial timeout
+        expires. Measured on a Jetson driving /dev/ttyTHS1 directly: get_angles
+        returns in 12.9ms because the arm really answers it, while send_angles
+        hangs -- there is no reply to collect.
+
+        That blocks the command thread on EVERY jog. At a 60ms
+        command_interval it caps the driver well below its own rate and the arm
+        falls behind its commanded goal, which the divergence leash then
+        reports as `Jog target pinned to the measured pose`. It reads as a slow
+        arm rather than as a blocking write, because nothing else in the
+        pipeline looks wrong.
+
+        _async=True writes and returns, which is what a fire-and-forget motion
+        command wants. Applied on the SERIAL path only: over TCP the Pi's
+        server.py mediates and that path has years of use behind it, so it is
+        left exactly as it was rather than changed untested.
+        """
+        if self._async_commands:
+            mc.send_angles(angles_deg, speed, _async=True)
+        else:
+            mc.send_angles(angles_deg, speed)
 
     def _publish_jog_applied(self, applied) -> None:
         """Report what was actually commanded, not what was asked for.
@@ -1376,7 +1405,7 @@ class MyCobotHardwareNode(Node):
             self._jog_reset_profile()
             try:
                 with self._lock:
-                    self._mc.send_angles(final_deg, self._speed)
+                    self._send_angles(self._mc, final_deg, self._speed)
                 self._wait_until_reached(
                     final_deg, tolerance_deg=self._settle_tol,
                     timeout=self._settle_timeout,
@@ -1438,7 +1467,7 @@ class MyCobotHardwareNode(Node):
 
                 try:
                     with self._lock:
-                        self._mc.send_angles(target_deg, speed)
+                        self._send_angles(self._mc, target_deg, speed)
                     self._last_tx_time = time.monotonic()
                 except OSError as e:
                     # A dropped command on an otherwise-live link is
@@ -1475,10 +1504,10 @@ class MyCobotHardwareNode(Node):
             self._cmd_positions = list(points[-1].positions)
             try:
                 with self._lock:
-                    self._mc.send_angles(
-                        final_deg,
-                        self._step_speed(prev_deg, final_deg, self._cmd_interval),
-                    )
+                    self._send_angles(
+                        self._mc, final_deg,
+                        self._step_speed(prev_deg, final_deg,
+                                         self._cmd_interval))
             except OSError as e:
                 self._handle_link_error(e, 'trajectory final position')
             except Exception as e:
@@ -1575,7 +1604,7 @@ class MyCobotHardwareNode(Node):
         self._jog_reset_profile()
         try:
             with self._lock:
-                self._mc.send_angles(target, self._home_speed)
+                self._send_angles(self._mc, target, self._home_speed)
             reached = self._wait_until_reached(
                 target,
                 tolerance_deg=self._settle_tol,

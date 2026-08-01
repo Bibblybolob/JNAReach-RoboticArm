@@ -72,12 +72,40 @@ def measure_round_trip(mc, n=30):
     }
 
 
+ASYNC = {'on': False}
+
+
+def send(mc, angles, speed):
+    """Command the arm the way the DRIVER does.
+
+    pymycobot marks SEND_ANGLES has_reply=True, so the default call blocks in
+    _res -> _read until the serial timeout, waiting for a reply the arm never
+    sends. Measured on a Jetson at /dev/ttyTHS1: 1550ms per command. Timing
+    anything through that measures the timeout, not the arm -- the joint-speed
+    sweep in particular came back with 100, 60 and 30 all taking an identical
+    1.69s, because the block dwarfed the motion.
+    """
+    if ASYNC['on']:
+        return mc.send_angles(angles, speed, _async=True)
+    return mc.send_angles(angles, speed)
+
+
+def measure_blocking_send(mc, angles, n=5):
+    """What a non-async send costs, reported as a fault rather than a spec."""
+    times = []
+    for _ in range(n):
+        t0 = time.monotonic()
+        send(mc, angles, 20)
+        times.append((time.monotonic() - t0) * 1000.0)
+    return statistics.median(times)
+
+
 def measure_send_cost(mc, angles, n=20):
     """Time send_angles(), which should be fire-and-forget (not in has_return)."""
     times = []
     for _ in range(n):
         t0 = time.monotonic()
-        mc.send_angles(angles, 20)
+        send(mc, angles, 20)
         times.append((time.monotonic() - t0) * 1000.0)
         time.sleep(0.05)
     times.sort()
@@ -94,12 +122,12 @@ def measure_joint_speed(mc, start, sweep_deg, speed, settle=3.0):
     target = list(start)
     target[0] = start[0] + sweep_deg
 
-    mc.send_angles(list(start), 50)
+    send(mc, list(start), 50)
     time.sleep(settle)
 
     begin = mc.get_angles()
     t0 = time.monotonic()
-    mc.send_angles(target, speed)
+    send(mc, target, speed)
 
     # Poll until motion stops rather than until the target is hit: the arm may
     # stop short, and we want the speed it actually achieved.
@@ -148,6 +176,7 @@ def main():
     if args.serial_port:
         print(f'Connecting over serial: {args.serial_port} at {args.baud} ...')
         mc = MyCobot280(args.serial_port, str(args.baud))
+        ASYNC['on'] = True
     else:
         print(f'Connecting to {args.ip}:{args.port} ...')
         mc = MyCobot280Socket(args.ip, args.port)
@@ -162,6 +191,15 @@ def main():
     rt = measure_round_trip(mc)
     print(f'  get_angles()  min {rt["min"]:6.1f}ms   median {rt["median"]:6.1f}ms   '
           f'p95 {rt["p95"]:6.1f}ms   max {rt["max"]:6.1f}ms')
+    if ASYNC['on']:
+        blocking = measure_blocking_send(mc, start)
+        print(f'  send_angles() blocking  {blocking:6.1f}ms median  '
+              f'<- waiting for a reply that never comes')
+        if blocking > 100.0:
+            print(f'     that is the serial timeout, not the arm. The driver '
+                  f'passes _async=True to skip it;')
+            print(f'     everything below is measured the same way, or it '
+                  f'would time the timeout instead.')
     st = measure_send_cost(mc, start)
     print(f'  send_angles() min {st["min"]:6.1f}ms   median {st["median"]:6.1f}ms   '
           f'p95 {st["p95"]:6.1f}ms   max {st["max"]:6.1f}ms')
@@ -190,7 +228,7 @@ def main():
         print(f'  speed={speed:3d}: {travelled:5.1f} deg in {elapsed:4.2f}s '
               f'= {deg_s:6.1f} deg/s')
 
-    mc.send_angles(list(start), 40)
+    send(mc, list(start), 40)
     print('\n  returning to starting pose...')
     time.sleep(3)
 

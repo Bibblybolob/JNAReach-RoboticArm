@@ -224,16 +224,19 @@ def test_wide_lens_is_flagged():
     log = Recorder()
     node = build_node(PARAMS, log)
     run_reader_once(node)
-    assert log.has('wider than the one the servo was tuned'), log.lines
-    assert log.has('skip_probe'), 'should name the fix'
-    print(f'  fx={fx:.0f} (87 deg lens) -> warned, and named skip_probe')
+    assert log.has('wider than the ~25/19 deg'), log.lines
+    assert log.has('assumed_deg_per_error'), 'should name the parameter'
+    # The direction is the part that was wrong once: a wider lens means an
+    # assumed value that is too SMALL, i.e. under-commanding.
+    assert log.has('% of what centring needs'), log.lines
+    print(f'  fx={fx:.0f} (87 deg lens) -> warned, named the shortfall')
 
     # And a narrow lens must NOT warn, or the warning is noise.
     narrow = (640 / 2.0) / math.tan(math.radians(50 / 2.0))
     sys.modules['pyrealsense2'] = make_fake_rs(fx=narrow, fy=narrow)
     log2 = Recorder()
     run_reader_once(build_node(PARAMS, log2))
-    assert not log2.has('wider than the one the servo'), log2.lines
+    assert not log2.has('wider than the ~25/19 deg'), log2.lines
     print(f'  fx={narrow:.0f} (50 deg lens) -> silent, as it should be')
 
 

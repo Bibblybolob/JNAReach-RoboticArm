@@ -531,14 +531,20 @@ class CameraNode(Node):
         self._d = [float(c) for c in coeffs]
 
     def _warn_field_of_view(self, fx, fy, width, height):
-        """The servo's tuning is tied to the lens, not just the pixel count.
+        """Report the real field of view, which the servo needs as geometry.
 
-        Its error is normalised per axis, so "1.0" means the frame edge on any
-        camera -- but how many DEGREES the edge is away depends entirely on the
-        field of view. The published gains were fitted against a webcam whose
-        edges are ~25 and ~19 degrees out. A D405 is roughly 87x58 degrees,
-        i.e. near double, so the same normalised error means about twice the
-        rotation and the loop will over-command by that factor.
+        The servo's error is normalised per axis, so "1.0" means the frame edge
+        on any camera -- but how many DEGREES the edge is away is a property of
+        the lens. Its `assumed_deg_per_error` was a hand-set 25 because no
+        intrinsics existed. On this path they do, and the servo takes them off
+        CameraInfo automatically (auto_deg_per_error).
+
+        The direction matters and is easy to get backwards: a WIDER lens means
+        the edge is FURTHER away in degrees, so an assumed value that is too
+        SMALL scales every command down. It under-corrects, the error never
+        closes, and the arm parks far enough out that the progressive gain
+        holds it against the max_step_deg clamp -- which then presents as jitter
+        rather than as sluggishness.
         """
         import math
         h_deg = math.degrees(math.atan2(width / 2.0, fx))
@@ -548,11 +554,14 @@ class CameraNode(Node):
             f'{v_deg:.0f} deg vertically')
         if h_deg > 32.0:
             self.get_logger().warn(
-                f'This lens is much wider than the one the servo was tuned '
-                f'against (~25 deg horizontal, ~19 vertical). A normalised '
-                f'error means ~{h_deg / 25.0:.1f}x as much rotation, so the '
-                f'loop will over-command and may oscillate. Re-measure with '
-                f'skip_probe:=false before trusting the gains.')
+                f'This lens is wider than the ~25/19 deg the servo gains were '
+                f'fitted against, so a hand-set assumed_deg_per_error would '
+                f'command only {25.0 / h_deg * 100:.0f}% of what centring '
+                f'needs. visual_servo_node should be taking {h_deg:.0f}/'
+                f'{v_deg:.0f} off CameraInfo -- check its log says so, and if '
+                f'auto_deg_per_error is off, pass '
+                f'assumed_deg_per_error:={h_deg:.0f} '
+                f'assumed_v_deg_per_error:={v_deg:.0f}.')
 
     def _stream_reader(self):
         """Runs in a background thread: continuously reads the MJPEG

@@ -23,6 +23,7 @@ rather than a transcription of it.
 """
 
 import ast
+import math
 import os
 
 import numpy as np
@@ -32,7 +33,8 @@ SRC = os.path.join(
     '..', 'mycobot_perception', 'visual_servo_node.py')
 
 WANTED = ('_record_sent', '_sent_between', '_compensate', '_set_jacobian',
-          '_reset_sign_estimate', '_update_sign_estimate', '_update_velocity')
+          '_reset_sign_estimate', '_update_sign_estimate', '_update_velocity',
+          '_deg_from_intrinsics')
 
 GAIN = 0.7
 DEG = 25.0
@@ -46,7 +48,9 @@ def _load():
              if isinstance(n, ast.FunctionDef) and n.name in WANTED]
     missing = set(WANTED) - {f.name for f in funcs}
     assert not missing, f'not found in visual_servo_node: {sorted(missing)}'
-    ns = {'np': np}
+    # CameraInfo appears only in an annotation, which Python evaluates at
+    # def time; a placeholder is enough to let the function compile.
+    ns = {'np': np, 'math': math, 'CameraInfo': object}
     exec(compile(ast.Module(body=funcs, type_ignores=[]), SRC, 'exec'), ns)
     return ns
 
@@ -492,3 +496,75 @@ if __name__ == '__main__':
             print(f'PASS  {name}')
             passed += 1
     print(f'\n{passed} passed')
+
+
+# ---------------------------------------------------------------------------
+# assumed_deg_per_error taken from CameraInfo (auto_deg_per_error)
+# ---------------------------------------------------------------------------
+
+def _info(fx, fy, w=640, h=480, k=None):
+    import types
+    return types.SimpleNamespace(
+        k=(k if k is not None else [fx, 0, w / 2, 0, fy, h / 2, 0, 0, 1]),
+        width=w, height=h)
+
+
+def _cam_node(auto=True, already=False, probed=False, skip=True):
+    s = _Servo()
+    s._auto_deg, s._deg_from_camera = auto, already
+    s._assumed_deg, s._assumed_v_deg = 25.0, 19.0
+    s._assumed_h_sign = s._assumed_v_sign = 1.0
+    s._probed, s._skip_probe = probed, skip
+    s._rebuilt = None
+    s.get_logger = lambda: _Log()
+    s._set_jacobian = lambda j: setattr(s, '_rebuilt', j)
+    return s
+
+
+def test_deg_per_error_comes_from_the_lens_not_a_guess():
+    """Regression for a real failure. The servo was told an edge target sits
+    25 deg away while a D405 puts it at 39, so every command was scaled to
+    25/39 = 64% of what centring needs: the error never closed, the arm stayed
+    far enough out that the progressive gain held it against max_step_deg, and
+    every jog logged the same +5.00. That reads as an unstable loop and is
+    really a wrong lens."""
+    s = _cam_node()
+    s._deg_from_intrinsics(_info(393.8, 393.4))     # measured on the board
+    assert round(s._assumed_deg) == 39, s._assumed_deg
+    assert round(s._assumed_v_deg) == 31, s._assumed_v_deg
+    assert s._deg_from_camera is True
+
+    s = _cam_node()
+    s._deg_from_intrinsics(_info(686.0, 686.0))     # the original webcam
+    assert round(s._assumed_deg) == 25, s._assumed_deg
+    assert round(s._assumed_v_deg) == 19, s._assumed_v_deg
+
+
+def test_auto_deg_per_error_can_be_turned_off():
+    s = _cam_node(auto=False)
+    s._deg_from_intrinsics(_info(393.8, 393.4))
+    assert s._assumed_deg == 25.0
+
+
+def test_intrinsics_are_taken_once_not_every_message():
+    s = _cam_node(already=True)
+    s._deg_from_intrinsics(_info(393.8, 393.4))
+    assert s._assumed_deg == 25.0
+
+
+def test_unusable_intrinsics_are_ignored():
+    for bad in ([0.0, 0, 320, 0, 0.0, 240, 0, 0, 1], [1.0, 0]):
+        s = _cam_node()
+        s._deg_from_intrinsics(_info(0, 0, k=bad))
+        assert s._assumed_deg == 25.0, f'accepted k={bad}'
+
+
+def test_a_guessed_jacobian_is_rebuilt_but_a_measured_one_is_not():
+    s = _cam_node(probed=True, skip=True)
+    s._deg_from_intrinsics(_info(393.8, 393.4))
+    assert s._rebuilt is not None, 'skip-probe Jacobian not rebuilt'
+    assert round(float(s._rebuilt[0][0])) == 39, s._rebuilt
+
+    s = _cam_node(probed=True, skip=False)
+    s._deg_from_intrinsics(_info(393.8, 393.4))
+    assert s._rebuilt is None, 'clobbered a measured probe'

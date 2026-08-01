@@ -556,6 +556,12 @@ class VisualServoNode(Node):
         # at the frame edge (error 1.0) to the centre takes about half the
         # camera's field of view. ~50 deg horizontal FOV on a typical webcam
         # puts that at 25. `gain` then applies a fraction of it.
+        # Derive assumed_deg_per_error from CameraInfo when the intrinsics
+        # are real, which they are under source:=realsense. Geometry belongs
+        # to the lens, not to the tuning, and guessing it wrong presents as an
+        # unstable loop rather than as a wrong number. See
+        # _deg_from_intrinsics.
+        self.declare_parameter('auto_deg_per_error', True)
         self.declare_parameter('assumed_deg_per_error', 25.0)
         # Same number for the VERTICAL axis, when it differs. 0 means "use
         # assumed_deg_per_error for both", which is the old behaviour.
@@ -743,6 +749,9 @@ class VisualServoNode(Node):
             self.get_parameter('assumed_deg_per_error').value)
         # 0 is the "same as horizontal" sentinel, so the single-number case
         # keeps working untouched.
+        self._auto_deg = bool(
+            self.get_parameter('auto_deg_per_error').value)
+        self._deg_from_camera = False
         self._assumed_v_deg = float(
             self.get_parameter('assumed_v_deg_per_error').value)
         if self._assumed_v_deg <= 0.0:
@@ -1057,6 +1066,59 @@ class VisualServoNode(Node):
         if self._width is None and msg.width > 0 and msg.height > 0:
             self._width, self._height = msg.width, msg.height
             self.get_logger().info(f'Frame size: {msg.width}x{msg.height}')
+        self._deg_from_intrinsics(msg)
+
+    def _deg_from_intrinsics(self, msg: CameraInfo) -> None:
+        """Take degrees-per-unit-error from the camera rather than a guess.
+
+        `assumed_deg_per_error` is geometry, not tuning: it is how far the arm
+        must rotate to bring a target at the frame edge to the centre, which is
+        half the horizontal field of view and nothing to do with the control
+        law. It was a hand-set 25 because no source of camera intrinsics
+        existed -- calibrate_camera.py has never been run.
+
+        A RealSense supplies factory intrinsics with the stream, so the real
+        figure is now available and there is no reason to guess. On a D405 at
+        640x480 it is 39 degrees horizontally and 31 vertically, against the
+        25/19 of the webcam these gains were fitted to.
+
+        Getting this wrong does NOT show up as bad tuning, which is what makes
+        it worth deriving rather than documenting. Too small and every command
+        is scaled down by the ratio -- 25/39 is 64% of what is needed -- so the
+        error never closes, the arm sits far enough out that the progressive
+        gain drives it into the max_step_deg clamp, and every jog logs the same
+        +5.00. The lag compensator then books the shortfall as the TARGET
+        moving, leads harder, and `aim=` drifts further from centre than
+        `seen=`. That looks like an unstable loop and is really a wrong lens.
+        """
+        if not self._auto_deg or self._deg_from_camera:
+            return
+        if len(msg.k) < 5 or msg.width <= 0 or msg.height <= 0:
+            return
+        fx, fy = float(msg.k[0]), float(msg.k[4])
+        if fx <= 0.0 or fy <= 0.0:
+            return
+
+        h = math.degrees(math.atan2(msg.width / 2.0, fx))
+        v = math.degrees(math.atan2(msg.height / 2.0, fy))
+        old_h, old_v = self._assumed_deg, self._assumed_v_deg
+        self._assumed_deg, self._assumed_v_deg = h, v
+        self._deg_from_camera = True
+        self.get_logger().info(
+            f'Camera intrinsics give {h:.0f}deg horizontally and {v:.0f}deg '
+            f'vertically per unit error (was {old_h:.0f}/{old_v:.0f}). '
+            f'fx={fx:.1f} fy={fy:.1f}. Set auto_deg_per_error:=false to use '
+            f'the assumed_* parameters instead.')
+
+        # If we already committed to a Jacobian from the assumed values, it is
+        # built on the wrong ones -- rebuild. A measured probe outranks this,
+        # so leave it alone once _probe has run.
+        if self._probed and self._skip_probe:
+            self._set_jacobian(np.array(
+                [[self._assumed_deg * self._assumed_h_sign, 0.0],
+                 [0.0, self._assumed_v_deg * self._assumed_v_sign]],
+                dtype=float))
+            self.get_logger().info('Rebuilt the Jacobian on the real values.')
 
     def _point_cb(self, msg: PointStamped) -> None:
         if not self._ever_received_point:

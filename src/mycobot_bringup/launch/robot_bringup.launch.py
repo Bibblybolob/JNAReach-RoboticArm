@@ -69,7 +69,7 @@ def generate_launch_description():
     # file, and forwarded from servo_demo so one command can move the camera
     # off the Pi entirely.
     source_arg = DeclareLaunchArgument(
-        'source', default_value='mjpeg', choices=['mjpeg', 'device'],
+        'source', default_value='mjpeg', choices=['mjpeg', 'device', 'realsense'],
         description="'mjpeg' reads the Pi's stream; 'device' opens a camera "
                     'plugged into THIS machine, which removes the encode, '
                     'the network hop and the decode rather than speeding '

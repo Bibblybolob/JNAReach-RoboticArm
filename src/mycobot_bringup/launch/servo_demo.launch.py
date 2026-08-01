@@ -274,6 +274,15 @@ def generate_launch_description():
         'serial_port', default_value='/dev/ttyUSB0')
     serial_baud_arg = DeclareLaunchArgument(
         'serial_baud', default_value='1000000')
+    max_jog_deg_arg = DeclareLaunchArgument(
+        'max_jog_deg', default_value='5.0',
+        description="Driver ceiling on a single jog. Must be >= the servo's "
+                    'max_step_deg or steps are clipped while the servo still '
+                    'credits them in full.')
+    max_jog_speed_arg = DeclareLaunchArgument(
+        'max_jog_speed_deg_s', default_value='80.0',
+        description='Ceiling on jog velocity. The arm measures 52 deg/s at '
+                    'speed=100, so above that is headroom rather than speed.')
     command_interval_arg = DeclareLaunchArgument(
         'command_interval', default_value='0.06',
         description='Seconds between streamed arm commands. 0.06 is safe on '
@@ -436,6 +445,8 @@ def generate_launch_description():
             'device_width': LaunchConfiguration('device_width'),
             'device_height': LaunchConfiguration('device_height'),
             'command_interval': LaunchConfiguration('command_interval'),
+            'max_jog_deg': LaunchConfiguration('max_jog_deg'),
+            'max_jog_speed_deg_s': LaunchConfiguration('max_jog_speed_deg_s'),
             'speed_at_100_deg_s': LaunchConfiguration('speed_at_100_deg_s'),
             'rs_width': LaunchConfiguration('rs_width'),
             'rs_height': LaunchConfiguration('rs_height'),
@@ -550,6 +561,8 @@ def generate_launch_description():
         device_exposure_arg,
         device_fps_arg,
         device_width_arg,
+        max_jog_deg_arg,
+        max_jog_speed_arg,
         command_interval_arg,
         speed_at_100_arg,
         rs_width_arg,

@@ -92,6 +92,9 @@ def generate_launch_description():
     device_width_arg = DeclareLaunchArgument('device_width', default_value='640')
     # Driver timing. Both were hardcoded here, which silently overrode the
     # node's own declared defaults -- changing the node did nothing.
+    max_jog_deg_arg = DeclareLaunchArgument('max_jog_deg', default_value='5.0')
+    max_jog_speed_arg = DeclareLaunchArgument(
+        'max_jog_speed_deg_s', default_value='80.0')
     command_interval_arg = DeclareLaunchArgument(
         'command_interval', default_value='0.06')
     speed_at_100_arg = DeclareLaunchArgument(
@@ -158,6 +161,8 @@ def generate_launch_description():
             'publish_rate_during_motion': 2.0,
             'default_speed': 80,
             'command_interval': _f('command_interval'),
+            'max_jog_deg': _f('max_jog_deg'),
+            'max_jog_speed_deg_s': _f('max_jog_speed_deg_s'),
             'lookahead': 0.12,
             'trajectory_speed': 60,
             # Scale each streaming step's speed to its size rather than using
@@ -242,6 +247,8 @@ def generate_launch_description():
         device_exposure_arg,
         device_fps_arg,
         device_width_arg,
+        max_jog_deg_arg,
+        max_jog_speed_arg,
         command_interval_arg,
         speed_at_100_arg,
         rs_width_arg,

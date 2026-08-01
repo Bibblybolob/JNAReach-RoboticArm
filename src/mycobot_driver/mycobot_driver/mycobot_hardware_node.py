@@ -959,7 +959,20 @@ class MyCobotHardwareNode(Node):
             idx = self.JOINT_NAMES.index(name)
             # Cap any single step. A bad detection should nudge the arm, not
             # fling it across the workspace.
-            delta = max(-self._max_jog_deg, min(self._max_jog_deg, float(delta)))
+            requested = float(delta)
+            delta = max(-self._max_jog_deg, min(self._max_jog_deg, requested))
+            # Say so when it bites. The servo's lag compensator credits the
+            # jog it ASKED for, so a step quietly clipped here makes the loop
+            # believe corrections landed that never did, and it under-drives
+            # the arm for as long as the mismatch lasts. Raising the servo's
+            # max_step_deg past this value is the usual way in.
+            if abs(requested) - abs(delta) > 1e-6:
+                self.get_logger().warn(
+                    f'Clipped {name} jog {requested:+.2f} to {delta:+.2f}: '
+                    f'max_jog_deg is {self._max_jog_deg:.1f}. The servo still '
+                    f'credits the full request, so raise max_jog_deg to at '
+                    f'least the servo\'s max_step_deg or lower max_step_deg '
+                    f'to match.', throttle_duration_sec=5.0)
             lo, hi = self._joint_limits_deg[idx]
             # Clamp to the joint's travel. This is not about being cautious
             # with the workspace -- driving a servo into its hard stop and

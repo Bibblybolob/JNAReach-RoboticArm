@@ -251,9 +251,24 @@ one to hand.
 it gives you the wired link this project keeps wishing it had, and it is the
 one option that fixes the underlying problem rather than working around it.
 
-**Phone USB tethering** gets the board online in seconds once you have a
-shell: plug the phone in, enable USB tethering, NetworkManager picks it up.
-Handy for the apt and pip steps even if WiFi is the long-term answer.
+**Phone tethering** gets the board online in seconds once you have a shell,
+which is handy for the apt and pip steps even if WiFi is the long-term answer.
+On **Android**, plug the phone into a USB-A port and turn on Settings →
+Hotspot & tethering → USB tethering; the toggle is greyed out until the cable
+is in, and NetworkManager takes a lease with nothing installed.
+
+On **iPhone it is a catch-22** — Linux needs `usbmuxd` and
+`libimobiledevice` to reach a Personal Hotspot over USB, and installing them
+needs the internet you are trying to obtain. Use the phone's **WiFi** hotspot
+instead, which needs no packages at all:
+
+```bash
+sudo nmcli device wifi connect "YOUR_PHONE_HOTSPOT" --ask
+```
+
+Tethering gets the board *online*; it does not get you *in*. USB device mode
+is still how you get a shell, and the two coexist — the 192.168.55.x link is a
+separate local network and survives the default route moving to the phone.
 
 ### Setting up WiFi
 

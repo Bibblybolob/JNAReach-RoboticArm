@@ -543,6 +543,10 @@ class VisualServoNode(Node):
         # needs the target still and in view while two joints nudge, so a
         # single momentary loss should not end the run.
         self.declare_parameter('probe_retries', 3)
+        # A probed Jacobian is only locally valid on a rotated mounting, so
+        # re-measure when tracking stops converging. Bounded so a genuinely
+        # bad mounting does not re-probe forever.
+        self.declare_parameter('max_reprobes', 4)
         # Start tracking the instant a hand is seen, instead of spending
         # several seconds twitching joints to measure the camera mounting.
         #
@@ -849,6 +853,8 @@ class VisualServoNode(Node):
         self._jinv: np.ndarray | None = None
         self._probed = False
         self._probe_failures = 0
+        self._reprobes = 0
+        self._max_reprobes = int(self.get_parameter('max_reprobes').value)
         self._probe_retries = int(
             self.get_parameter('probe_retries').value)
         self._probing = False
@@ -1853,6 +1859,27 @@ class VisualServoNode(Node):
                     f'swapped. skip_probe:=false measures it properly.',
                     throttle_duration_sec=10.0)
                 self._stuck[i] = 0
+
+        # After a probe, a growing error means the MEASUREMENT no longer
+        # describes this pose -- not that a sign needs flipping. Measured on
+        # hardware from two probes of the same mounting at different joint5
+        # angles: joint5's x-component read +0.078 at ~28deg and -0.178 at
+        # ~50deg. The image Jacobian of a rotated camera varies through the
+        # workspace, so a single 2x2 taken once is only locally valid, and
+        # re-measuring at the current pose is the correct response. Flipping
+        # an axis is not: after a probe the matrix is off-diagonal and there
+        # is no per-axis sign to flip.
+        if not self._skip_probe and max(self._growing) >= 6:
+            if self._reprobes < self._max_reprobes:
+                self._reprobes += 1
+                self._growing = [0, 0]
+                self.get_logger().warn(
+                    f'Error growing since the probe -- the measured Jacobian '
+                    f'no longer fits this pose. Re-probing '
+                    f'({self._reprobes} of {self._max_reprobes}); hold still.')
+                self._probed = False
+                self._set_state(SEARCHING)
+            return
 
         for i, (axis, param) in enumerate(
                 (('horizontal', 'assumed_h_sign'),

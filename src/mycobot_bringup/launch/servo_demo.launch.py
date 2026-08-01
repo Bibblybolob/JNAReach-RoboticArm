@@ -379,6 +379,11 @@ def generate_launch_description():
                     'steadiest point on a hand because it does not move when '
                     'fingers flex. 8 is the index fingertip -- more precise '
                     'to point with, but it makes the arm chase finger jitter')
+    max_reprobes_arg = DeclareLaunchArgument(
+        'max_reprobes', default_value='4',
+        description='Re-measure the Jacobian when tracking stops converging. '
+                    'A rotated camera gives a pose-dependent Jacobian, so one '
+                    'probe is only locally valid.')
     probe_retries_arg = DeclareLaunchArgument(
         'probe_retries', default_value='3',
         description='Probes to attempt before falling back to the assumed '
@@ -511,6 +516,7 @@ def generate_launch_description():
             'target_landmark': _i('target_landmark'),
             'max_frame_age': _f('max_frame_age'),
             'probe_retries': _i('probe_retries'),
+            'max_reprobes': _i('max_reprobes'),
         }],
         output='screen',
         respawn=True,
@@ -603,6 +609,7 @@ def generate_launch_description():
         delegate_arg,
         hand_model_arg,
         target_landmark_arg,
+        max_reprobes_arg,
         probe_retries_arg,
         max_frame_age_arg,
         show_window_arg,

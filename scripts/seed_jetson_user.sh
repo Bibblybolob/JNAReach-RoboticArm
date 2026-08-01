@@ -168,3 +168,15 @@ echo "on this image and will start once $TARGET is reached, so you get both"
 echo "the network and the USB console without touching anything else."
 echo
 echo "    ssh $USERNAME@192.168.55.1        # over the USB-C cable"
+echo
+echo "THEN RESIZE THE FILESYSTEM. The wizard this script replaces also runs"
+echo "nvresizefs, which grows the root partition to fill the card -- so"
+echo "skipping the wizard leaves you on whatever the flash tool created,"
+echo "typically ~22GB of a 64GB card. It fills up partway through installing"
+echo "ROS and reports it as an apt error, which points nowhere near the cause."
+echo
+echo "    sudo /usr/lib/nvidia/resizefs/nvresizefs.sh --max   # report only"
+echo "    sudo /usr/lib/nvidia/resizefs/nvresizefs.sh         # do it"
+echo "    df -h /"
+echo
+echo "It resizes online -- parted, partprobe, resize2fs -- so no reboot."

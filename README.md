@@ -84,6 +84,25 @@ every later step assumes 22.04.
 sudo apt update && sudo apt full-upgrade -y
 ```
 
+**Check the root filesystem actually fills the card:**
+
+```bash
+df -h /
+```
+
+A 64GB card should show ~57G, not 22G. If it shows 22G the partition was
+never grown — normally `nvresizefs` does that during first-boot setup, so any
+route that skips the wizard skips the resize too:
+
+```bash
+sudo /usr/lib/nvidia/resizefs/nvresizefs.sh
+```
+
+Worth doing before anything else. Out of space, `apt` fails partway through
+installing ROS with `You don't have enough free space in
+/var/cache/apt/archives/`, which reads like an apt problem and is not one. It
+resizes online, so no reboot.
+
 ## 2. Claim the UART
 
 ```bash

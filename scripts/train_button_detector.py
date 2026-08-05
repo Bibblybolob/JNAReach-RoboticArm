@@ -30,27 +30,34 @@ def main():
     parser.add_argument('--device', default='0',
                         help='CUDA device index or "cpu"')
     parser.add_argument('--output', default='elevator_buttons.pt')
+    parser.add_argument('--data-yaml', default='',
+                        help='Skip the Roboflow download and train directly '
+                             'on an existing dataset/data.yaml')
     args = parser.parse_args()
 
-    api_key = os.environ.get('ROBOFLOW_API_KEY', '')
-    if not api_key:
-        api_key = input('Roboflow API key: ').strip()
+    if args.data_yaml:
+        data_yaml = args.data_yaml
+        print(f'Using existing dataset: {data_yaml}')
+    else:
+        api_key = os.environ.get('ROBOFLOW_API_KEY', '')
         if not api_key:
-            print('No API key provided.', file=sys.stderr)
-            sys.exit(1)
+            api_key = input('Roboflow API key: ').strip()
+            if not api_key:
+                print('No API key provided.', file=sys.stderr)
+                sys.exit(1)
 
-    workspace = args.workspace or input('Roboflow workspace: ').strip()
-    project = args.project or input('Roboflow project: ').strip()
-    version = args.version or int(input('Dataset version: ').strip())
+        workspace = args.workspace or input('Roboflow workspace: ').strip()
+        project = args.project or input('Roboflow project: ').strip()
+        version = args.version or int(input('Dataset version: ').strip())
 
-    from roboflow import Roboflow
-    rf = Roboflow(api_key=api_key)
-    proj = rf.workspace(workspace).project(project)
-    dataset = proj.version(version).download('yolov11')
-    data_yaml = os.path.join(dataset.location, 'data.yaml')
+        from roboflow import Roboflow
+        rf = Roboflow(api_key=api_key)
+        proj = rf.workspace(workspace).project(project)
+        dataset = proj.version(version).download('yolov11')
+        data_yaml = os.path.join(dataset.location, 'data.yaml')
 
-    print(f'\nDataset downloaded to {dataset.location}')
-    print(f'data.yaml: {data_yaml}')
+        print(f'\nDataset downloaded to {dataset.location}')
+        print(f'data.yaml: {data_yaml}')
 
     from ultralytics import YOLO
     model = YOLO('yolo11n.pt')

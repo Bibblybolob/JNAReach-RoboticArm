@@ -1,8 +1,10 @@
 # JNAReach — myCobot 280 on a Jetson Orin Nano
 
 A ROS 2 Humble workspace that drives a myCobot 280 with an eye-in-hand camera.
-The arm finds a hand, centres it in view, and closes in. Working toward
-pressing elevator buttons autonomously.
+The arm finds a hand, centres it in view, and closes in — that loop is also
+what finds an elevator button, centres on it, and approaches to within a
+couple inches using the D405's depth. See
+[Elevator buttons](#elevator-buttons) below.
 
 Everything runs on one board: the Jetson watches through a RealSense on USB
 and drives the arm through its own UART pins, so **there is no network
@@ -167,6 +169,85 @@ mounted camera.
 
 ---
 
+## Elevator buttons
+
+Same servo loop, a different target. `button_detector_node` runs a
+YOLOv11n model trained on elevator buttons instead of MediaPipe, and
+`detection_bridge_node` turns its detections into the same PointStamped
+contract the hand tracker publishes — the servo does not know the
+difference. The one thing that does change is the approach axis: instead of
+using apparent target size as a range proxy, it reads real depth off the
+D405 and closes in until the button is ~50mm away.
+
+```bash
+ros2 launch mycobot_bringup button_servo.launch.py
+```
+
+The arm homes, then sits idle until a floor is selected:
+
+```bash
+ros2 param set /detection_bridge_node target_label "3"
+```
+
+Any input method can set that parameter — a CLI, a limit-switch morse
+decoder, eventually a microphone. The bridge node does not care which. Leave
+`target_label` empty to have it centre on whichever button it is most
+confident about, useful for testing detection without wiring up selection.
+
+```bash
+ros2 service call /servo/enable std_srvs/srv/SetBool "{data: false}"
+```
+
+stops it at any point, same as hand tracking.
+
+| Argument | Default | Effect |
+|---|---|---|
+| `target_depth_mm` | 50.0 | stop this many mm from the button (~2 inches) |
+| `depth_approach` | true | use D405 depth instead of apparent-size proxy |
+| `model_path` | `elevator_buttons.pt` | trained YOLOv11n weights |
+| `confidence_threshold` | 0.3 | lower than hand tracking — button glyphs are small |
+| `lead_time` | 0.0 | buttons do not move; velocity prediction is pure noise here |
+| `deadband` | 0.02 | tighter than hand tracking for precise centring |
+
+### Training the detector
+
+`button_detector_node` expects a model whose classes are the button labels
+themselves (`"3"`, `"lobby"`, `"open"`, …) — that is what makes floor
+selection a label match rather than an image-space guess.
+
+```bash
+python3 -m venv --system-site-packages .venv-train
+.venv-train/bin/pip install roboflow ultralytics
+.venv-train/bin/python3 scripts/train_button_detector.py \
+    --workspace <roboflow-workspace> --project <roboflow-project> --version <n>
+```
+
+**Use a venv, not the system Python.** `ultralytics` pulls in a NumPy 2 /
+OpenCV 5 `torch` dependency chain, and this project's `cv_bridge` needs
+NumPy < 2 and OpenCV < 5 — installing training deps system-wide silently
+breaks the ROS stack the next time anyone runs `pip install -r
+requirements.txt`. `--system-site-packages` keeps the venv able to see the
+already-installed ROS Python packages while isolating the conflicting ones.
+
+**Expect CPU-only training on this board.** The generic PyPI `torch` wheel
+does not see the Jetson's GPU — `torch.cuda.is_available()` is `False`, even
+though the hardware has one. NVIDIA does publish a JetPack-matched wheel
+(`developer.download.nvidia.com/compute/redist/jp/v61/pytorch/` for
+JetPack 6.1), but it in turn wants cuDNN 9 while the stock JetPack image
+ships cuDNN 8.9 — getting real GPU training working means chasing that too.
+For a few hundred images, CPU training is workable: ~8 minutes/epoch on a
+YOLOv11n at 640px on this board, so budget several hours for 50 epochs. Rerun
+against an already-downloaded dataset with `--data-yaml
+path/to/data.yaml` instead of `--workspace/--project/--version` to skip
+re-fetching from Roboflow.
+
+Once trained, `elevator_buttons.pt` is NOT checked into this repo (see
+`.gitignore`) — copy it somewhere durable and point at it with
+`model_path:=/path/to/elevator_buttons.pt`, or drop it in the workspace root
+where the launch default expects it.
+
+---
+
 ## Topics and services
 
 | Name | Type | Purpose |
@@ -183,6 +264,9 @@ mounted camera.
 | `/camera/depth_raw` | Image | 16UC1 depth, only with `rs_depth:=true` |
 | `/hand/point_px` | PointStamped | x,y = pixel; **z = palm width in pixels** |
 | `/hand/annotated` | Image | landmarks drawn, for debugging |
+| `/perception/button_detections` | Detection2DArray | YOLOv11n button detections, class label = floor/button |
+| `/button/point_px` | PointStamped | x,y = pixel; **z = depth in mm** when `depth_approach:=true` |
+| `target_label` (param on `/detection_bridge_node`) | string | floor to target; empty = highest-confidence any button |
 
 **Only joint1, joint5 and joint3 are ever commanded** — pan, tilt, and approach
 when enabled. Joints 2, 4 and 6 are untouched by design: two DOF centre a
@@ -346,6 +430,16 @@ boards float and the arm reads nothing.
 - Approach is implemented but off by default until tracking is solid.
 - **The 2×2 image Jacobian has never been measured** with `skip_probe:=false`,
   which matters more with the D405's wider lens than it did before.
+- **The elevator button pipeline has not run against real hardware yet.**
+  `button_detector_node`, `detection_bridge_node`, `depth_approach`, and
+  `button_servo.launch.py` are new and untested end-to-end; `elevator_buttons.pt`
+  is training on a public dataset, which will need retuning against the real
+  panel it targets — different lighting and button styling than the training
+  images. `approach_gain` and `target_depth_mm` are unverified against a real
+  D405 depth reading close to the sensor's near limit (~70mm).
+- **GPU training on this Jetson is unresolved.** The JetPack-matched PyTorch
+  wheel needs cuDNN 9; the board ships cuDNN 8.9. Training currently runs on
+  CPU. See [Training the detector](#training-the-detector).
 
 The Raspberry-Pi-over-network setup this replaced still works and is what the
 launch files default to; it is archived in

@@ -41,3 +41,12 @@ bob
 bob.pub
 *.pem
 id_rsa*
+
+# Button-detector training: venv, downloaded Roboflow dataset, and run
+# checkpoints. Reproducible from scripts/train_button_detector.py; none of
+# it belongs in history. elevator_buttons.pt itself is also excluded here
+# for now — see README for how to obtain or place a trained model.
+.venv-train/
+entc-elevator-button-detection-*/
+runs/
+elevator_buttons.pt

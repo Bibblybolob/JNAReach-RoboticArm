@@ -649,6 +649,8 @@ class VisualServoNode(Node):
         self.declare_parameter('approach_gain', 6.0)
         self.declare_parameter('approach_deadband', 0.03)
         self.declare_parameter('max_approach_step_deg', 1.5)
+        self.declare_parameter('depth_approach', False)
+        self.declare_parameter('target_depth_mm', 50.0)
 
         # --- Search / idle behaviour ---
         # Seconds without a sighting before giving up and homing.
@@ -790,6 +792,9 @@ class VisualServoNode(Node):
         self._approach_deadband = float(self.get_parameter('approach_deadband').value)
         self._max_approach_step = float(
             self.get_parameter('max_approach_step_deg').value)
+        self._depth_approach = bool(self.get_parameter('depth_approach').value)
+        self._target_depth_mm = float(
+            self.get_parameter('target_depth_mm').value)
 
         self._lost_timeout = float(self.get_parameter('lost_timeout').value)
         self._resume_search_after = float(
@@ -964,6 +969,8 @@ class VisualServoNode(Node):
         'target_size_fraction': '_target_size',
         'approach_gain': '_approach_gain',
         'max_approach_step_deg': '_max_approach_step',
+        'depth_approach': '_depth_approach',
+        'target_depth_mm': '_target_depth_mm',
     }
 
     def _on_set_parameters(self, params):
@@ -1966,11 +1973,19 @@ class VisualServoNode(Node):
                 self._growing[i] = 0
 
     def _approach_step(self) -> float:
-        """Degrees to move the approach joint to close in on the hand.
+        """Degrees to move the approach joint to close in on the target.
 
-        Uses apparent palm size as the range proxy: bigger means nearer. Zero
-        if approach is off, the probe could not determine a direction, or the
-        hand already fills the target fraction of the frame.
+        Two modes selected by ``depth_approach``:
+
+        - **Size mode** (default): uses apparent target size as a range proxy.
+          Bigger means nearer.  Drives until size reaches
+          ``target_size_fraction`` of the frame width.
+        - **Depth mode** (``depth_approach=true``): interprets ``point.z`` as
+          depth in millimetres (from a depth sensor via the detection bridge).
+          Drives until depth reaches ``target_depth_mm``.
+
+        Returns zero when approach is off, the direction is unknown, or the
+        target is already within the deadband.
         """
         if not self._approach_enabled:
             return 0.0
@@ -1981,6 +1996,32 @@ class VisualServoNode(Node):
                 'Set assumed_approach_sign, or skip_probe:=false to measure.',
                 throttle_duration_sec=10.0)
             return 0.0
+
+        if self._depth_approach:
+            return self._approach_step_depth()
+        return self._approach_step_size()
+
+    def _approach_step_depth(self) -> float:
+        """Depth-based approach: drive until the sensor reads target_depth_mm."""
+        if self._last_size_px is None or self._last_size_px <= 0.0:
+            self.get_logger().warn(
+                'Not closing in: depth reading is zero or unavailable. '
+                'Check that the detection bridge is publishing depth in '
+                'point.z and that the target is within the depth sensor range.',
+                throttle_duration_sec=10.0)
+            return 0.0
+
+        depth_mm = self._last_size_px
+        error = (depth_mm - self._target_depth_mm) / self._target_depth_mm
+        if abs(error) < self._approach_deadband:
+            return 0.0
+
+        step = self._approach_gain * error * self._approach_sign
+        return max(-self._max_approach_step,
+                   min(self._max_approach_step, step))
+
+    def _approach_step_size(self) -> float:
+        """Size-based approach: drive until apparent size reaches target."""
         if self._last_size_px is None or self._width is None:
             self.get_logger().warn(
                 'Not closing in: the tracker is not reporting palm size, so '
@@ -2258,9 +2299,13 @@ class VisualServoNode(Node):
         self._jog_pub.publish(msg)
 
         size_note = ''
-        if self._last_size_px is not None and self._width:
-            frac = self._last_size_px / float(self._width)
-            size_note = f' size={frac:.2f}/{self._target_size:.2f}'
+        if self._last_size_px is not None:
+            if self._depth_approach:
+                size_note = (f' depth={self._last_size_px:.0f}mm'
+                             f'/{self._target_depth_mm:.0f}mm')
+            elif self._width:
+                frac = self._last_size_px / float(self._width)
+                size_note = f' size={frac:.2f}/{self._target_size:.2f}'
 
         # All three errors, because the differences between them are the whole
         # story when tracking misbehaves. `seen` is what the camera reported;

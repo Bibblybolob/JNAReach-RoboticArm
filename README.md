@@ -186,8 +186,16 @@ ros2 launch mycobot_bringup button_servo.launch.py
 The arm homes, then sits idle until a floor is selected:
 
 ```bash
-ros2 param set /detection_bridge_node target_label "3"
+ros2 param set /detection_bridge_node target_label "button-3"
 ```
+
+`target_label` has to match a class name from the trained model exactly
+(case-insensitive). The currently trained `elevator_buttons.pt` was fitted
+on a public dataset and knows: `alarm`, `button-1/2/3/up/down/g`,
+`close`, `closed-door`, `down`, `floor-1/2/3/ground`, `key`, `open`, `up` —
+list them yourself against whatever model is actually loaded with
+`python3 -c "from ultralytics import YOLO; print(YOLO('elevator_buttons.pt').names)"`,
+since a retrained model may use different names.
 
 Any input method can set that parameter — a CLI, a limit-switch morse
 decoder, eventually a microphone. The bridge node does not care which. Leave
@@ -212,8 +220,10 @@ stops it at any point, same as hand tracking.
 ### Training the detector
 
 `button_detector_node` expects a model whose classes are the button labels
-themselves (`"3"`, `"lobby"`, `"open"`, …) — that is what makes floor
-selection a label match rather than an image-space guess.
+themselves (`"button-3"`, `"floor-2"`, `"open"`, …) — that is what makes
+floor selection a label match rather than an image-space guess. The exact
+label spelling is whatever the training dataset used; there is no
+normalisation between e.g. `"3"` and `"floor-3"`.
 
 ```bash
 python3 -m venv --system-site-packages .venv-train
@@ -432,14 +442,17 @@ boards float and the arm reads nothing.
   which matters more with the D405's wider lens than it did before.
 - **The elevator button pipeline has not run against real hardware yet.**
   `button_detector_node`, `detection_bridge_node`, `depth_approach`, and
-  `button_servo.launch.py` are new and untested end-to-end; `elevator_buttons.pt`
-  is training on a public dataset, which will need retuning against the real
-  panel it targets — different lighting and button styling than the training
-  images. `approach_gain` and `target_depth_mm` are unverified against a real
-  D405 depth reading close to the sensor's near limit (~70mm).
+  `button_servo.launch.py` are new and untested end-to-end. `elevator_buttons.pt`
+  is trained (mAP50 0.929, mAP50-95 0.546 on the held-out validation set, 50
+  epochs on the public `entc-elevator-button-detection` dataset) but will need
+  retuning against the real panel it targets — different lighting and button
+  styling than the training images almost always costs accuracy on a small
+  (~440 image) dataset. `approach_gain` and `target_depth_mm` are unverified
+  against a real D405 depth reading close to the sensor's near limit (~70mm).
 - **GPU training on this Jetson is unresolved.** The JetPack-matched PyTorch
   wheel needs cuDNN 9; the board ships cuDNN 8.9. Training currently runs on
-  CPU. See [Training the detector](#training-the-detector).
+  CPU — 50 epochs on ~440 images took 6.75 hours. See
+  [Training the detector](#training-the-detector).
 
 The Raspberry-Pi-over-network setup this replaced still works and is what the
 launch files default to; it is archived in

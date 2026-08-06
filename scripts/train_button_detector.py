@@ -71,7 +71,11 @@ def main():
         name='train',
     )
 
-    best = os.path.join('runs', 'button_detect', 'train', 'weights', 'best.pt')
+    # Read the save dir back from the trainer rather than assuming
+    # 'runs/button_detect/train' -- Ultralytics nests it under an extra
+    # 'detect/' segment even with an explicit `project`, so a hardcoded path
+    # missed the real weights on the first run this was used.
+    best = os.path.join(model.trainer.save_dir, 'weights', 'best.pt')
     if os.path.exists(best):
         import shutil
         shutil.copy2(best, args.output)

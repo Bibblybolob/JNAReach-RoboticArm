@@ -49,7 +49,7 @@ class ButtonDetectorNode(Node):
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('show_window', True)
         self.declare_parameter('window_name', 'Button Detection')
-        self.declare_parameter('device', 'cuda:0')
+        self.declare_parameter('device', 'cpu')
 
         image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         model_path = self.get_parameter('model_path').get_parameter_value().string_value

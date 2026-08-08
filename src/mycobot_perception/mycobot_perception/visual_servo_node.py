@@ -649,6 +649,13 @@ class VisualServoNode(Node):
         self.declare_parameter('approach_gain', 6.0)
         self.declare_parameter('approach_deadband', 0.03)
         self.declare_parameter('max_approach_step_deg', 1.5)
+        # --- Depth-based approach ---
+        # When true, interpret point.z as depth in mm (from a depth camera)
+        # instead of palm width in pixels. Drives the approach joint until the
+        # target reaches target_depth_mm. Requires the upstream node to publish
+        # depth as point.z (detection_bridge_node does this).
+        self.declare_parameter('depth_approach', False)
+        self.declare_parameter('target_depth_mm', 70.0)
 
         # --- Search / idle behaviour ---
         # Seconds without a sighting before giving up and homing.
@@ -790,6 +797,9 @@ class VisualServoNode(Node):
         self._approach_deadband = float(self.get_parameter('approach_deadband').value)
         self._max_approach_step = float(
             self.get_parameter('max_approach_step_deg').value)
+        self._depth_approach = bool(self.get_parameter('depth_approach').value)
+        self._target_depth_mm = float(self.get_parameter('target_depth_mm').value)
+        self._last_depth_mm: float | None = None
 
         self._lost_timeout = float(self.get_parameter('lost_timeout').value)
         self._resume_search_after = float(
@@ -964,6 +974,7 @@ class VisualServoNode(Node):
         'target_size_fraction': '_target_size',
         'approach_gain': '_approach_gain',
         'max_approach_step_deg': '_max_approach_step',
+        'target_depth_mm': '_target_depth_mm',
     }
 
     def _on_set_parameters(self, params):
@@ -1174,8 +1185,11 @@ class VisualServoNode(Node):
                     'ros2 service call /servo/search std_srvs/srv/Trigger')
             self._ever_received_point = True
         self._last_point = (msg.point.x, msg.point.y)
-        # z carries palm width in pixels, not a depth. See hand_tracker_node.
-        self._last_size_px = msg.point.z if msg.point.z > 0 else None
+        if self._depth_approach:
+            self._last_depth_mm = msg.point.z if msg.point.z > 0 else None
+            self._last_size_px = None
+        else:
+            self._last_size_px = msg.point.z if msg.point.z > 0 else None
         self._last_point_time = time.monotonic()
 
         # The frame's own timestamp, carried through by the tracker. This is
@@ -1966,11 +1980,12 @@ class VisualServoNode(Node):
                 self._growing[i] = 0
 
     def _approach_step(self) -> float:
-        """Degrees to move the approach joint to close in on the hand.
+        """Degrees to move the approach joint to close in on the target.
 
-        Uses apparent palm size as the range proxy: bigger means nearer. Zero
-        if approach is off, the probe could not determine a direction, or the
-        hand already fills the target fraction of the frame.
+        Two modes:
+        - depth_approach=false: uses apparent palm size as the range proxy.
+        - depth_approach=true: uses depth in mm from point.z, driving the
+          approach joint until the target reaches target_depth_mm.
         """
         if not self._approach_enabled:
             return 0.0
@@ -1981,6 +1996,17 @@ class VisualServoNode(Node):
                 'Set assumed_approach_sign, or skip_probe:=false to measure.',
                 throttle_duration_sec=10.0)
             return 0.0
+
+        if self._depth_approach:
+            if self._last_depth_mm is None or self._last_depth_mm <= 0.0:
+                return 0.0
+            error = (self._last_depth_mm - self._target_depth_mm) / self._target_depth_mm
+            if abs(error) < self._approach_deadband:
+                return 0.0
+            step = self._approach_gain * error * self._approach_sign
+            return max(-self._max_approach_step,
+                       min(self._max_approach_step, step))
+
         if self._last_size_px is None or self._width is None:
             self.get_logger().warn(
                 'Not closing in: the tracker is not reporting palm size, so '

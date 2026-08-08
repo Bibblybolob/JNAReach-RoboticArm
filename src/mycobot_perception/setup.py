@@ -18,6 +18,8 @@ setup(
     entry_points={
         'console_scripts': [
             'food_detector_node = mycobot_perception.food_detector_node:main',
+            'button_detector_node = mycobot_perception.button_detector_node:main',
+            'detection_bridge_node = mycobot_perception.detection_bridge_node:main',
             'color_tracker_node = mycobot_perception.color_tracker_node:main',
             'hand_tracker_node = mycobot_perception.hand_tracker_node:main',
             'visual_servo_node = mycobot_perception.visual_servo_node:main',

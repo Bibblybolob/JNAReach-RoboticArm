@@ -17,6 +17,7 @@ carries everything.
 
 import math
 import os
+import pathlib
 import time
 import threading
 
@@ -180,6 +181,7 @@ class MyCobotHardwareNode(Node):
         # deliberately starting the whole stack and expects the arm to
         # settle at home before anything else happens.
         self.declare_parameter('home_on_start', False)
+        self.declare_parameter('home_settle_time', 0.5)
 
         # --- Jogging (visual servoing) ---
         # Largest displacement honoured in a single JointJog, in degrees. A
@@ -346,6 +348,8 @@ class MyCobotHardwareNode(Node):
         self._home_timeout = self.get_parameter('home_timeout').get_parameter_value().double_value
         self._home_on_start = self.get_parameter(
             'home_on_start').get_parameter_value().bool_value
+        self._home_settle_time = self.get_parameter(
+            'home_settle_time').get_parameter_value().double_value
         self._start_homed = False
         if len(self._home_angles) != 6:
             self.get_logger().warn(
@@ -558,6 +562,7 @@ class MyCobotHardwareNode(Node):
             self._mc = mc
             self.get_logger().info(f'Connected. Joint angles: '
                                    f'{[round(a, 1) for a in angles]}')
+            self._focus_servos()
             try:
                 if self._mc.get_fresh_mode() != 1:
                     self._mc.set_fresh_mode(1)
@@ -602,9 +607,54 @@ class MyCobotHardwareNode(Node):
             )
             return False
 
+    _consecutive_failures: int = 0
+
+    def _reset_uart(self) -> None:
+        """Unbind and rebind the Tegra UART driver to reset the controller.
+
+        On Orin Nano Super devkits, ttyTHS1's TX pad intermittently stops
+        driving.  A driver unbind/rebind resets the hardware without a full
+        reboot.  Requires write access to sysfs (run as root or with udev
+        rules granting the dialout group access).
+        """
+        sysfs = pathlib.Path('/sys/class/tty') / pathlib.Path(
+            self._serial_port).name / 'device'
+        if not sysfs.exists():
+            return
+        try:
+            dev_id = (sysfs / 'uevent').read_text()
+            # Extract e.g. "3100000.serial" from OF_FULLNAME or DRIVER line
+            dev_name = sysfs.resolve().name          # e.g. "3100000.serial"
+            driver = (sysfs / 'driver').resolve()    # e.g. .../serial-tegra
+            unbind = driver / 'unbind'
+            bind = driver / 'bind'
+            if not unbind.exists():
+                return
+            self.get_logger().info(
+                f'Resetting UART controller {dev_name} (unbind/rebind)')
+            unbind.write_text(dev_name)
+            time.sleep(0.3)
+            bind.write_text(dev_name)
+            time.sleep(0.5)
+            self.get_logger().info('UART controller reset complete')
+        except PermissionError:
+            self.get_logger().warn(
+                'Cannot reset UART: permission denied on sysfs. '
+                'Run as root or add a udev rule for the dialout group.',
+                throttle_duration_sec=60.0)
+        except Exception as e:
+            self.get_logger().warn(f'UART reset failed: {e}')
+
     def _retry_connect(self) -> None:
         if self._mc is None:
-            self._connect()
+            if (self._connection == 'serial'
+                    and self._consecutive_failures >= 3):
+                self._reset_uart()
+                self._consecutive_failures = 0
+            if self._connect():
+                self._consecutive_failures = 0
+            else:
+                self._consecutive_failures += 1
 
     def _keepalive(self) -> None:
         """Keep the TCP link warm so the Pi never sees it as idle.
@@ -668,6 +718,44 @@ class MyCobotHardwareNode(Node):
         # Reuse the service path so startup homing and /arm/home cannot drift
         # apart in behaviour.
         self._home_callback(SetBool.Request(), SetBool.Response())
+
+    def _focus_servos(self) -> None:
+        """Power the servos and engage position hold before commanding motion.
+
+        A released arm answers get_angles perfectly and ACCEPTS send_angles
+        without moving a millimetre, which is the single most misleading
+        failure this driver can hit: the link looks healthy, commands are
+        acknowledged, and the arm sags under gravity. That sag then reads back
+        as joints drifting away from the commanded pose, so the divergence
+        leash reports `not keeping up, is blocked, or that joint is not moving
+        at all` about an arm that was never holding in the first place, and
+        homing times out because nothing ever arrives.
+
+        Diagnosed the long way once: joint5 sat at 6.2deg through a full search
+        sweep commanding it between -5 and +16, while joints 2 and 4 wandered
+        tens of degrees with nothing asking them to. power_on() and
+        focus_all_servos() fixed it outright -- the next commanded move
+        travelled 109deg.
+
+        Best-effort by design. Some firmware answers -1 to these while still
+        acting on them, so a bad return is not worth refusing the connection
+        over; the arm either holds station afterwards or the divergence
+        warnings say it does not.
+        """
+        for name in ('power_on', 'focus_all_servos'):
+            fn = getattr(self._mc, name, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+                time.sleep(0.3)
+            except Exception as e:
+                self.get_logger().warn(
+                    f'{name}() failed: {e}. If the arm accepts commands '
+                    'without moving, its servos are released -- that is this.')
+        self.get_logger().info(
+            'Servos powered and holding position (power_on + '
+            'focus_all_servos).')
 
     def _angles_plausible(self, angles_deg) -> bool:
         """Reject a reading that cannot be a real pose at all.
@@ -820,6 +908,17 @@ class MyCobotHardwareNode(Node):
                         'Resyncing to hardware.',
                         throttle_duration_sec=3.0)
                 self._last_angles_rad = angles
+                # Drop the profile with it. Rebasing the jog chain while the
+                # profiler keeps its own stale _jog_cmd_deg makes the next
+                # tick ramp EVERY joint from where it used to think the arm
+                # was to the freshly rebuilt target -- so joints nobody jogged
+                # get commanded motion out of nowhere. That is the
+                # `jog profile joint2+4.80` seen against a search sweep that
+                # only ever asks for joint5. Clearing it means the next jog
+                # rebuilds both the target and the chain from this reading;
+                # the servo re-commands within one detection, so nothing is
+                # lost but the drift.
+                self._jog_reset_profile()
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -1678,6 +1777,8 @@ class MyCobotHardwareNode(Node):
             self.get_logger().error(response.message)
             return response
         finally:
+            if self._home_settle_time > 0:
+                time.sleep(self._home_settle_time)
             self._in_motion.clear()
             self._cmd_positions = None
 

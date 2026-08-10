@@ -25,6 +25,23 @@ Design notes
 
 from __future__ import annotations
 
+import torch
+
+# cuDNN OFF, deliberately, and this must run before any CUDA work.
+#
+# NVIDIA's torch 2.5.0a0 for JetPack 6.1 links against cuDNN 9 and will not
+# even import without libcudnn.so.9 present, but the cuDNN 9 pip wheels
+# (cu12 and cu13 both) fail at runtime on this Jetson's CUDA 12.2 with
+# CUDNN_STATUS_NOT_INITIALIZED the moment a convolution runs. So the symlinks
+# into site-packages/nvidia/cudnn/lib have to STAY -- removing them breaks the
+# import -- while cuDNN itself has to be switched off.
+#
+# Disabling it falls back to native CUDA convolutions, which cost nothing that
+# matters here: measured 24 fps against roughly 2 fps on CPU. Deleting this
+# line does not "re-enable acceleration", it crashes the node on the first
+# frame.
+torch.backends.cudnn.enabled = False
+
 import cv2
 import numpy as np
 
@@ -49,7 +66,7 @@ class ButtonDetectorNode(Node):
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('show_window', True)
         self.declare_parameter('window_name', 'Button Detection')
-        self.declare_parameter('device', 'cpu')
+        self.declare_parameter('device', 'cuda:0')
 
         image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         model_path = self.get_parameter('model_path').get_parameter_value().string_value

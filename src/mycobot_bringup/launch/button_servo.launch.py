@@ -209,7 +209,7 @@ def generate_launch_description():
         'button_confidence', default_value='0.5',
         description='Minimum detector confidence to accept a detection')
     button_device_arg = DeclareLaunchArgument(
-        'button_device', default_value='cpu',
+        'button_device', default_value='cuda:0',
         description='Inference device for the button detector')
     target_label_arg = DeclareLaunchArgument(
         'target_label', default_value='',

@@ -16,7 +16,7 @@ MoveIt entirely -- it jogs joints directly from image error -- so planning is
 dead weight here, and it is a lot of dead weight on a VM. Use
 moveit_bringup.launch.py when you want planning.
 
-On startup the arm drives to its home pose ([0, 90, -90, 0, 0, 0] degrees) so
+On startup the arm drives to its home pose ([0.8, 94.8, -149.5, 43.9, 2.3, 0.6] degrees) so
 it always begins from a known position rather than wherever it was left. Pass
 home_on_start:=false to skip that.
 

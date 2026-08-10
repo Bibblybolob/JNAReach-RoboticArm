@@ -511,11 +511,27 @@ hardware as of this writing; the port may be power-only.
 
 ## Gotchas
 
-- **The home pose `[0, 90, -90, 0, 0, 0]` is defined in five places** and they
-  must agree: the driver node default, `robot_bringup.launch.py`,
-  `moveit_bringup.launch.py`, `driver.launch.py`, and
-  `src/mycobot_moveit_config/config/mycobot_280pi.srdf` (in radians).
-  Consolidating this is outstanding work.
+- **The home pose `[0.8, 94.8, -149.5, 43.9, 2.3, 0.6]` is defined in five
+  places** and they must agree: the driver node default,
+  `robot_bringup.launch.py`, `moveit_bringup.launch.py`, `driver.launch.py`,
+  and `src/mycobot_moveit_config/config/mycobot_280pi.srdf` (in radians —
+  `[0.0140, 1.6546, -2.6093, 0.7662, 0.0401, 0.0105]`). Consolidating this is
+  outstanding work.
+
+  **It was `[0, 90, -90, 0, 0, 0]` until 2026-08-10, and that is not a pose
+  this arm can hold with a D405 on the flange.** Walking joint2 up in 8deg
+  steps, it reached 91.8 and then FELL 36deg under its own weight; 110 did not
+  hold either. Homing to a pose the shoulder cannot support meant homing never
+  completed — it timed out after 40s and the stack then started from wherever
+  the arm had sagged to, which read as "the arm is not homing" and as joints
+  wandering during the search sweep.
+
+  **These numbers are measured, not chosen**: the pose the arm settled into and
+  held with zero drift across 13 consecutive readings. Its only virtue is that
+  it is reachable and stable. It is a folded pose — joint3 at -150 and joint4
+  at 44 — so **check where the camera actually points from it** before trusting
+  a search sweep to see anything; the old home looked forward and this one may
+  not. Re-measure after any payload change.
 - `colcon build --symlink-install` — without the symlink flag, edits to Python
   nodes do not take effect and `ros2 param get` keeps reporting old values.
 - The arm keeps moving after the stack dies unless `mc.stop()` runs; the

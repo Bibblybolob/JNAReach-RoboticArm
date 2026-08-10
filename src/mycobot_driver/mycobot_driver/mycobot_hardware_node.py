@@ -156,10 +156,23 @@ class MyCobotHardwareNode(Node):
         # --- Homing ---
         # Fixed joint-angle home pose, in degrees.
         # Kept in sync with the "home" group_state in mycobot_280pi.srdf
-        # ([0, 1.5708, -1.5708, 0, 0, 0] rad) — change both together or
-        # RViz's named "home" and this service will disagree.
+        # ([0.0140, 1.6546, -2.6093, 0.7662, 0.0401, 0.0105] rad) — change
+        # both together or RViz's named "home" and this service will disagree.
+        #
+        # This was [0, 90, -90, 0, 0, 0] until 2026-08-10. That pose is not one
+        # this arm can hold with a D405 on the flange: walking joint2 up in
+        # 8deg steps, it reached 91.8 and then FELL 36deg under its own weight,
+        # and 110 did not hold either. Homing to a pose the shoulder cannot
+        # support meant homing never completed — it timed out after 40s and the
+        # stack then started from wherever the arm had sagged to, which read as
+        # "the arm is not homing" and as joints wandering during the sweep.
+        #
+        # These numbers are therefore MEASURED, not chosen: the pose the arm
+        # settled into and held with zero drift across 13 consecutive readings.
+        # Its virtue is that it is reachable and stable, which the old one was
+        # not. Re-measure if the payload changes.
         self.declare_parameter(
-            'home_angles_deg', [0.0, 90.0, -90.0, 0.0, 0.0, 0.0]
+            'home_angles_deg', [0.8, 94.8, -149.5, 43.9, 2.3, 0.6]
         )
         # Homing runs slower than normal motion on purpose: it is commanded
         # from an arbitrary unknown starting pose, which makes it the single

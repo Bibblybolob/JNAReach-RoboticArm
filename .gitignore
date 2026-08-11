@@ -41,3 +41,26 @@ bob
 bob.pub
 *.pem
 id_rsa*
+
+# Inference build artifacts. A TensorRT engine is compiled for one exact GPU,
+# driver and TensorRT version and is invalid anywhere else — including this
+# same board after a JetPack upgrade. Rebuild from the .pt with
+#     yolo export model=elevator_buttons.pt format=engine imgsz=640 half=True
+# (~10min, and export via Ultralytics rather than trtexec or the engine
+# carries no class names and the detection bridge sees class0..classN).
+*.engine
+*.onnx
+
+# Training output. Checkpoints, plots and per-epoch CSVs — reproducible from
+# the dataset and the training script, and large.
+runs/
+runs_960/
+runs_panel/
+
+# Pretrained checkpoints pulled from the Ultralytics release assets by
+# benchmarking and by the AMP check at the start of training. Re-downloaded on
+# demand. elevator_buttons.pt is OURS and stays tracked — it is the source of
+# truth every engine is built from.
+yolo11*.pt
+yolo26*.pt
+yolov8*.pt

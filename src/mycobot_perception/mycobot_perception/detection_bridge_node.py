@@ -7,13 +7,20 @@ contract the visual servo expects.
                          z    = depth at that point, in millimetres (0 if
                                 unavailable)
 
-Which detection gets published is controlled by the `target_label` parameter
-(empty by default, which means "publish nothing"). Set it at runtime:
+Which detection gets published is controlled by the `target_label` parameter:
 
-    ros2 param set /detection_bridge_node target_label button_5
+    ros2 param set /detection_bridge_node target_label button-5
 
-If more than one detection matches the label, the highest-confidence one
-wins. Depth is sampled as the median of a 5x5 patch around the bbox centre,
+Empty (the default) means "steer at the best button you can see, whatever it
+is" -- the highest-confidence detection of any class. That is what bring-up
+wants, and what button_servo.launch.py's own description has always claimed
+this did; it used to publish nothing instead, which silently pinned the servo
+in SEARCHING forever because /button/point_px never carried a single message.
+
+Set the label once a specific floor is wanted. If more than one detection
+matches, the highest-confidence one wins.
+
+Depth is sampled as the median of a 5x5 patch around the bbox centre,
 with zero (invalid) pixels excluded, so a single missing depth reading at the
 exact centre pixel does not zero out the whole point.
 """
@@ -52,6 +59,8 @@ class DetectionBridgeNode(Node):
 
         self._bridge = CvBridge()
         self._depth_image: np.ndarray | None = None
+        self._published_any = False
+        self._warned_no_match = False
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -77,7 +86,10 @@ class DetectionBridgeNode(Node):
         for p in params:
             if p.name == 'target_label':
                 self.target_label = p.value
-                self.get_logger().info(f'target_label -> {self.target_label!r}')
+                self._warned_no_match = False
+                self.get_logger().info(
+                    f'target_label -> {self.target_label!r}'
+                    + ('' if self.target_label else ' (best detection of any class)'))
         return SetParametersResult(successful=True)
 
     def _depth_cb(self, msg: Image) -> None:
@@ -87,21 +99,34 @@ class DetectionBridgeNode(Node):
             self.get_logger().warn(f'depth conversion failed: {exc}')
 
     def _detection_cb(self, msg: Detection2DArray) -> None:
-        if not self.target_label:
-            return
-
         # vision_msgs in Humble uses string class_id (see food_detector_node).
         target = None
         for det in msg.detections:
             for result in det.results:
                 class_id = result.hypothesis.class_id
                 score = result.hypothesis.score
-                if class_id.lower() == self.target_label.lower():
-                    if target is None or score > target[1]:
-                        target = (det, score)
+                # No label set: any class will do, best score wins.
+                if self.target_label and class_id.lower() != self.target_label.lower():
+                    continue
+                if target is None or score > target[1]:
+                    target = (det, score, class_id)
 
         if target is None:
+            if self.target_label and msg.detections and not self._warned_no_match:
+                self._warned_no_match = True
+                seen = sorted({r.hypothesis.class_id
+                               for d in msg.detections for r in d.results})
+                self.get_logger().warn(
+                    f'target_label={self.target_label!r} matches nothing; '
+                    f'detector is reporting {seen}. Nothing will be published '
+                    f'until it matches, so the servo will keep searching.')
             return
+
+        if not self._published_any:
+            self._published_any = True
+            self.get_logger().info(
+                f'first target: {target[2]!r} score {target[1]:.2f} '
+                f'-- publishing to {self.output_topic}')
 
         det = target[0]
         cx = det.bbox.center.position.x

@@ -940,7 +940,13 @@ class VisualServoNode(Node):
             self._arm_timer = self.create_timer(
                 2.0, self._arm_jog_once, callback_group=cb)
 
-        if bool(self.get_parameter('search_on_start').value):
+        # Deferred until the jog gate is actually open (see _armed). Sweeping
+        # before then advances the sweep bookkeeping while the driver discards
+        # every jog, so the node believes it has swept a range the arm never
+        # moved through -- and it cannot see anything, because the arm is
+        # still homing.
+        self._search_on_start = bool(self.get_parameter('search_on_start').value)
+        if self._search_on_start and not bool(self.get_parameter('auto_arm_jog').value):
             self._set_state(SEARCHING)
 
         self.get_logger().info(
@@ -1053,9 +1059,18 @@ class VisualServoNode(Node):
                 self.get_logger().info(
                     'Armed the driver jog gate (/arm/jog_enable).')
                 self._arm_timer.cancel()
+                # Now, and not before: the driver holds this shut until
+                # startup homing has finished, so this is the earliest moment
+                # a sweep can actually move the arm.
+                if getattr(self, '_search_on_start', False) and self._state == IDLE:
+                    self.get_logger().info(
+                        'Jog gate open and homing done -- starting search.')
+                    self._set_state(SEARCHING)
             else:
-                self.get_logger().warn(
-                    '/arm/jog_enable refused; will retry.')
+                msg = getattr(res, 'message', '') if res is not None else ''
+                self.get_logger().info(
+                    f'/arm/jog_enable refused ({msg or "no reason given"}); '
+                    'will retry.', throttle_duration_sec=5.0)
 
         future.add_done_callback(_armed)
 

@@ -213,8 +213,9 @@ def generate_launch_description():
         description='Inference device for the button detector')
     target_label_arg = DeclareLaunchArgument(
         'target_label', default_value='',
-        description='Which detected label to steer at; empty follows '
-                    'whatever the bridge picks by default')
+        description='Which detected label to steer at, e.g. button-5. Empty '
+                    '(default) steers at the highest-confidence detection of '
+                    'any class, which is what bring-up wants')
     depth_approach_arg = DeclareLaunchArgument(
         'depth_approach', default_value='true',
         description='Use measured depth to gate/drive the approach rather '

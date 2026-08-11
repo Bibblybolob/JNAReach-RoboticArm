@@ -524,6 +524,22 @@ hardware as of this writing; the port may be power-only.
   servo zeros — see the firmware entry below — not torque. Worth remembering
   before re-deriving a "measured" home from readings taken while something
   upstream is broken.
+- **`Jog target pinned to the measured pose` on one joint, repeatedly, can be
+  a loose wire.** On 2026-08-10 joint5 ran ~10 degrees behind the search sweep
+  for a whole run, pinning the leash constantly, and it looked exactly like
+  "the sweep is faster than the joint can move". Reseating a wire fixed it
+  outright:
+
+  | | before | after |
+  |---|---|---|
+  | jog commands in a 100s run | 25 | 50 |
+  | `pinned to the measured pose` | many | 0 |
+  | divergence resyncs | several | 1 |
+
+  So before tuning `search_sweep_seconds` or raising `jog_max_divergence_deg`
+  to quieten the warning, check the hardware. The leash warning is doing its
+  job when it fires — it is reporting a joint that genuinely is not keeping up.
+
 - **If the arm accepts commands and never moves, suspect the Atom firmware
   before anything else.** On 2026-08-10 the ESP32 was crash-looping — it
   rejected a command as malformed, dereferenced a null pointer, panicked and

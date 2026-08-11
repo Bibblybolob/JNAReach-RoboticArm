@@ -87,6 +87,23 @@ for _ in range(25):
 PY
 ```
 
+## Reflashing does not fix it
+
+atomMain 6.2 was flashed **twice** with myStudio, power-cycling between. The
+crash survives both.
+
+| | valid replies | crashes | silent |
+|---|---|---|---|
+| after first flash | 1/20 | 2 | 13 |
+| after second flash | 19/60 | 2 | 35 |
+
+The second attempt improved the proportion of good replies but did not stop the
+panic, so the ratio is a measure of how often it manages a reply between
+reboots rather than of any real recovery.
+
+Servo zero calibration DOES survive: after recalibrating, encoders read 2048
+and joint6 still reported 2048 across subsequent power cycles and reflashes.
+
 ## Related
 
 `elephantrobotics/myCobot` issue #48 reports motors unresponsive after a power

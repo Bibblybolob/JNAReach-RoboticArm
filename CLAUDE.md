@@ -511,34 +511,28 @@ hardware as of this writing; the port may be power-only.
 
 ## Gotchas
 
-- **The home pose `[0, 90, -90, 0, 0, 0]` is defined in five places** and they
-  must agree: the driver node default, `robot_bringup.launch.py`,
+- **The home pose `[0, 90, -150, 55, 0, 0]` is defined in five places** and
+  they must agree: the driver node default, `robot_bringup.launch.py`,
   `moveit_bringup.launch.py`, `driver.launch.py`, and
-  `src/mycobot_moveit_config/config/mycobot_280pi.srdf` (in radians).
-  Consolidating this is outstanding work.
+  `src/mycobot_moveit_config/config/mycobot_280pi.srdf` (in radians —
+  `[0, 1.5708, -2.618, 0.9599, 0, 0]`). Consolidating this is outstanding work.
+  Measured poses, including this one, are in
+  [docs/recorded_poses.md](docs/recorded_poses.md).
 
-  It was briefly changed on 2026-08-10, in the belief that joint2 could not
-  hold 90 degrees with a D405 on the flange, and changed straight back: the arm
-  reaches this pose to 1.1 degrees and holds it with **zero** drift over 8
-  seconds. The sagging and the failed homing were a crash-looping Atom and lost
-  servo zeros — see the firmware entry below — not torque. Worth remembering
-  before re-deriving a "measured" home from readings taken while something
-  upstream is broken.
-- **`Jog target pinned to the measured pose` on one joint, repeatedly, can be
-  a loose wire.** On 2026-08-10 joint5 ran ~10 degrees behind the search sweep
-  for a whole run, pinning the leash constantly, and it looked exactly like
-  "the sweep is faster than the joint can move". Reseating a wire fixed it
-  outright:
+  **Home is chosen for where the CAMERA points, not just for the arm.** The
+  stock `[0, 90, -90, 0, 0, 0]` is mechanically fine — reaches to 1 degree,
+  holds with zero drift, no torque problem whatever an earlier note in this
+  file claimed — but it folds the arm over and aims the flange camera at the
+  ceiling. The search sweep only tilts joint5 from wherever the arm starts, so
+  homing there means sweeping empty air and never seeing a button, which
+  presents as "the detector does not work" when the detector is fine.
 
-  | | before | after |
-  |---|---|---|
-  | jog commands in a 100s run | 25 | 50 |
-  | `pinned to the measured pose` | many | 0 |
-  | divergence resyncs | several | 1 |
-
-  So before tuning `search_sweep_seconds` or raising `jog_max_divergence_deg`
-  to quieten the warning, check the hardware. The leash warning is doing its
-  job when it fires — it is reporting a joint that genuinely is not keeping up.
+  **joint3 sits at its -150 limit.** pymycobot validates that range and RAISES
+  rather than clamping, so a reading a fraction past it makes `send_angles`
+  fail outright — an arm resting at -150.6 cost a session. The driver clamps
+  to `joint_limits_deg` before sending, which covers the normal path. If
+  homing starts failing with `Has invalid angle value ... index 2`, back
+  joint3 off to -149 rather than looking elsewhere.
 
 - **If the arm accepts commands and never moves, suspect the Atom firmware
   before anything else.** On 2026-08-10 the ESP32 was crash-looping — it

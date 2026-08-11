@@ -156,17 +156,25 @@ class MyCobotHardwareNode(Node):
         # --- Homing ---
         # Fixed joint-angle home pose, in degrees.
         # Kept in sync with the "home" group_state in mycobot_280pi.srdf
-        # ([0, 1.5708, -1.5708, 0, 0, 0] rad) — change both together or
+        # ([0, 1.5708, -2.618, 0.9599, 0, 0] rad) — change both together or
         # RViz's named "home" and this service will disagree.
         #
-        # Briefly changed to a folded pose on 2026-08-10 in the belief that
-        # joint2 could not hold 90 degrees with a D405 on the flange. It can:
-        # verified reaching this pose to 1.1 degrees and holding it with ZERO
-        # drift over 8 seconds. The apparent sagging was a crash-looping Atom
-        # plus lost servo calibration, not torque. See
-        # docs/atom_firmware_crash.md.
+        # Operator-chosen 2026-08-11 so the flange camera looks outward. The
+        # stock [0, 90, -90, 0, 0, 0] is mechanically fine — reaches to 1
+        # degree, holds with zero drift — but it folds the arm over and aims
+        # the camera at the ceiling, and the search sweep only tilts joint5
+        # from wherever the arm starts, so hunting for buttons from there
+        # scans empty air and finds nothing.
+        #
+        # joint3 sits AT its -150 limit. pymycobot validates this range and
+        # RAISES rather than clamping, so a reading a fraction past it makes
+        # send_angles fail outright — that cost a debugging session when the
+        # arm was resting at -150.6. The driver clamps targets to
+        # joint_limits_deg before sending, which covers the normal path; if
+        # homing ever starts failing with "Has invalid angle value ... index
+        # 2", back this off to -149 rather than hunting elsewhere.
         self.declare_parameter(
-            'home_angles_deg', [0.0, 90.0, -90.0, 0.0, 0.0, 0.0]
+            'home_angles_deg', [0.0, 90.0, -150.0, 55.0, 0.0, 0.0]
         )
         # Homing runs slower than normal motion on purpose: it is commanded
         # from an arbitrary unknown starting pose, which makes it the single

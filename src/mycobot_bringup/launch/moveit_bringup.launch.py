@@ -134,7 +134,7 @@ def generate_launch_description():
             'adaptive_speed': True,
             'speed_at_100_deg_s': 52.0,
             'speed_headroom': 1.3,
-            'home_angles_deg': [0.8, 94.8, -149.5, 43.9, 2.3, 0.6],
+            'home_angles_deg': [0.0, 90.0, -90.0, 0.0, 0.0, 0.0],
             'home_speed': 30,
         }],
         output='screen',

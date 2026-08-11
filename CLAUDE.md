@@ -511,27 +511,72 @@ hardware as of this writing; the port may be power-only.
 
 ## Gotchas
 
-- **The home pose `[0.8, 94.8, -149.5, 43.9, 2.3, 0.6]` is defined in five
-  places** and they must agree: the driver node default,
-  `robot_bringup.launch.py`, `moveit_bringup.launch.py`, `driver.launch.py`,
-  and `src/mycobot_moveit_config/config/mycobot_280pi.srdf` (in radians —
-  `[0.0140, 1.6546, -2.6093, 0.7662, 0.0401, 0.0105]`). Consolidating this is
-  outstanding work.
+- **The home pose `[0, 90, -90, 0, 0, 0]` is defined in five places** and they
+  must agree: the driver node default, `robot_bringup.launch.py`,
+  `moveit_bringup.launch.py`, `driver.launch.py`, and
+  `src/mycobot_moveit_config/config/mycobot_280pi.srdf` (in radians).
+  Consolidating this is outstanding work.
 
-  **It was `[0, 90, -90, 0, 0, 0]` until 2026-08-10, and that is not a pose
-  this arm can hold with a D405 on the flange.** Walking joint2 up in 8deg
-  steps, it reached 91.8 and then FELL 36deg under its own weight; 110 did not
-  hold either. Homing to a pose the shoulder cannot support meant homing never
-  completed — it timed out after 40s and the stack then started from wherever
-  the arm had sagged to, which read as "the arm is not homing" and as joints
-  wandering during the search sweep.
+  It was briefly changed on 2026-08-10, in the belief that joint2 could not
+  hold 90 degrees with a D405 on the flange, and changed straight back: the arm
+  reaches this pose to 1.1 degrees and holds it with **zero** drift over 8
+  seconds. The sagging and the failed homing were a crash-looping Atom and lost
+  servo zeros — see the firmware entry below — not torque. Worth remembering
+  before re-deriving a "measured" home from readings taken while something
+  upstream is broken.
+- **If the arm accepts commands and never moves, suspect the Atom firmware
+  before anything else.** On 2026-08-10 the ESP32 was crash-looping — it
+  rejected a command as malformed, dereferenced a null pointer, panicked and
+  rebooted, forever:
 
-  **These numbers are measured, not chosen**: the pose the arm settled into and
-  held with zero drift across 13 consecutive readings. Its only virtue is that
-  it is reachable and stable. It is a folded pose — joint3 at -150 and joint4
-  at 44 — so **check where the camera actually points from it** before trusting
-  a search sweep to see anything; the old home looked forward and this one may
-  not. Re-measure after any payload change.
+  ```
+  cmd_len error cmd_len error cmd_len error
+  Guru Meditation Error: Core  1 panic'ed (LoadProhibited)
+  ```
+
+  **The fix took THREE reflashes of atomMain 6.2 with myStudio.** The first two
+  changed nothing measurable; the third cleared it (55/60 valid replies, 0
+  crashes). Do not conclude a reflash failed after one attempt. Reflashing also
+  **loses the servo zero calibration** — redo it with
+  `./scripts/calibrate_zero.py`, which is a separate and equally necessary
+  step. Calibration then survives power cycles and further reflashes.
+
+  Full capture, reproduction and everything ruled out:
+  [docs/atom_firmware_crash.md](docs/atom_firmware_crash.md).
+
+- **Read the raw serial bytes, not pymycobot's return value.** This is the
+  lesson that cost most of a session. pymycobot returns `-1` for anything it
+  cannot parse, and the host UART carries the ESP32's panic text, its boot
+  output and the arm's **internal Feetech servo bus** (`ff ff 01 11 00 ...`)
+  alongside real `fe fe 0e 20 ... fa` replies. That mixture reads as `-1`,
+  which is indistinguishable from a dead link. Six confident diagnoses were
+  built on `-1` and every one was wrong — wiring, torque, power rail, free
+  mode, servo bus, protocol mismatch. One raw dump found the real fault in
+  minutes:
+
+  ```bash
+  python3 -c "
+  import serial, time
+  sp = serial.Serial('/dev/ttyTHS1', 1000000, timeout=1.0); time.sleep(2)
+  for _ in range(20):
+      sp.write(bytes([0xfe,0xfe,0x02,0x20,0xfa])); sp.flush(); time.sleep(0.4)
+      d = sp.read(16384)
+      if d: print(len(d), d[:60].hex(' '))"
+  ```
+
+- **`set_color` is the write test to reach for first.** It drives the Atom's
+  own LED: no servo, no meaningful current, nothing mechanical to block. If the
+  LED changes, the controller executes writes, and torque/power/gearing/wiring
+  are all eliminated in one step. If it does not, nothing you command is
+  landing. Hours went into torque and power theories that this would have
+  killed immediately.
+
+- **`jog_angle` does nothing on atomMain 6.2** — silently ignored, every time,
+  at every speed. `send_angles` is the working motion path, which is what
+  `mycobot_hardware_node` already uses, so the driver is unaffected. Worth
+  knowing before writing a diagnostic script around `jog_angle` and concluding
+  the arm is dead.
+
 - `colcon build --symlink-install` — without the symlink flag, edits to Python
   nodes do not take effect and `ros2 param get` keeps reporting old values.
 - The arm keeps moving after the stack dies unless `mc.stop()` runs; the

@@ -47,7 +47,7 @@ That one script does preflight, a build check, the launch, and then a menu:
 ```
 
 The arm stays **idle at home until you press `1`.** Home is
-`[0.8, 94.8, -149.5, 43.9, 2.3, 0.6]` degrees, commanded from wherever it happens to be —
+`[0, 90, -90, 0, 0, 0]` degrees, commanded from wherever it happens to be —
 the largest single move it makes, so check the path is clear.
 
 Prefer `./run.py` over a bare `ros2 launch`: it catches the kinds of stale copy

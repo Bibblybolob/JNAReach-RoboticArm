@@ -28,12 +28,19 @@ try:
         s.flush()
         time.sleep(0.5)
         data = s.read(512)
-        if len(data) >= 17 and data[0] == 0xfe and data[1] == 0xfe:
+        # Search for the reply header rather than assuming offset 0. The host
+        # UART carries the arm's INTERNAL Feetech servo bus (ff ff 07 02 ...)
+        # and ESP32 console output alongside real replies, so a good answer
+        # routinely arrives behind 100+ bytes of other traffic. Requiring
+        # data[0]==0xfe scored those as PARTIAL and kept resetting a UART that
+        # was already working -- observed 2026-08-12, a valid 17-byte reply
+        # sitting at the end of a 163-byte frame.
+        idx = data.find(b'\xfe\xfe\x0e\x20')
+        if idx >= 0 and len(data) >= idx + 17:
+            body = data[idx+4:idx+16]
             angles = []
             for i in range(6):
-                hi = data[4 + i*2]
-                lo = data[5 + i*2]
-                val = (hi << 8 | lo)
+                val = (body[i*2] << 8) | body[i*2 + 1]
                 if val > 32767: val -= 65536
                 angles.append(val / 100.0)
             print(f'OK attempt={attempt+1} angles={angles}')

@@ -41,6 +41,13 @@ Protocol: newline-delimited JSON, one request per line, one reply per line.
          checksum, so a corrupted SEND_ANGLES is simply a joint angle the arm
          obeys. Pass "force": true to override that, knowingly.
 
+    {"cmd": "call", "method": "set_servo_calibration", "args": [6]}
+      -> {"ok": true, "value": -1}
+         Any whitelisted pymycobot method, run under the broker's lock. "ok"
+         means the call was made, NOT that the arm acted: pymycobot returns
+         -1 for anything it cannot parse, and power_on / focus_all_servos
+         both return -1 while working perfectly. Verify by reading back.
+
     {"cmd": "health"}   -> link statistics
     {"cmd": "rebind"}   -> force a UART controller rebind
     {"cmd": "stop"}     -> mc.stop()
@@ -91,9 +98,30 @@ HEALTHY_FRACTION = 0.35
 class ArmState:
     """The single owner of the serial port, plus the latest known truth."""
 
+    # pymycobot methods clients may invoke through the broker.
+    #
+    # A whitelist, not a passthrough. set_servo_data writes raw Feetech
+    # registers, and addresses 5 and 6 in that map are servo ID and baud --
+    # a wrong write there takes a joint off the bus entirely. Reading those
+    # registers is fine and is how temperature is obtained.
+    ALLOWED_CALLS = {
+        # reads
+        'get_angles', 'get_coords', 'get_encoder', 'get_encoders',
+        'get_servo_data', 'get_servo_error', 'get_servo_max_temperature',
+        'get_servo_max_voltage', 'get_servo_firmware_version',
+        'is_servo_enable', 'is_all_servo_enable', 'is_power_on',
+        # motion and power
+        'send_angles', 'send_angle', 'send_coords', 'stop',
+        'power_on', 'power_off', 'focus_servo', 'focus_all_servos',
+        'release_servo', 'release_all_servos', 'set_color', 'set_fresh_mode',
+        # calibration -- the reason this exists
+        'set_servo_calibration',
+    }
+
     def __init__(self, poll_hz: float = 4.0, verbose: bool = True):
         self._lock = threading.Lock()
         self._sp = None
+        self._mc = None
         self._verbose = verbose
         self._poll_interval = 1.0 / poll_hz
 
@@ -107,12 +135,27 @@ class ArmState:
     # ---- serial ----
 
     def _open(self):
+        """Open the port once, as both a raw handle and a pymycobot handle.
+
+        Raw for polling, because searching for the fe fe 0e 20 header is more
+        reliable than pymycobot's parser on a link that also carries the
+        internal Feetech bus. pymycobot for everything else, because
+        reimplementing its frames by guessing opcodes is how you write a bad
+        value into a servo's ID or baud register.
+
+        pymycobot opens its own file descriptor on the same tty. That is only
+        safe because THIS process is the single owner and serialises every
+        use behind self._lock -- which is the entire point of the broker.
+        """
         import serial
+        from pymycobot import MyCobot
         self._sp = serial.Serial(port=PORT, baudrate=BAUD, bytesize=8,
                                  parity='N', stopbits=1, timeout=1.0,
                                  xonxoff=False, rtscts=False, dsrdtr=False)
         time.sleep(2.0)
         self._sp.reset_input_buffer()
+        self._mc = MyCobot(PORT, BAUD)
+        time.sleep(1.0)
 
     def _reopen_after_rebind(self):
         """Recover a wedged controller without anyone having to notice."""
@@ -122,6 +165,7 @@ class ArmState:
         except Exception:
             pass
         self._sp = None
+        self._mc = None
         self.rebinds += 1
         if self._verbose:
             print(f'  link silent; rebinding UART (#{self.rebinds})',
@@ -217,6 +261,29 @@ class ArmState:
             self._sp.flush()
         return {'ok': True, 'link': h}
 
+    def call(self, method: str, args) -> dict:
+        """Invoke a whitelisted pymycobot method under the broker's lock."""
+        if method not in self.ALLOWED_CALLS:
+            return {'ok': False,
+                    'error': f'{method!r} is not allowed through the broker. '
+                             f'Allowed: {sorted(self.ALLOWED_CALLS)}'}
+        with self._lock:
+            if self._mc is None:
+                self._open()
+            fn = getattr(self._mc, method, None)
+            if fn is None:
+                return {'ok': False,
+                        'error': f'pymycobot has no {method!r} '
+                                 '(version mismatch?)'}
+            try:
+                value = fn(*args)
+            except Exception as e:  # noqa: BLE001
+                return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+        # -1 is pymycobot's "could not parse", which is NOT the same as
+        # failure -- power_on and focus_all_servos both return -1 while
+        # working. Report it and let the caller judge.
+        return {'ok': True, 'value': value}
+
     def raw(self, data: bytes) -> dict:
         with self._lock:
             if self._sp is None:
@@ -261,6 +328,8 @@ class Handler(socketserver.StreamRequestHandler):
             return STATE.send_angles(req.get('angles', []),
                                      int(req.get('speed', 40)),
                                      bool(req.get('force', False)))
+        if cmd == 'call':
+            return STATE.call(req.get('method', ''), req.get('args', []))
         if cmd == 'rebind':
             with STATE._lock:
                 STATE._reopen_after_rebind()
@@ -294,6 +363,56 @@ def request(obj, timeout: float = 5.0, sock_path: str = SOCK_PATH):
         return json.loads(buf.decode() or '{}')
     finally:
         s.close()
+
+
+class BrokerMyCobot:
+    """Quacks like a pymycobot MyCobot, but goes through the broker.
+
+    Drop-in: existing code calling mc.get_encoder(3) or
+    mc.set_servo_calibration(6) needs no changes, it just stops opening the
+    serial port itself. That matters because a script holding the tty while
+    it waits at a prompt is what stranded the link for a whole session.
+
+    Returns pymycobot's own values, including -1, so callers that already
+    know -1 is not necessarily failure keep working.
+    """
+
+    def __init__(self, sock_path: str = SOCK_PATH):
+        self.sock_path = sock_path
+        if request({'cmd': 'health'}, sock_path=sock_path) is None:
+            raise ConnectionError(f'no broker listening on {sock_path}')
+
+    def __getattr__(self, method: str):
+        def call(*args):
+            r = request({'cmd': 'call', 'method': method, 'args': list(args)},
+                        timeout=20.0, sock_path=self.sock_path)
+            if r is None:
+                raise ConnectionError('broker went away mid-call')
+            if not r.get('ok'):
+                raise RuntimeError(r.get('error', 'broker refused the call'))
+            return r.get('value')
+        return call
+
+
+def connect_via_broker_or_direct(direct_factory, sock_path: str = SOCK_PATH,
+                                 verbose: bool = True):
+    """Prefer the broker; fall back to opening the port directly.
+
+    Scripts should use this rather than constructing MyCobot themselves. If
+    the broker is up, nothing else touches the tty; if it is not, behaviour
+    is exactly as before.
+    """
+    try:
+        mc = BrokerMyCobot(sock_path)
+        if verbose:
+            print(f'using the arm broker on {sock_path} '
+                  '(nothing else touches the port)')
+        return mc
+    except ConnectionError:
+        if verbose:
+            print('no broker running; opening the port directly. '
+                  'Start ./scripts/arm_broker.py to avoid contention.')
+        return direct_factory()
 
 
 def main() -> int:

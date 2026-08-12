@@ -20,8 +20,11 @@ conversion was never the problem -- the zero references were.
 """
 
 import argparse
+import os
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from pymycobot import MyCobot280
@@ -33,6 +36,24 @@ BAUD = '1000000'
 
 
 def connect(attempts=3, patience=25.0):
+    """Prefer the broker, so this script never holds the tty itself.
+
+    It sits at an interactive prompt partway through, and a script holding
+    /dev/ttyTHS1 while it waits for a human is what stranded the link for an
+    entire session -- diagnostics polling the same port saw silence and it
+    was read as a dead arm, three reflashes deep.
+    """
+    try:
+        from arm_broker import BrokerMyCobot
+        mc = BrokerMyCobot()
+        print('using the arm broker (the port is not opened here)')
+        return mc
+    except Exception:
+        pass
+    return _connect_direct(attempts, patience)
+
+
+def _connect_direct(attempts=3, patience=25.0):
     for attempt in range(attempts):
         print(f'connecting ({attempt + 1})...', end=' ', flush=True)
         try:

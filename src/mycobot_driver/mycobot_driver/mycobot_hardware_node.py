@@ -2362,10 +2362,28 @@ class MyCobotHardwareNode(Node):
             self._hold_last_err.clear()
             self._hold_no_progress.clear()
         else:
-            response.message = (
-                f'Homing timed out after {self._home_timeout}s; '
-                f'arm did not reach {target} within {self._settle_tol}deg'
-            )
+            # Say what it actually reached and how far off it was. "Timed
+            # out" alone reads as a stuck joint, and this session lost time
+            # to exactly that reading -- the joint under suspicion turned out
+            # to move 8deg in 4s on demand, with a normal temperature. The
+            # settle wait after the stepped walk is min(home_timeout, 10s),
+            # NOT home_timeout, so quoting home_timeout here overstated the
+            # patience by 4x and made a slow-but-fine arm look dead.
+            got = self._read_angles_deg_blocking(tries=4)
+            budget = min(self._home_timeout, 10.0)
+            if got:
+                worst_i = max(range(6), key=lambda i: abs(got[i] - target[i]))
+                response.message = (
+                    f'Homing did not settle within {budget:.0f}s: reached '
+                    f'{[round(g, 1) for g in got]}, wanted {target}. Furthest '
+                    f'off is {self.JOINT_NAMES[worst_i]} by '
+                    f'{abs(got[worst_i] - target[worst_i]):.1f}deg against a '
+                    f'{self._settle_tol}deg tolerance.')
+            else:
+                response.message = (
+                    f'Homing did not settle within {budget:.0f}s and the pose '
+                    'could not be read afterwards, so where the arm actually '
+                    'got to is unknown.')
             self.get_logger().warn(response.message)
         return response
 

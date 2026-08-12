@@ -197,6 +197,11 @@ class MyCobotHardwareNode(Node):
         # settle at home before anything else happens.
         self.declare_parameter('home_on_start', False)
         self.declare_parameter('home_settle_time', 0.5)
+        # Waypoints to break a homing move into. One big send_angles lets the
+        # joints race each other and the arm swings through a stretched-out
+        # pose on the way, which is the largest torque it ever sees. Capped by
+        # the actual distance travelled, so a short home is still one step.
+        self.declare_parameter('home_steps', 8)
 
         # --- Hold watchdog (torque loss) ---
         # A released arm sags, and because the jog profiler seeds its goal
@@ -220,6 +225,9 @@ class MyCobotHardwareNode(Node):
         # that really was moved by hand does not lurch. 0 restores the old
         # behaviour of carrying the measured value straight through.
         self.declare_parameter('hold_correction_deg', 2.0)
+        # Corrections with no progress before a joint is written off as
+        # stalled and left alone.
+        self.declare_parameter('hold_give_up_after', 6)
 
         # --- Jogging (visual servoing) ---
         # Largest displacement honoured in a single JointJog, in degrees. A
@@ -384,6 +392,7 @@ class MyCobotHardwareNode(Node):
         )
         self._home_speed = self.get_parameter('home_speed').get_parameter_value().integer_value
         self._home_timeout = self.get_parameter('home_timeout').get_parameter_value().double_value
+        self._home_steps = self.get_parameter('home_steps').get_parameter_value().integer_value
         self._home_on_start = self.get_parameter(
             'home_on_start').get_parameter_value().bool_value
         self._droop_tolerance = self.get_parameter(
@@ -394,6 +403,8 @@ class MyCobotHardwareNode(Node):
             'droop_recover').get_parameter_value().bool_value
         self._hold_correction = self.get_parameter(
             'hold_correction_deg').get_parameter_value().double_value
+        self._hold_give_up = self.get_parameter(
+            'hold_give_up_after').get_parameter_value().integer_value
         self._home_settle_time = self.get_parameter(
             'home_settle_time').get_parameter_value().double_value
         self._start_homed = False
@@ -439,6 +450,10 @@ class MyCobotHardwareNode(Node):
         self._last_jog_time_per_joint: dict[int, float] = {}
         self._droop_since = None
         self._droop_recoveries = 0
+        # Per-joint progress tracking for the hold correction, so a joint that
+        # cannot move is abandoned rather than held in a stall.
+        self._hold_last_err: dict[int, float] = {}
+        self._hold_no_progress: dict[int, int] = {}
         self._last_jog_time = 0.0
         self._jog_profile = self.get_parameter(
             'jog_profile').get_parameter_value().bool_value
@@ -1378,6 +1393,30 @@ class MyCobotHardwareNode(Node):
                 err = want - target_deg[i]
                 if abs(err) < 1e-3:
                     continue
+                # Give up on a joint that is not responding. Correcting a
+                # joint that cannot move does not recover it -- it holds a
+                # stall, and stall current is heavy. joint3 was pushed toward
+                # its -150 limit every 0.5s for tens of seconds while sitting
+                # at -126, and the controller then browned out mid-frame
+                # (`cmd_len error`, then a panic). Backing off is the safe
+                # failure: the arm stays where it is instead of grinding.
+                prev = self._hold_last_err.get(i)
+                if prev is not None and abs(err) > abs(prev) - 0.25:
+                    self._hold_no_progress[i] = self._hold_no_progress.get(i, 0) + 1
+                else:
+                    self._hold_no_progress[i] = 0
+                self._hold_last_err[i] = err
+                if self._hold_no_progress.get(i, 0) >= self._hold_give_up:
+                    if self._hold_no_progress[i] == self._hold_give_up:
+                        self.get_logger().error(
+                            f'{self.JOINT_NAMES[i]} has not moved toward '
+                            f'{want:.1f} in {self._hold_give_up} corrections '
+                            f'(stuck at {target_deg[i]:.1f}). It is stalled or '
+                            'blocked, so it will not be commanded further -- '
+                            'holding a stall draws heavy current and can brown '
+                            'out the controller. Home the arm to clear this.')
+                    continue
+
                 step = max(-self._hold_correction,
                            min(self._hold_correction, err))
                 lo, hi = self._joint_limits_deg[i]
@@ -1669,6 +1708,87 @@ class MyCobotHardwareNode(Node):
         except Exception as e:
             self.get_logger().warn(
                 f'jog rejected: {e}', throttle_duration_sec=2.0)
+
+    def _home_in_steps(self, target_deg) -> bool:
+        """Walk to home along interpolated waypoints instead of one big move.
+
+        A single send_angles releases all six joints at once and they travel at
+        their own rates, so the arm passes through whatever configuration that
+        happens to produce. Coming from a stretched-out pose, joint2 reaches
+        90deg while joint3 is still unfolded -- the D405 out at maximum lever
+        arm, which is the worst torque this arm ever sees. That spike is what
+        stalls joint3, and a stalled servo's current draw is a plausible route
+        to the ESP32 browning out: `cmd_len error` is a length field that did
+        not survive the wire, and the LoadProhibited panic follows from parsing
+        the garbage.
+
+        Stepping keeps every intermediate pose close to the straight line
+        between start and finish, so the arm folds as it rises rather than
+        reaching first and folding after.
+
+        Returns True if home was reached. Gives up early -- and says which
+        joint -- rather than grinding a stalled servo, because holding a stall
+        is exactly the condition to avoid.
+        """
+        start = self._read_angles_deg_blocking()
+        if start is None:
+            self.get_logger().warn(
+                'Cannot read a starting pose; falling back to a single move.')
+            with self._lock:
+                self._send_angles(self._mc, list(target_deg), self._home_speed)
+            return self._wait_until_reached(
+                target_deg, tolerance_deg=self._settle_tol,
+                timeout=self._home_timeout)
+
+        span = max(abs(t - s) for s, t in zip(start, target_deg))
+        steps = max(1, min(self._home_steps, int(span / 8.0) + 1))
+        self.get_logger().info(
+            f'Homing in {steps} step(s) from {[round(s, 1) for s in start]} '
+            f'(largest joint move {span:.0f}deg)')
+
+        stalled_for = 0
+        prev_err = None
+        for k in range(1, steps + 1):
+            frac = k / steps
+            way = [s + (t - s) * frac for s, t in zip(start, target_deg)]
+            with self._lock:
+                self._send_angles(self._mc, way, self._home_speed)
+            # Long enough for a step of this size to actually execute; joint1
+            # measured 51.6 deg/s flat out, and home_speed is well below that.
+            time.sleep(max(0.35, span / steps / 25.0))
+
+            now = self._read_angles_deg_blocking(tries=3)
+            if now is None:
+                continue
+            err = max(abs(n - t) for n, t in zip(now, target_deg))
+            if prev_err is not None and err > prev_err - 0.5:
+                stalled_for += 1
+                if stalled_for >= 4:
+                    worst = max(range(6), key=lambda i: abs(now[i] - target_deg[i]))
+                    self.get_logger().error(
+                        f'Homing stopped making progress: '
+                        f'{self.JOINT_NAMES[worst]} is at {now[worst]:.1f} and '
+                        f'{target_deg[worst]:.1f} was asked for, unchanged over '
+                        f'{stalled_for} steps. Not commanding it further -- '
+                        'holding a stalled servo draws heavy current and is a '
+                        'good way to brown out the controller.')
+                    return False
+            else:
+                stalled_for = 0
+            prev_err = err
+
+        return self._wait_until_reached(
+            target_deg, tolerance_deg=self._settle_tol,
+            timeout=min(self._home_timeout, 10.0))
+
+    def _read_angles_deg_blocking(self, tries: int = 6):
+        """One trustworthy pose in degrees, or None. Most reads come back -1."""
+        for _ in range(tries):
+            rad = self._read_angles_rad()
+            if rad is not None:
+                return [math.degrees(r) for r in rad]
+            time.sleep(0.15)
+        return None
 
     def _send_angles(self, mc, angles_deg, speed) -> None:
         """send_angles, without waiting for a reply that never comes.
@@ -2095,21 +2215,9 @@ class MyCobotHardwareNode(Node):
             self._focus_servos()
             reached = False
             for attempt in range(2):
-                with self._lock:
-                    self._send_angles(self._mc, target, self._home_speed)
-                # A home that works arrives in 2-5s, so spending the full
-                # budget on the first try only delays the re-power that
-                # actually fixes it -- and with two attempts that was 80s of
-                # the stack sitting on its hands with the jog gate shut. Give
-                # the retry the full timeout, since by then a slow-but-moving
-                # arm is the remaining possibility worth waiting out.
-                budget = (min(self._home_timeout, 12.0) if attempt == 0
-                          else self._home_timeout)
-                reached = self._wait_until_reached(
-                    target,
-                    tolerance_deg=self._settle_tol,
-                    timeout=budget,
-                )
+                # Stepped, so the arm folds as it rises instead of
+                # stretching out first -- see _home_in_steps.
+                reached = self._home_in_steps(target)
                 if reached:
                     break
                 if attempt == 0:
@@ -2144,6 +2252,8 @@ class MyCobotHardwareNode(Node):
             # meant to be holding. The watchdog measures against it.
             self._hold_reference_deg = list(target)
             self._droop_since = None
+            self._hold_last_err.clear()
+            self._hold_no_progress.clear()
         else:
             response.message = (
                 f'Homing timed out after {self._home_timeout}s; '

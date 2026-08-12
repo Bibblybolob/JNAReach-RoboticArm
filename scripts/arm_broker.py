@@ -88,6 +88,10 @@ SOCK_PATH = os.environ.get('MYCOBOT_SOCK', '/tmp/mycobot-arm.sock')
 # does not look like a dead arm and one good one does not look like a fixed
 # one.
 WINDOW = 40
+# How long to wait for a GET_ANGLES reply before giving up on that poll. The
+# arm has been measured replying in 727ms; anything shorter than that throws
+# away good answers and reports a healthy link as dead.
+POLL_WINDOW_S = 1.5
 # Below this fraction of the window answering, commanding motion is refused.
 HEALTHY_FRACTION = 0.35
 
@@ -101,6 +105,8 @@ class ArmState:
     # registers, and addresses 5 and 6 in that map are servo ID and baud --
     # a wrong write there takes a joint off the bus entirely. Reading those
     # registers is fine and is how temperature is obtained.
+    POLL_WINDOW = POLL_WINDOW_S
+
     ALLOWED_CALLS = {
         # reads
         'get_angles', 'get_coords', 'get_encoder', 'get_encoders',
@@ -147,7 +153,6 @@ class ArmState:
         use behind self._lock -- which is the entire point of the broker.
         """
         import serial
-        from pymycobot import MyCobot, MyCobot280
         self._sp = serial.Serial(port=PORT, baudrate=BAUD, bytesize=8,
                                  parity='N', stopbits=1, timeout=1.0,
                                  xonxoff=False, rtscts=False, dsrdtr=False)
@@ -162,9 +167,22 @@ class ArmState:
         #     but no fresh-mode calls.
         # Holding one and not the other means some caller fails at runtime
         # with 'pymycobot has no ...' after everything looked fine.
+        # NOT opened here. pymycobot opens its own file descriptor on the
+        # same tty, so holding both plus the raw handle means three readers on
+        # one port -- and a read() on any of them can consume bytes meant for
+        # another. Polling only needs the raw handle; the pymycobot ones are
+        # opened on first use and only matter while a call is in flight.
+        self._mc = None
+        self._mc280 = None
+
+    def _ensure_pymycobot(self):
+        """Open the pymycobot handles on demand, under the lock."""
+        if self._mc is not None:
+            return
+        from pymycobot import MyCobot, MyCobot280
         self._mc = MyCobot(PORT, BAUD)
         self._mc280 = MyCobot280(PORT, str(BAUD))
-        time.sleep(1.0)
+        time.sleep(0.5)
 
     def _reopen_after_rebind(self):
         """Recover a wedged controller without anyone having to notice."""
@@ -194,8 +212,30 @@ class ArmState:
         self._sp.reset_input_buffer()
         self._sp.write(GET_ANGLES)
         self._sp.flush()
-        time.sleep(0.25)
-        d = self._sp.read(16384)
+
+        # Read until the reply appears, up to POLL_WINDOW -- do NOT sleep a
+        # fixed guess and read once.
+        #
+        # The fixed 250ms wait was silently discarding good replies. Measured
+        # 2026-08-12: a successful get_angles took 727ms, so the read found an
+        # empty buffer and the NEXT poll's reset_input_buffer() threw away the
+        # reply that had since arrived. Reads sat at 2% valid while writes
+        # worked perfectly -- which reads as a dead link and is not one.
+        #
+        # Exits as soon as a complete frame is seen, so a healthy arm still
+        # polls fast; only a slow one costs the extra wait.
+        d = b''
+        deadline = time.monotonic() + self.POLL_WINDOW
+        i = -1
+        while time.monotonic() < deadline:
+            chunk = self._sp.read(4096)
+            if chunk:
+                d += chunk
+                i = d.find(REPLY_HEADER)
+                if i >= 0 and len(d) >= i + 17:
+                    break
+            else:
+                time.sleep(0.02)
         if not d:
             return False
         i = d.find(REPLY_HEADER)
@@ -278,8 +318,9 @@ class ArmState:
                     'error': f'{method!r} is not allowed through the broker. '
                              f'Allowed: {sorted(self.ALLOWED_CALLS)}'}
         with self._lock:
-            if self._mc is None:
+            if self._sp is None:
                 self._open()
+            self._ensure_pymycobot()
             # Model-specific class first, then the generic one. See _open().
             fn = None
             for handle in (self._mc280, self._mc):

@@ -159,7 +159,22 @@ def capture_poses(args) -> int:
     if frac is None:
         print('No broker is running. Start ./scripts/arm_broker.py first.')
         return 1
-    if frac < args.min_link:
+    if args.commanded_angles:
+        # Degraded mode, for when writes land but reads do not -- a real and
+        # separately-failing pair on this arm, confirmed by the LED cycling on
+        # command while reads sat at 2%.
+        #
+        # The cost is real and worth stating: the arm settles about a degree
+        # from where it was told to go, and that error goes straight into the
+        # transform instead of being measured out. Roughly 4mm of position
+        # error at 250mm. Much better than no calibration, clearly worse than
+        # a clean one -- redo it properly when reads come back.
+        print(f'link {frac*100:.0f}% valid -- COMMANDED-ANGLE MODE')
+        print('  Using commanded joint angles, not measured ones. The arm '
+              'settles ~1deg off target and that error enters the result: '
+              'expect ~4mm of position error at 250mm.')
+        print('  Redo this without --commanded-angles once reads recover.')
+    elif frac < args.min_link:
         print(f'Link is {frac*100:.0f}% valid; calibration needs at least '
               f'{args.min_link*100:.0f}%.')
         print('Readings that arrive late get paired with the wrong image, '
@@ -181,7 +196,12 @@ def capture_poses(args) -> int:
                      'force': True}, timeout=25)
             time.sleep(args.settle)
             settled = time.monotonic()
-            actual = pose_after(settled)
+            if args.commanded_angles:
+                # Give it longer to arrive, since nothing will confirm it did.
+                time.sleep(args.settle)
+                actual = list(q)
+            else:
+                actual = pose_after(settled)
             if actual is None:
                 print(f'  {i:02d}: no post-move pose read within 25s '
                       '-- skipped rather than guessed')
@@ -343,7 +363,15 @@ def solve(args) -> int:
                    'captures_used': used,
                    'rotation_spread_deg': spread,
                    'solver_disagreement_mm': spread_mm,
-                   'square_mm': args.square_mm}, f, indent=2)
+                   'square_mm': args.square_mm,
+                   'commanded_angles': bool(args.commanded_angles),
+                   'accuracy_note': (
+                       'DEGRADED: solved from commanded joint angles because '
+                       'reads were unavailable. Expect ~4mm position error. '
+                       'Recalibrate without --commanded-angles.'
+                       if args.commanded_angles else
+                       'solved from measured joint angles')},
+                  f, indent=2)
     print(f'\nwrote {out}')
     print('This is FIXED to the mounting. Redo it only if the camera is '
           'remounted or knocked -- not when the robot is moved somewhere new.')
@@ -362,6 +390,10 @@ def main() -> int:
     ap.add_argument('--square-mm', type=float, default=DEFAULT_SQUARE_MM,
                     help='MEASURED square size of the printed board')
     ap.add_argument('--settle', type=float, default=2.5)
+    ap.add_argument('--commanded-angles', action='store_true',
+                    help='record commanded instead of measured joint angles. '
+                         'For when writes land but reads do not. Costs ~4mm '
+                         'of accuracy; redo properly when reads recover')
     ap.add_argument('--min-link', type=float, default=0.6,
                     help='refuse to collect below this link reliability; '
                          'calibrating on unreliable readings produces a '

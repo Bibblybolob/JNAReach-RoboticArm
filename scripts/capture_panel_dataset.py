@@ -15,9 +15,11 @@ vary distance -- 15-40cm is the useful band (the D405 gives valid depth from
     ./scripts/capture_panel_dataset.py --out ~/panel_dataset --shots 2
 
 Arm is returned home afterwards. Images only -- labelling happens elsewhere
-(Roboflow, labelImg); export YOLO format with the SAME 17 class names in the
-SAME order as entc-elevator-button-detection-1/data.yaml or the class ids
-will not line up.
+(Roboflow, labelImg); export YOLO format with the SAME 14 class names in the
+SAME order as ~/panel_dataset/data.yaml (button-1..button-10, button-P,
+open, close, alarm) or the class ids will not line up. NOT the ENTC
+17-class list -- that has no button-4..10 and no P, which is why the
+shipped model mislabels most of this panel.
 """
 from __future__ import annotations
 
@@ -27,6 +29,19 @@ import time
 
 import cv2
 import numpy as np
+
+# Route through the arm broker when one is running, so this script does not
+# open /dev/ttyTHS1 itself. Two openers interleave bytes on that tty and the
+# Atom reports the resulting bad length field as `cmd_len error` -- which
+# reads as a firmware fault and has cost whole sessions.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+try:
+    from arm_broker import connect_arm as _connect_arm
+except Exception:  # broker module unavailable; behave exactly as before
+    def _connect_arm(port, factory, **kw):
+        return factory()
+
 
 HOME = [0, 90, -149, 55, 0, 0]
 
@@ -59,7 +74,8 @@ def main() -> int:
     mc = None
     if not args.no_arm:
         from pymycobot import MyCobot
-        mc = MyCobot(args.serial_port, args.baud)
+        mc = _connect_arm(args.serial_port,
+                          lambda: MyCobot(args.serial_port, args.baud))
         time.sleep(2)
         if mc.get_angles() is None:
             print('arm not answering -- check the UART wiring, or use --no-arm')

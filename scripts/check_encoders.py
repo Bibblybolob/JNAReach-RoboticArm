@@ -23,6 +23,19 @@ THE ARM WILL SAG WHEN RELEASED. Hold it.
 import sys
 import time
 
+# Route through the arm broker when one is running, so this script does not
+# open /dev/ttyTHS1 itself. Two openers interleave bytes on that tty and the
+# Atom reports the resulting bad length field as `cmd_len error` -- which
+# reads as a firmware fault and has cost whole sessions.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+try:
+    from arm_broker import connect_arm as _connect_arm
+except Exception:  # broker module unavailable; behave exactly as before
+    def _connect_arm(port, factory, **kw):
+        return factory()
+
+
 try:
     from pymycobot import MyCobot280
 except ImportError:
@@ -38,7 +51,7 @@ def connect(patience=40.0):
     """One open, then patient retries -- reopening is the wrong recovery on
     this port, which needs settling time after an open."""
     print(f'connecting to {PORT}...', end=' ', flush=True)
-    mc = MyCobot280(PORT, BAUD)
+    mc = _connect_arm(PORT, lambda: MyCobot280(PORT, BAUD))
     time.sleep(3.0)
     deadline = time.monotonic() + patience
     dots = 0

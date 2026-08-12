@@ -120,6 +120,7 @@ class ArmState:
         self._lock = threading.Lock()
         self._sp = None
         self._mc = None
+        self._mc280 = None
         self._verbose = verbose
         self._poll_interval = 1.0 / poll_hz
 
@@ -146,13 +147,23 @@ class ArmState:
         use behind self._lock -- which is the entire point of the broker.
         """
         import serial
-        from pymycobot import MyCobot
+        from pymycobot import MyCobot, MyCobot280
         self._sp = serial.Serial(port=PORT, baudrate=BAUD, bytesize=8,
                                  parity='N', stopbits=1, timeout=1.0,
                                  xonxoff=False, rtscts=False, dsrdtr=False)
         time.sleep(2.0)
         self._sp.reset_input_buffer()
+        # BOTH classes, because neither covers the whole surface this repo
+        # uses and they differ in both directions:
+        #   MyCobot280 has set_fresh_mode/get_fresh_mode (the driver needs
+        #     them) but no get_servo_data/get_servo_error;
+        #   MyCobot has the raw servo-register reads -- which is how servo
+        #     temperature is obtained, the only torque proxy on this arm --
+        #     but no fresh-mode calls.
+        # Holding one and not the other means some caller fails at runtime
+        # with 'pymycobot has no ...' after everything looked fine.
         self._mc = MyCobot(PORT, BAUD)
+        self._mc280 = MyCobot280(PORT, str(BAUD))
         time.sleep(1.0)
 
     def _reopen_after_rebind(self):
@@ -164,6 +175,7 @@ class ArmState:
             pass
         self._sp = None
         self._mc = None
+        self._mc280 = None
         self.rebinds += 1
         if self._verbose:
             print(f'  link silent; rebinding UART (#{self.rebinds})',
@@ -268,11 +280,16 @@ class ArmState:
         with self._lock:
             if self._mc is None:
                 self._open()
-            fn = getattr(self._mc, method, None)
+            # Model-specific class first, then the generic one. See _open().
+            fn = None
+            for handle in (self._mc280, self._mc):
+                if handle is not None and hasattr(handle, method):
+                    fn = getattr(handle, method)
+                    break
             if fn is None:
                 return {'ok': False,
-                        'error': f'pymycobot has no {method!r} '
-                                 '(version mismatch?)'}
+                        'error': f'neither MyCobot280 nor MyCobot has '
+                                 f'{method!r} (pymycobot version mismatch?)'}
             try:
                 value = fn(*args)
             except Exception as e:  # noqa: BLE001
@@ -390,6 +407,30 @@ class BrokerMyCobot:
                 raise RuntimeError(r.get('error', 'broker refused the call'))
             return r.get('value')
         return call
+
+
+def connect_arm(port: str, direct_factory, sock_path: str = SOCK_PATH,
+                verbose: bool = True):
+    """Broker if it owns `port`, otherwise open directly. Use this everywhere.
+
+    Port-aware on purpose. probe_usb_arm.py and probe_uart_bridge.py exist to
+    talk to a DIFFERENT interface -- the Atom's USB-C console, or a USB-TTL
+    adapter on /dev/ttyUSB0 -- and silently routing those through the broker
+    would answer questions about the wrong wire, which is worse than not
+    running them.
+    """
+    if os.path.realpath(port) != os.path.realpath(PORT):
+        return direct_factory()
+    try:
+        mc = BrokerMyCobot(sock_path)
+        if verbose:
+            print(f'using the arm broker (nothing else opens {port})')
+        return mc
+    except ConnectionError:
+        if verbose:
+            print(f'no broker running; opening {port} directly. '
+                  'Start ./scripts/arm_broker.py to avoid contention.')
+        return direct_factory()
 
 
 def connect_via_broker_or_direct(direct_factory, sock_path: str = SOCK_PATH,

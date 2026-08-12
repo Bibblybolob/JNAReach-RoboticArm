@@ -132,7 +132,17 @@ def generate_launch_description():
                     'approaching a button needs range, unlike plain '
                     'centring which is 2D')
     rs_serial_arg = DeclareLaunchArgument('rs_serial', default_value='')
-    rs_align_arg = DeclareLaunchArgument(
+    rs_emitter_arg = DeclareLaunchArgument(
+        'rs_emitter', default_value='true',
+        description='IR projector on. A printed or blank panel gives stereo '
+                    'matching no texture, so depth comes back empty and every '
+                    'detection is dropped as no_depth')
+    rs_laser_power_arg = DeclareLaunchArgument(
+        'rs_laser_power', default_value='150.0',
+        description='Projector strength. Higher recovers depth on flat '
+                    'surfaces; too high puts visible speckle into the colour '
+                    'image the detector runs on. 0 leaves the firmware default')
+    rs_align_depth_to_color_arg = DeclareLaunchArgument(
         'rs_align_depth_to_color', default_value='false',
         description='Needed on a D435/D455, a no-op on a D405 whose colour '
                     'and depth come from the same imagers.')
@@ -263,6 +273,8 @@ def generate_launch_description():
             'rs_serial': LaunchConfiguration('rs_serial'),
             'rs_align_depth_to_color': LaunchConfiguration(
                 'rs_align_depth_to_color'),
+            'rs_emitter': LaunchConfiguration('rs_emitter'),
+            'rs_laser_power': LaunchConfiguration('rs_laser_power'),
         }.items(),
     )
 
@@ -341,7 +353,9 @@ def generate_launch_description():
         rs_fps_arg,
         rs_depth_arg,
         rs_serial_arg,
-        rs_align_arg,
+        rs_emitter_arg,
+        rs_laser_power_arg,
+        rs_align_depth_to_color_arg,
         gain_arg,
         command_lag_arg,
         lag_comp_arg,

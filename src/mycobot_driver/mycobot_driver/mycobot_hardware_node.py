@@ -228,6 +228,10 @@ class MyCobotHardwareNode(Node):
         # Corrections with no progress before a joint is written off as
         # stalled and left alone.
         self.declare_parameter('hold_give_up_after', 6)
+        # Error below which a joint counts as already holding. Must exceed
+        # the servo's own resolution and backlash or it chases noise and then
+        # reports a stall that is not happening.
+        self.declare_parameter('hold_deadband_deg', 1.5)
 
         # --- Jogging (visual servoing) ---
         # Largest displacement honoured in a single JointJog, in degrees. A
@@ -405,6 +409,8 @@ class MyCobotHardwareNode(Node):
             'hold_correction_deg').get_parameter_value().double_value
         self._hold_give_up = self.get_parameter(
             'hold_give_up_after').get_parameter_value().integer_value
+        self._hold_deadband = self.get_parameter(
+            'hold_deadband_deg').get_parameter_value().double_value
         self._home_settle_time = self.get_parameter(
             'home_settle_time').get_parameter_value().double_value
         self._start_homed = False
@@ -1429,7 +1435,18 @@ class MyCobotHardwareNode(Node):
                     continue
                 want = self._hold_reference_deg[i]
                 err = want - target_deg[i]
-                if abs(err) < 1e-3:
+                # Deadband. Below this the joint is where it was asked to be
+                # as far as this arm can tell, and correcting is noise.
+                #
+                # 1e-3 was far too tight: joint4 sitting 0.8deg off -- inside
+                # the servo's own resolution and backlash -- never closed that
+                # gap, so the no-progress counter ran up and the arm reported
+                # 'joint4 has not moved toward 55.0 in 6 corrections' about a
+                # joint that was holding perfectly well. A false stall report
+                # is worse than none: it is exactly the message that sends
+                # someone looking for a mechanical fault.
+                if abs(err) < self._hold_deadband:
+                    self._hold_no_progress[i] = 0
                     continue
                 # Give up on a joint that is not responding. Correcting a
                 # joint that cannot move does not recover it -- it holds a

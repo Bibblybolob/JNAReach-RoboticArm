@@ -132,6 +132,12 @@ class CameraNode(Node):
         # sensor on a different baseline, alignment is required for a pixel in
         # one image to mean anything in the other.
         self.declare_parameter('rs_align_depth_to_color', False)
+        # IR projector. On by default because this arm looks at flat, matte
+        # targets -- a printed panel gives stereo matching nothing to work
+        # with, and the depth simply comes back empty. 0 laser power leaves
+        # whatever the firmware defaulted to.
+        self.declare_parameter('rs_emitter', True)
+        self.declare_parameter('rs_laser_power', 150.0)
         # AUTO-EXPOSURE IS A FRAME RATE CONTROL. The same trap as the V4L2
         # path, and it was missed here: a sensor in dim light lengthens its
         # exposure to brighten the image, and frame time cannot be shorter
@@ -516,6 +522,7 @@ class CameraNode(Node):
                     'published in millimetres regardless of model.')
 
                 self._apply_rs_exposure(rs, dev)
+                self._apply_rs_emitter(rs, dev)
 
                 # Factory intrinsics. Nothing else in this project has ever
                 # had them, so this is what unblocks depth downstream.
@@ -586,6 +593,65 @@ class CameraNode(Node):
                         pipeline.stop()
                     except Exception:
                         pass
+
+    def _apply_rs_emitter(self, rs, dev) -> None:
+        """Project IR texture, so flat surfaces get a depth reading.
+
+        Stereo depth works by matching features between two images. A blank
+        wall, or a MATTE PRINTED SHEET, has nothing to match, so the sensor
+        returns no measurement there rather than a wrong one. The projector
+        paints a speckle pattern that gives it something to correlate.
+
+        Measured need: with the panel in view and depth otherwise working,
+        the detection filter reported {'no_depth': 320, 'out_of_range': 12,
+        'inconsistent': 18} -- nine detections in ten landing where the D405
+        resolved nothing at all. Every one of those ends a TRACKING episode,
+        which is why the approach never got more than two jogs in before the
+        target evaporated.
+
+        Not free on colour: the D405's colour comes from the same stereo
+        imagers, so a strong projector can put a visible speckle into the
+        image the detector runs on. laser_power is exposed for that trade --
+        raise it for depth on blank surfaces, lower it if detections start
+        suffering.
+        """
+        if not bool(self.get_parameter('rs_emitter').value):
+            self.get_logger().info(
+                'IR emitter left off (rs_emitter:=false). On a flat, matte '
+                'target expect depth dropouts -- there is nothing for stereo '
+                'matching to lock onto.')
+            return
+
+        power = float(self.get_parameter('rs_laser_power').value)
+        applied = False
+        for sensor in dev.query_sensors():
+            try:
+                if sensor.supports(rs.option.emitter_enabled):
+                    sensor.set_option(rs.option.emitter_enabled, 1)
+                    applied = True
+                if power > 0 and sensor.supports(rs.option.laser_power):
+                    rng = sensor.get_option_range(rs.option.laser_power)
+                    want = max(rng.min, min(rng.max, power))
+                    sensor.set_option(rs.option.laser_power, want)
+                    self.get_logger().info(
+                        f'IR emitter on, laser power {want:.0f} '
+                        f'(range {rng.min:.0f}-{rng.max:.0f}).')
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warn(f'emitter option refused: {e}')
+        if applied:
+            self.get_logger().info(
+                'IR emitter enabled -- flat surfaces should now return depth. '
+                'If detection confidence drops, the speckle is showing in the '
+                'colour image: lower rs_laser_power.')
+        else:
+            self.get_logger().info(
+                'This camera has no IR projector, which for a D405 is by '
+                'design -- it is a PASSIVE close-range stereo camera, unlike '
+                'a D435/D455. So depth on a flat, matte target cannot be '
+                'improved by projecting texture; there is nothing to switch '
+                'on. Give the surface real texture, light it better, or '
+                'accept the dropouts and let the depth filter drop those '
+                'detections.')
 
     def _apply_rs_exposure(self, rs, dev) -> None:
         """Stop the sensor trading frame rate for brightness.

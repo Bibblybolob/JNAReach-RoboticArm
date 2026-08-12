@@ -19,6 +19,7 @@ maths was exact (360/4096 per count, verified against all six joints), so the
 conversion was never the problem -- the zero references were.
 """
 
+import argparse
 import sys
 import time
 
@@ -72,6 +73,22 @@ def retry(fn, *args, tries=8):
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--joint', type=int, action='append', default=None,
+                    metavar='N',
+                    help='calibrate only this joint (repeatable). Use when a '
+                         'joint\'s notch does not correspond to the zero you '
+                         'want -- j6 on this arm sits ~116deg out when set '
+                         'from its notch, because that notch is not oriented '
+                         'like the others. Put the joint where it SHOULD read '
+                         'zero and calibrate it alone.')
+    args = ap.parse_args()
+
+    joints = sorted(set(args.joint)) if args.joint else list(range(1, 7))
+    for j in joints:
+        if not 1 <= j <= 6:
+            sys.exit(f'joint {j} is not 1-6')
+
     mc = connect()
     if mc is None:
         sys.exit('could not reach the arm')
@@ -81,8 +98,14 @@ def main():
     print('  encoders:', [retry(mc.get_encoder, j) for j in range(1, 7)])
     print('  angles:  ', mc.get_angles())
     print()
-    print('This writes the CURRENT physical pose as zero for all six joints.')
-    print('Every joint must be sitting on its notch right now.')
+    if joints == list(range(1, 7)):
+        print('This writes the CURRENT physical pose as zero for all six joints.')
+        print('Every joint must be sitting on its notch right now.')
+    else:
+        names = ', '.join(f'joint{j}' for j in joints)
+        print(f'This writes the CURRENT physical pose as zero for {names}.')
+        print('Those joints must be where you want them to read zero right')
+        print('now. The others are left exactly as they are.')
     try:
         if not input('Aligned and ready? [y/N] ').strip().lower().startswith('y'):
             sys.exit('aborted -- nothing written')
@@ -90,7 +113,7 @@ def main():
         sys.exit('\naborted -- nothing written')
 
     print()
-    for joint in range(1, 7):
+    for joint in joints:
         try:
             mc.set_servo_calibration(joint)
             print(f'  joint{joint} calibrated')

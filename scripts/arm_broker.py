@@ -54,19 +54,16 @@ Protocol: newline-delimited JSON, one request per line, one reply per line.
 
 Install it so it survives a logout:
 
-    sudo tee /etc/systemd/system/mycobot-broker.service >/dev/null <<'UNIT'
-    [Unit]
-    Description=myCobot arm serial broker
-    After=multi-user.target
-    [Service]
-    ExecStart=/usr/bin/python3 /home/jonathan/mycobot_project/scripts/arm_broker.py
-    User=jonathan
-    Restart=always
-    RestartSec=3
-    [Install]
-    WantedBy=multi-user.target
-    UNIT
+    sudo cp /home/jonathan/mycobot_project/scripts/mycobot-broker.service \
+            /etc/systemd/system/
+    sudo systemctl daemon-reload
     sudo systemctl enable --now mycobot-broker
+
+The unit sets PrivateTmp=no deliberately. With a private /tmp the socket
+exists only inside the service, every client falls back to opening the serial
+port directly, and the concurrent-access corruption this exists to prevent
+comes straight back -- while the broker looks perfectly healthy from inside
+its own namespace.
 """
 from __future__ import annotations
 

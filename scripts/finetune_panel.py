@@ -7,8 +7,8 @@ backbone -- which is the part worth having, since it already knows what
 elevator buttons look like. That is why this takes 1-2 hours instead of the
 6.75h the original run took.
 
-    ./scripts/finetune_panel.py                     # from the 960 run
-    ./scripts/finetune_panel.py --weights elevator_buttons.pt --imgsz 640
+    ./scripts/finetune_panel.py                     # from elevator_buttons.pt
+    ./scripts/finetune_panel.py --weights runs_960/yolo11s_960/weights/best.pt
 
 Match --imgsz to what you will deploy at: the TensorRT engine is built for one
 resolution, and inference cost scales with it (640 -> 19.5ms, 960 -> ~26ms

@@ -99,6 +99,29 @@ def joint_points(angles_deg, tool_offset_m: float = TOOL_OFFSET_M):
     return pts
 
 
+def flange_transform(angles_deg):
+    """4x4 pose of the flange in the base frame, for angles in degrees.
+
+    Returned as a plain nested list so this module keeps its no-numpy, no-ROS
+    property -- callers that want numpy can wrap it.
+
+    Hand-eye calibration needs the flange ORIENTATION as well as its position,
+    which joint_points() throws away. Same chain, same conventions, so the two
+    cannot drift apart.
+    """
+    q = [math.radians(a) for a in angles_deg]
+    T = [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+    for i in range(6):
+        xyz, rpy_ = CHAIN[i]
+        R = _rpy(*rpy_)
+        c, s = math.cos(q[i]), math.sin(q[i])
+        Rz = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+        M = [[sum(R[r][k] * Rz[k][cc] for k in range(3)) for cc in range(3)]
+             + [xyz[r]] for r in range(3)] + [[0.0, 0.0, 0.0, 1.0]]
+        T = _matmul(T, M)
+    return T
+
+
 def _sampled(pts, per_link: int = 4, skip_first_links: int = 1):
     """Joint points plus samples along each link.
 

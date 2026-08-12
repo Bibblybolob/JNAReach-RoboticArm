@@ -191,6 +191,8 @@ class CameraNode(Node):
         self._height = None
         self._latest_frame = None
         self._latest_depth = None
+        # Millimetres per raw depth unit; set once the device is open.
+        self._depth_scale_mm = 1.0
         self._frame_lock = threading.Lock()
         # Camera intrinsics. None until a source supplies them, which today
         # only source:=realsense does -- the other two paths have no way to
@@ -491,6 +493,28 @@ class CameraNode(Node):
                         f'3 for full rate -- expect a silently reduced frame '
                         f'rate, which caps the whole servo loop.')
 
+                # Depth scale: metres per raw unit. NOT the same across
+                # models, and assuming it is silently scales every distance.
+                # A D435 uses 0.001 (1mm per unit) which matches the 16UC1
+                # convention of millimetres, so publishing raw is correct
+                # there. A D405 uses 0.0001 -- tenths of a millimetre -- so
+                # raw values are 10x the millimetre figure.
+                #
+                # That was live for a whole session: the depth filter saw
+                # "3423-35561mm, median 5451" and rejected everything as far
+                # beyond the sensor's 50cm range, when those were really
+                # 342-3556mm with the panel sitting at 545mm. The panel was
+                # in view the entire time.
+                try:
+                    ds = dev.first_depth_sensor().get_depth_scale()
+                except Exception:
+                    ds = 0.001
+                self._depth_scale_mm = ds * 1000.0
+                self.get_logger().info(
+                    f'depth scale: {ds:.6f} m per unit '
+                    f'({self._depth_scale_mm:.4f} mm) -- /camera/depth_raw is '
+                    'published in millimetres regardless of model.')
+
                 self._apply_rs_exposure(rs, dev)
 
                 # Factory intrinsics. Nothing else in this project has ever
@@ -525,9 +549,23 @@ class CameraNode(Node):
                     if want_depth:
                         depth = frames.get_depth_frame()
                         if depth:
+                            raw = np.asanyarray(depth.get_data())
+                            # Convert to millimetres HERE, so every consumer
+                            # gets the same units whatever camera is fitted.
+                            # Scaling downstream instead means each consumer
+                            # has to know the model, and one that does not
+                            # silently reads distances 10x too large.
+                            scale = getattr(self, '_depth_scale_mm', 1.0)
+                            if abs(scale - 1.0) > 1e-6:
+                                mm = raw.astype(np.float32) * scale
+                                # Preserve 0 as "no measurement" rather than
+                                # letting it round into a real distance.
+                                out = np.zeros_like(raw)
+                                np.clip(mm, 0, 65535, out=mm)
+                                out[raw > 0] = mm[raw > 0].astype(np.uint16)
+                                raw = out
                             with self._frame_lock:
-                                self._latest_depth = np.asanyarray(
-                                    depth.get_data())
+                                self._latest_depth = raw
 
                     grabbed += 1
                     elapsed = time.monotonic() - rate_since

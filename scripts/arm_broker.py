@@ -340,6 +340,40 @@ class ArmState:
         # working. Report it and let the caller judge.
         return {'ok': True, 'value': value}
 
+    def sniff(self, seconds: float = 3.0, poke: bool = True) -> dict:
+        """What is actually on the wire, as bytes.
+
+        The whole point of the broker is that nothing else may open this port,
+        which also means nothing else can watch it. When reads fail but writes
+        land, the question is whether replies are ABSENT or arriving MALFORMED
+        -- and those need opposite fixes. Only raw bytes distinguish them.
+        """
+        with self._lock:
+            if self._sp is None:
+                self._open()
+            self._sp.reset_input_buffer()
+            if poke:
+                self._sp.write(GET_ANGLES)
+                self._sp.flush()
+            buf = b''
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                c = self._sp.read(4096)
+                if c:
+                    buf += c
+                else:
+                    time.sleep(0.02)
+        printable = sum(1 for b in buf if 32 <= b < 127 or b in (10, 13))
+        return {
+            'ok': True,
+            'bytes': len(buf),
+            'hex': buf[:400].hex(' '),
+            'printable_ratio': round(printable / len(buf), 2) if buf else None,
+            'has_reply_header': buf.find(REPLY_HEADER) >= 0,
+            'has_servo_bus': buf.find(b'\xff\xff') >= 0,
+            'has_crash_text': (b'cmd_len' in buf) or (b'Guru' in buf),
+        }
+
     def raw(self, data: bytes) -> dict:
         with self._lock:
             if self._sp is None:
@@ -387,6 +421,9 @@ class Handler(socketserver.StreamRequestHandler):
         if cmd == 'call':
             return STATE.call(req.get('method', ''), req.get('args', []),
                               req.get('kwargs', {}))
+        if cmd == 'sniff':
+            return STATE.sniff(float(req.get('seconds', 3.0)),
+                               bool(req.get('poke', True)))
         if cmd == 'rebind':
             with STATE._lock:
                 STATE._reopen_after_rebind()

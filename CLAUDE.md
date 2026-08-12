@@ -5,6 +5,67 @@ doing visual servoing. The long-term goal is autonomously **pressing elevator
 buttons**; hand-following is the stepping stone that proves the
 perception-to-motion loop works.
 
+## Working agreements
+
+**Never ask for a power cycle.** It is not a diagnosis, it clears the evidence
+that would have identified the fault, and on 2026-08-12 the four faults that
+actually cost time were all found and fixed in software after power cycles had
+failed to help.
+
+**The wiring is not the problem. Do not raise it.** Every time it was blamed
+this project, the real cause was elsewhere and the accusation cost hours.
+
+**When something is unexpected, work through at least ten distinct hypotheses
+before concluding anything.** Not ten retries of the same idea — ten different
+mechanisms. The failures here impersonate each other: a dead link, a crashed
+controller, a stalled joint and a script sitting at a prompt all present as
+silence.
+
+The checklist below is not hypothetical. Every entry is a fault that really
+happened here and was mistaken for something else first:
+
+1. **Another process holds the port.** `fuser -v /dev/ttyTHS1`. A script
+   waiting at an interactive prompt held it for a whole session while
+   diagnostics read silence and the arm was declared dead.
+2. **Two writers on one tty.** Interleaved bytes produce a length field that
+   does not match its payload, which the Atom reports as `cmd_len error` — so
+   concurrent access MANUFACTURES the firmware crash that gets blamed on the
+   flash. `scripts/arm_broker.py` makes this impossible; use it.
+3. **The parser assumes the reply is at offset 0.** It routinely arrives
+   behind 100+ bytes of internal Feetech servo-bus traffic. Two separate tools
+   scored a working arm as dead this way. SEARCH for `fe fe 0e 20`.
+4. **The Tegra UART controller wedges.** Zero bytes, no crash text, nothing
+   unsolicited. Unbind/rebind `3100000.serial` — `arm_link.rebind_uart()`
+   does it without root if the sudoers rule is installed.
+5. **Return values lie.** pymycobot returns -1 for anything it cannot parse,
+   and `power_on`/`focus_all_servos` return -1 while working perfectly. Judge
+   by effect: `set_color` and look at the LED.
+6. **Writes and reads fail independently.** Confirmed 2026-08-12: the LED
+   cycled on command while reads sat at 2%. Test the two directions
+   separately before concluding "the link is down" — the arm may still be
+   fully commandable.
+7. **Units.** The D405 reports depth in 0.1mm, not mm. Every distance was 10x
+   too large for a whole session, and the symptom was "the panel is not in
+   view" while it sat in front of the camera.
+8. **Stale reads paired with fresh data.** A joint reading that arrives late
+   gets attributed to the wrong image or the wrong moment. Require samples
+   taken AFTER the event, not merely recent.
+9. **A tolerance set below the hardware's resolution.** 0.8deg of backlash
+   tripped a "joint has not moved" alarm for six cycles about a joint that was
+   holding fine.
+10. **A diagnostic message that lies.** A 10s wait reported as "timed out
+    after 40.0s" sent an investigation after a mechanical fault that did not
+    exist. Check what the code actually did before believing what it printed.
+11. **Class or index order.** Labels are written as indices; a different order
+    silently relabels every box with no error anywhere.
+12. **The commanded pose is not the measured pose.** The jog target is seeded
+    from the MEASURED pose, so an untouched joint gets re-commanded to
+    wherever gravity left it — a sag ratchet that looks exactly like lost
+    torque and is not.
+
+Only after all of those come up empty is it worth suspecting hardware — and
+then say what evidence points there, not "check the wiring".
+
 ## Layout
 
 **The target topology is a Jetson Orin Nano doing everything** — RealSense on

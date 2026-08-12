@@ -233,6 +233,18 @@ class MyCobotHardwareNode(Node):
         # reports a stall that is not happening.
         self.declare_parameter('hold_deadband_deg', 1.5)
 
+        # --- Collision guard ---
+        # The servo jogs joints straight from image error with no MoveIt in
+        # the path, so nothing else checks whether the destination is
+        # occupied. Per-joint limits do not help: every self-collision on
+        # this arm is reachable well inside them.
+        self.declare_parameter('collision_guard', True)
+        self.declare_parameter('collision_min_z_m', 0.02)
+        self.declare_parameter('collision_base_radius_m', 0.06)
+        self.declare_parameter('collision_base_height_m', 0.12)
+        self.declare_parameter('collision_max_reach_m', 0.32)
+        self.declare_parameter('collision_tool_offset_m', 0.055)
+
         # --- Jogging (visual servoing) ---
         # Largest displacement honoured in a single JointJog, in degrees. A
         # spurious detection should nudge the arm, not fling it.
@@ -411,6 +423,16 @@ class MyCobotHardwareNode(Node):
             'hold_give_up_after').get_parameter_value().integer_value
         self._hold_deadband = self.get_parameter(
             'hold_deadband_deg').get_parameter_value().double_value
+
+        from .collision_guard import CollisionGuard
+        self._guard = CollisionGuard(
+            min_z=self.get_parameter('collision_min_z_m').value,
+            base_radius=self.get_parameter('collision_base_radius_m').value,
+            base_height=self.get_parameter('collision_base_height_m').value,
+            max_reach=self.get_parameter('collision_max_reach_m').value,
+            tool_offset_m=self.get_parameter('collision_tool_offset_m').value,
+            enabled=self.get_parameter('collision_guard').value)
+        self._guard_blocks = 0
         self._home_settle_time = self.get_parameter(
             'home_settle_time').get_parameter_value().double_value
         self._start_homed = False
@@ -1485,6 +1507,24 @@ class MyCobotHardwareNode(Node):
                     'commanding these, so this is gravity or a released '
                     'servo, not tracking.',
                     throttle_duration_sec=5.0)
+        # Last gate before this pose becomes a command. Checked HERE rather
+        # than on the incoming JointJog because the delta has now been
+        # clipped, limit-clamped and leashed -- so this tests the pose the
+        # arm will really be driven to, not the one that was asked for.
+        ok, why = self._guard.check(target_deg)
+        if not ok:
+            self._guard_blocks += 1
+            self.get_logger().error(
+                f'Refusing jog: {why}. Commanded pose '
+                f'{[round(t, 1) for t in target_deg]} '
+                f'(blocked {self._guard_blocks} so far). The servo will keep '
+                'asking, so this is a limit being reached, not a fault -- if '
+                'it is wrong, the keep-out is set badly: '
+                'collision_min_z_m / collision_base_radius_m / '
+                'collision_max_reach_m, or collision_guard:=false.',
+                throttle_duration_sec=3.0)
+            return
+
         # Record where each jogged joint was actually told to go -- the
         # leashed target, not an accumulation of every delta ever requested.
         #
@@ -2268,6 +2308,18 @@ class MyCobotHardwareNode(Node):
             # somewhere between connecting and homing -- until that is
             # understood, re-engaging here is what makes homing dependable.
             self._focus_servos()
+            ok, why = self._guard.check(target)
+            if not ok:
+                # A home pose that collides is a configuration error, not
+                # something to drive into and find out.
+                self.get_logger().error(
+                    f'Refusing to home: {why}. The home pose {target} is '
+                    'inside a keep-out volume -- fix home_angles or the '
+                    'collision_* limits.')
+                response.success = False
+                response.message = f'home pose rejected: {why}'
+                return response
+
             reached = False
             for attempt in range(2):
                 # Stepped, so the arm folds as it rises instead of

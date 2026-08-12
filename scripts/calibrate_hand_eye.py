@@ -106,12 +106,26 @@ def capture_poses(args) -> int:
     guard = CollisionGuard()
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    def pose(tries=25, max_age=12000):
-        for _ in range(tries):
+    def pose_after(t_settled, timeout=25.0):
+        """A reading genuinely SAMPLED after the arm stopped moving.
+
+        Not "recent enough": on a lossy link the freshest available sample can
+        predate the move entirely, and accepting it pairs this pose's IMAGE
+        with the previous pose's ANGLES. Hand-eye would then solve a
+        consistent-looking problem with one input systematically wrong, and
+        return a confident wrong transform with no error anywhere.
+
+        The broker stamps each reading with its age, so the sample time is
+        now - age. Require that to be after the arm settled.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             s = request({'cmd': 'state'})
-            if s and s.get('angles') and (s.get('age_ms') or 9e9) < max_age:
-                return s['angles']
-            time.sleep(0.6)
+            if s and s.get('angles') and s.get('age_ms') is not None:
+                sampled_at = time.monotonic() - s['age_ms'] / 1000.0
+                if sampled_at >= t_settled:
+                    return s['angles']
+            time.sleep(0.4)
         return None
 
     # Rotation-rich, translation-poor. joint5 and joint6 turn the camera
@@ -134,20 +148,64 @@ def capture_poses(args) -> int:
         print('Too few safe poses to calibrate from.')
         return 1
 
+    # Refuse to start on a link that cannot answer. Calibration is precisely
+    # the task that must not run on unreliable readings: a pose read that
+    # arrives late or not at all pairs an image with the wrong joint angles,
+    # and hand-eye then returns a confident wrong transform. Measured the hard
+    # way -- started at 15% valid, ground through poses for 10 minutes waiting
+    # 25s each for readings that never came, and recorded nothing.
+    h = request({'cmd': 'health'}, timeout=15)
+    frac = (h or {}).get('link', {}).get('fraction')
+    if frac is None:
+        print('No broker is running. Start ./scripts/arm_broker.py first.')
+        return 1
+    if frac < args.min_link:
+        print(f'Link is {frac*100:.0f}% valid; calibration needs at least '
+              f'{args.min_link*100:.0f}%.')
+        print('Readings that arrive late get paired with the wrong image, '
+              'which yields a confident wrong transform rather than an error. '
+              'Not starting.')
+        print('Override with --min-link 0 if you know what you are doing.')
+        return 1
+    print(f'link {frac*100:.0f}% valid -- proceeding')
+
     pipe = rs.pipeline()
     cfg = rs.config()
     cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     pipe.start(cfg)
     records = []
+    consecutive_failures = 0
     try:
         for i, q in enumerate(safe):
             request({'cmd': 'send_angles', 'angles': q, 'speed': 30,
                      'force': True}, timeout=25)
             time.sleep(args.settle)
-            actual = pose(tries=10, max_age=9000)
+            settled = time.monotonic()
+            actual = pose_after(settled)
             if actual is None:
-                print(f'  {i:02d}: no pose read, skipping')
+                print(f'  {i:02d}: no post-move pose read within 25s '
+                      '-- skipped rather than guessed')
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    print('\nThree poses in a row could not be read. The link '
+                          'has gone during the run -- stopping rather than '
+                          'spending 25s on each of the remaining poses to '
+                          'collect nothing.')
+                    break
                 continue
+            # A pose that never arrived is worse than a skipped one: it means
+            # the arm is somewhere else entirely, and the image would be
+            # attributed to where we THINK it went.
+            if max(abs(a - c) for a, c in zip(actual, q)) > 8.0:
+                print(f'  {i:02d}: arm is {max(abs(a-c) for a,c in zip(actual,q)):.0f}deg '
+                      'from the commanded pose -- skipped')
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    print('\nThree poses in a row where the arm did not '
+                          'arrive. It is not executing commands -- stopping.')
+                    break
+                continue
+            consecutive_failures = 0
             for _ in range(8):
                 frames = pipe.wait_for_frames()
             img = np.asanyarray(frames.get_color_frame().get_data())
@@ -304,6 +362,10 @@ def main() -> int:
     ap.add_argument('--square-mm', type=float, default=DEFAULT_SQUARE_MM,
                     help='MEASURED square size of the printed board')
     ap.add_argument('--settle', type=float, default=2.5)
+    ap.add_argument('--min-link', type=float, default=0.6,
+                    help='refuse to collect below this link reliability; '
+                         'calibrating on unreliable readings produces a '
+                         'confident wrong answer, not an error')
     ap.add_argument('--K', type=float, nargs=9, default=None,
                     help='camera matrix, row-major; defaults to D405 factory')
     args = ap.parse_args()

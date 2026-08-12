@@ -4,6 +4,7 @@ The one script. Brings the stack up and gives you a menu to drive it.
 
     ./run.py                    launch everything, then show the menu
     ./run.py gain:=1.5          extra args pass through to ros2 launch
+    ./run.py --button           elevator-button pipeline instead of hand-following
 
 If the stack is already running it attaches to it instead of starting a
 second one.
@@ -56,6 +57,10 @@ except ImportError as e:
 BOLD, DIM = '\033[1m', '\033[2m'
 RED, GREEN, YELLOW, CYAN = '\033[1;31m', '\033[1;32m', '\033[1;33m', '\033[1;36m'
 OFF = '\033[0m'
+
+# Which launch file the menu drives. --button swaps it for the elevator
+# button pipeline; default stays the hand-following demo.
+LAUNCH_FILE = 'servo_demo.launch.py'
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 LOG = '/tmp/mycobot_stack.log'
@@ -258,12 +263,27 @@ def preflight(args=()):
     Pi is not in the picture at all and every check below is asking after a
     machine this run will never speak to.
     """
-    serial_arm = _arg_is(args, 'connection', 'serial')
-    source = _arg_value(args, 'source') or 'mjpeg'
+    # Read the LAUNCH FILE'S defaults, not just the command line. Different
+    # launch files default differently -- button_servo.launch.py is already
+    # connection:=serial source:=realsense -- so inferring the topology from
+    # explicit arguments alone concluded "Pi run" for a run that never speaks
+    # to the Pi, and blocked on a camera at 192.168.0.15:8080 that does not
+    # exist. The user then has to pass arguments that are already the
+    # defaults, purely to get past a check.
+    if LAUNCH_FILE == 'button_servo.launch.py':
+        default_conn, default_source = 'serial', 'realsense'
+    else:
+        default_conn, default_source = 'tcp', 'mjpeg'
+
+    conn = _arg_value(args, 'connection') or default_conn
+    serial_arm = conn == 'serial'
+    source = _arg_value(args, 'source') or default_source
     local_cam = source in ('device', 'realsense')
 
     if serial_arm and local_cam:
-        port = _arg_value(args, 'serial_port') or '/dev/ttyUSB0'
+        port = _arg_value(args, 'serial_port') or (
+            '/dev/ttyTHS1' if LAUNCH_FILE == 'button_servo.launch.py'
+            else '/dev/ttyUSB0')
         say(f'connection:=serial source:={source} -- the Pi is not in this '
             f'run at all, so nothing about it is checked.')
         # Name the port rather than saying "USB". On a Jetson this is
@@ -372,8 +392,7 @@ def check_launch_args(args):
     if not names:
         return
     r = subprocess.run(
-        ['ros2', 'launch', 'mycobot_bringup', 'servo_demo.launch.py',
-         '--show-args'],
+        ['ros2', 'launch', 'mycobot_bringup', LAUNCH_FILE, '--show-args'],
         capture_output=True, text=True, cwd=REPO)
     if r.returncode != 0:
         return  # cannot verify; do not block on it
@@ -418,7 +437,7 @@ class Stack:
     def start(self):
         env = dict(os.environ, MYCOBOT_IP=IP)
         cmd = ['ros2', 'launch', 'mycobot_bringup',
-               'servo_demo.launch.py'] + self.extra
+               LAUNCH_FILE] + self.extra
         say(f'Launching (MYCOBOT_IP={IP}), output -> {LOG}')
         self.log = open(LOG, 'w')
         # start_new_session so the whole launch tree can be signalled as one
@@ -540,7 +559,9 @@ class Panel(Node):
             warn('Not all nodes appeared; check the log with "l".')
         elif _arg_is(args, 'connection', 'serial'):
             # The TCP advice below is about a Pi that is not in this run.
-            port = _arg_value(args, 'serial_port') or '/dev/ttyUSB0'
+            port = _arg_value(args, 'serial_port') or (
+            '/dev/ttyTHS1' if LAUNCH_FILE == 'button_servo.launch.py'
+            else '/dev/ttyUSB0')
             uart = any(k in port for k in ('THS', 'AMA', 'ttyS'))
             tool = (f'probe_uart_bridge.py poke --port {port}' if uart
                     else f'probe_usb_arm.py --port {port}')
@@ -701,10 +722,24 @@ def menu(attached):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a not in ('-h', '--help')]
-    if len(args) != len(sys.argv[1:]):
+    global LAUNCH_FILE
+    raw = sys.argv[1:]
+    # Decide about help BEFORE consuming any other flag. This used to be
+    # `len(args) != len(sys.argv[1:])`, which infers "help was asked for"
+    # from the list having shrunk -- so stripping any new flag silently
+    # printed the help text instead of running.
+    if any(a in ('-h', '--help') for a in raw):
         print(__doc__)
         return 0
+    args = list(raw)
+    # --button switches to the elevator-button pipeline. Without this the
+    # button work had to bypass run.py and call ros2 launch directly, which
+    # skips exactly the four staleness checks run.py exists for -- and the
+    # launch-argument validation, so a mistyped button_confidence would have
+    # been silently ignored.
+    if '--button' in args or '--buttons' in args:
+        LAUNCH_FILE = 'button_servo.launch.py'
+        args = [a for a in args if a not in ('--button', '--buttons')]
 
     ensure_built()
     check_launch_args(args)

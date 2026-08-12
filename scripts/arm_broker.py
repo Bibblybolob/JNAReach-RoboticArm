@@ -271,7 +271,7 @@ class ArmState:
             self._sp.flush()
         return {'ok': True, 'link': h}
 
-    def call(self, method: str, args) -> dict:
+    def call(self, method: str, args, kwargs=None) -> dict:
         """Invoke a whitelisted pymycobot method under the broker's lock."""
         if method not in self.ALLOWED_CALLS:
             return {'ok': False,
@@ -291,7 +291,7 @@ class ArmState:
                         'error': f'neither MyCobot280 nor MyCobot has '
                                  f'{method!r} (pymycobot version mismatch?)'}
             try:
-                value = fn(*args)
+                value = fn(*args, **(kwargs or {}))
             except Exception as e:  # noqa: BLE001
                 return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
         # -1 is pymycobot's "could not parse", which is NOT the same as
@@ -344,7 +344,8 @@ class Handler(socketserver.StreamRequestHandler):
                                      int(req.get('speed', 40)),
                                      bool(req.get('force', False)))
         if cmd == 'call':
-            return STATE.call(req.get('method', ''), req.get('args', []))
+            return STATE.call(req.get('method', ''), req.get('args', []),
+                              req.get('kwargs', {}))
         if cmd == 'rebind':
             with STATE._lock:
                 STATE._reopen_after_rebind()
@@ -398,8 +399,13 @@ class BrokerMyCobot:
             raise ConnectionError(f'no broker listening on {sock_path}')
 
     def __getattr__(self, method: str):
-        def call(*args):
-            r = request({'cmd': 'call', 'method': method, 'args': list(args)},
+        def call(*args, **kwargs):
+            # kwargs matter: the driver calls send_angles(..., _async=True),
+            # and an *args-only proxy raises TypeError deep inside homing --
+            # which surfaced as 'Homing failed: got an unexpected keyword
+            # argument' and left the arm at an unknown pose.
+            r = request({'cmd': 'call', 'method': method,
+                         'args': list(args), 'kwargs': kwargs},
                         timeout=20.0, sock_path=self.sock_path)
             if r is None:
                 raise ConnectionError('broker went away mid-call')

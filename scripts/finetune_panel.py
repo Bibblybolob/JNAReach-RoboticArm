@@ -12,7 +12,8 @@ elevator buttons look like. That is why this takes 1-2 hours instead of the
 
 Match --imgsz to what you will deploy at: the TensorRT engine is built for one
 resolution, and inference cost scales with it (640 -> 19.5ms, 960 -> ~26ms
-against a 33ms frame budget).
+against a 33ms frame budget). 640 is the default because 960 was measured to
+buy nothing on a set this small -- see DEFAULT_WEIGHTS.
 """
 from __future__ import annotations
 
@@ -27,15 +28,22 @@ torch.backends.cudnn.enabled = False
 
 from ultralytics import YOLO
 
-DEFAULT_WEIGHTS = '/home/jonathan/mycobot_project/runs_960/yolo11s_960/weights/best.pt'
-FALLBACK_WEIGHTS = '/home/jonathan/mycobot_project/elevator_buttons.pt'
+# The original yolo11n@640 weights, deliberately.
+#
+# An overnight yolo11s@960 run on the same 393-image set was measured WORSE:
+# mAP50 0.9252 / mAP50-95 0.5366 at its best epoch, against 0.9292 / 0.5446
+# for these. With that little data the model is data-limited, not capacity-
+# limited, and the larger backbone just overfits sooner. Starting a fine-tune
+# from the weaker checkpoint would inherit that for nothing.
+DEFAULT_WEIGHTS = '/home/jonathan/mycobot_project/elevator_buttons.pt'
+FALLBACK_WEIGHTS = '/home/jonathan/mycobot_project/runs_960/yolo11s_960/weights/best.pt'
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', default=os.path.expanduser('~/panel_dataset/data.yaml'))
     ap.add_argument('--weights', default=None)
-    ap.add_argument('--imgsz', type=int, default=960)
+    ap.add_argument('--imgsz', type=int, default=640)
     ap.add_argument('--epochs', type=int, default=120)
     ap.add_argument('--batch', type=int, default=4)
     ap.add_argument('--hours', type=float, default=3.0)

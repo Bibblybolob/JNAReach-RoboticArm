@@ -607,16 +607,54 @@ class MyCobotHardwareNode(Node):
 
     # ---- Connection ----
 
+    def _connect_via_broker(self):
+        """Use scripts/arm_broker.py if it is running, else None.
+
+        The broker owns /dev/ttyTHS1 for the life of the machine and serves
+        every client over a Unix socket. Going through it matters for two
+        reasons beyond tidiness:
+
+        - Two openers on this tty interleave their bytes, and a frame whose
+          length field does not match its payload is what the Atom reports as
+          `cmd_len error` before it panics. So a driver opening the port
+          while any diagnostic is attached does not merely lose replies, it
+          manufactures the firmware crash.
+        - Repeated open/close is itself unreliable here. The driver opening
+          on every reconnect is exactly that pattern.
+
+        Falls back to a direct open when no broker is running, so nothing
+        depends on it being installed. Returns a MyCobot-compatible proxy.
+        """
+        try:
+            import os
+            import sys
+            scripts = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))))), 'scripts')
+            if scripts not in sys.path:
+                sys.path.insert(0, scripts)
+            from arm_broker import BrokerMyCobot
+            mc = BrokerMyCobot()
+        except Exception:
+            return None
+        self.get_logger().info(
+            'Connected through the arm broker; the driver is NOT opening '
+            f'{self._serial_port} itself, so diagnostics can run alongside '
+            'it without corrupting the link.')
+        return mc
+
     def _connect(self) -> bool:
         """Try to open the link to the arm. Never raises."""
         try:
             if self._connection == 'serial':
-                self.get_logger().info(
-                    f'Connecting to myCobot DIRECTLY over '
-                    f'{self._serial_port} at {self._serial_baud} baud '
-                    f'(no Pi, no network). Stop mycobot_server on the Pi '
-                    f'first -- two masters on one bus behaves erratically.')
-                mc = MyCobot280(self._serial_port, str(self._serial_baud))
+                mc = self._connect_via_broker()
+                if mc is None:
+                    self.get_logger().info(
+                        f'Connecting to myCobot DIRECTLY over '
+                        f'{self._serial_port} at {self._serial_baud} baud '
+                        f'(no Pi, no network). Stop mycobot_server on the Pi '
+                        f'first -- two masters on one bus behaves erratically.')
+                    mc = MyCobot280(self._serial_port, str(self._serial_baud))
             else:
                 self.get_logger().info(
                     f'Connecting to myCobot at {self._ip}:{self._port} ...')

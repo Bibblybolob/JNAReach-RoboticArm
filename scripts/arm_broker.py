@@ -110,6 +110,7 @@ class ArmState:
         'get_servo_data', 'get_servo_error', 'get_servo_max_temperature',
         'get_servo_max_voltage', 'get_servo_firmware_version',
         'is_servo_enable', 'is_all_servo_enable', 'is_power_on',
+        'get_fresh_mode',
         # motion and power
         'send_angles', 'send_angle', 'send_coords', 'stop',
         'power_on', 'power_off', 'focus_servo', 'focus_all_servos',

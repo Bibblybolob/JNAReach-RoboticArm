@@ -58,6 +58,40 @@ def main() -> int:
         return 1
     print(f'starting from {w}')
 
+    # Check the dataset BEFORE handing it to Ultralytics, which reports a
+    # missing split as a FileNotFoundError buried in two chained tracebacks --
+    # and does it AFTER printing eighty lines of hyperparameters, so the real
+    # message is off the top of the screen.
+    import yaml
+    if not os.path.isfile(args.data):
+        print(f'\nNo dataset at {args.data}.')
+        return 1
+    cfg = yaml.safe_load(open(args.data)) or {}
+    root = cfg.get('path') or os.path.dirname(os.path.abspath(args.data))
+    missing = [k for k in ('train', 'val')
+               if not os.path.isdir(os.path.join(root, str(cfg.get(k, ''))))]
+    if missing:
+        imgs = os.path.join(root, 'images')
+        n_img = len(os.listdir(imgs)) if os.path.isdir(imgs) else 0
+        n_lbl = len([f for f in os.listdir(os.path.join(root, 'labels'))
+                     if f.endswith('.txt')]) \
+            if os.path.isdir(os.path.join(root, 'labels')) else 0
+        print(f'\n{args.data} has no {"/".join(missing)} split yet.')
+        print(f'  {root}/images : {n_img} image(s)')
+        print(f'  {root}/labels : {n_lbl} label file(s)')
+        if n_img and not n_lbl:
+            print('\nThe images are not labelled, so there is nothing to '
+                  'train on. Label them with the 14 classes in that '
+                  'data.yaml, put the .txt files in labels/, then:')
+            print(f'    ./scripts/split_panel_dataset.py --root {root}')
+            print('\nFaster than labelling from scratch: '
+                  './scripts/autolabel_panel.py writes a first pass with a '
+                  'trained model, and you correct it.')
+        elif n_lbl:
+            print(f'\nLabels exist but the split has not been made:')
+            print(f'    ./scripts/split_panel_dataset.py --root {root}')
+        return 1
+
     model = YOLO(w)
     model.train(
         data=args.data,

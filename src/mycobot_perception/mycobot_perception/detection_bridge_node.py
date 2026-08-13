@@ -7,6 +7,22 @@ contract the visual servo expects.
                          z    = depth at that point, in millimetres (0 if
                                 unavailable)
 
+    /button/point_base  geometry_msgs/PointStamped
+                         the same detection in the ARM's base frame, METRES.
+                         Silent unless an eye-to-hand calibration exists.
+
+Pixels steer a servo; they cannot be reached for. The base-frame topic is what
+lets the arm be commanded AT the button rather than merely turned toward it,
+and it needs three things the pixel topic does not: the camera intrinsics
+(source:=realsense supplies them), the eye-to-hand calibration, and the
+MEASURED joint1 angle -- which on this mount is the one joint that moves the
+camera, so the transform depends on it.
+
+Every one of those degrades quietly and says why once. A missing calibration
+is the normal state until someone runs it, and it must never take
+/button/point_px down with it: the servo depends on that topic and needs none
+of this.
+
 Which detection gets published is controlled by the `target_label` parameter:
 
     ros2 param set /detection_bridge_node target_label button-5
@@ -27,6 +43,10 @@ exact centre pixel does not zero out the whole point.
 
 from __future__ import annotations
 
+import json
+import math
+import os
+
 import numpy as np
 
 import rclpy
@@ -38,8 +58,10 @@ from rcl_interfaces.msg import SetParametersResult
 from cv_bridge import CvBridge
 
 from geometry_msgs.msg import PointStamped
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image, JointState
 from vision_msgs.msg import Detection2DArray
+
+from mycobot_perception.target_in_base import TargetError, target_in_base
 
 
 class DetectionBridgeNode(Node):
@@ -51,6 +73,21 @@ class DetectionBridgeNode(Node):
         self.declare_parameter('depth_topic', '/camera/depth_raw')
         self.declare_parameter('output_topic', '/button/point_px')
         self.declare_parameter('target_label', '')
+
+        # --- Base-frame output ---
+        #
+        # The same detection expressed where the ARM can act on it. Off until
+        # a calibration exists, which is the honest default: without one there
+        # is no transform from the camera to the base, and a guess would be a
+        # confident wrong point that something downstream would drive to.
+        self.declare_parameter('base_output_topic', '/button/point_base')
+        self.declare_parameter('camera_info_topic', '/camera/camera_info')
+        self.declare_parameter('calibration_path',
+                               '~/mycobot_project/calibration/eye_to_hand.json')
+        self.declare_parameter('base_frame', 'base_link')
+        # Which joint pans the camera. joint1 for the first-arm-piece mount;
+        # a parameter rather than a constant so remounting is a config change.
+        self.declare_parameter('pan_joint', 'joint1')
 
         # --- Depth sanity filter ---
         #
@@ -81,6 +118,11 @@ class DetectionBridgeNode(Node):
         self.min_depth_mm = self.get_parameter('min_depth_mm').value
         self.max_depth_mm = self.get_parameter('max_depth_mm').value
         self.depth_consistency_mm = self.get_parameter('depth_consistency_mm').value
+        self.base_output_topic = self.get_parameter('base_output_topic').value
+        self.camera_info_topic = self.get_parameter('camera_info_topic').value
+        self.calibration_path = self.get_parameter('calibration_path').value
+        self.base_frame = self.get_parameter('base_frame').value
+        self.pan_joint = self.get_parameter('pan_joint').value
 
         self._bridge = CvBridge()
         self._depth_image: np.ndarray | None = None
@@ -110,6 +152,22 @@ class DetectionBridgeNode(Node):
             Image, self.depth_topic, self._depth_cb, qos)
 
         self._point_pub = self.create_publisher(PointStamped, self.output_topic, 10)
+        self._base_pub = self.create_publisher(
+            PointStamped, self.base_output_topic, 10)
+
+        # joint1 is the only joint that moves this camera, so it is the only
+        # one the base-frame transform needs -- but it must be the MEASURED
+        # angle, not the commanded one, or the point is wrong by however far
+        # the arm is trailing.
+        self._joint1_deg = None
+        self._joint_sub = self.create_subscription(
+            JointState, '/joint_states', self._on_joint_states, 10)
+        self._cam_info_sub = self.create_subscription(
+            CameraInfo, self.camera_info_topic, self._on_camera_info, 10)
+        self._intrinsics = None
+        self._published_base_any = False
+        self._warned = set()
+        self._cam_to_base = self._load_calibration()
 
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -117,6 +175,70 @@ class DetectionBridgeNode(Node):
             f'detection_bridge_node up: {self.detection_topic} + '
             f'{self.depth_topic} -> {self.output_topic}, '
             f"target_label={self.target_label!r}")
+
+    def _load_calibration(self):
+        """The eye-to-hand transform, or None with a reason said once.
+
+        Absent is the normal state until someone runs the calibration, and it
+        must degrade quietly: /button/point_px needs none of this and the
+        servo depends on it.
+        """
+        path = os.path.expanduser(self.calibration_path)
+        if not os.path.isfile(path):
+            self.get_logger().info(
+                f'no eye-to-hand calibration at {path}, so '
+                f'{self.base_output_topic} stays silent. Pixels still publish. '
+                'Run scripts/calibrate_hand_eye.py --eye-to-hand to enable it.')
+            return None
+        try:
+            with open(path) as f:
+                calib = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().error(f'could not read {path}: {e}')
+            return None
+        if 'camera_to_base' not in calib:
+            # The likeliest wrong file: an eye-IN-hand result, which describes
+            # a camera that is no longer on the flange.
+            self.get_logger().error(
+                f'{path} has no camera_to_base. That looks like an eye-in-hand '
+                'calibration, which describes a camera mounted on the flange '
+                '-- this one is on the first arm piece. Re-run with '
+                '--eye-to-hand.')
+            return None
+        self.get_logger().info(
+            f'eye-to-hand calibration loaded from {path}, solved at joint1='
+            f'{calib.get("joint1_deg", 0.0):.1f}deg')
+        return calib
+
+    def _on_camera_info(self, msg: CameraInfo) -> None:
+        if self._intrinsics is not None:
+            return
+        k = list(msg.k)
+        if len(k) < 9 or k[0] == 0.0:
+            # CameraInfo went out with an empty k for most of this project's
+            # life. Naming the fix beats a stream of transform failures.
+            self._warn_once(
+                'intrinsics',
+                'CameraInfo carries no intrinsics (k is empty or zero), so no '
+                'base-frame point can be computed. Run with source:=realsense, '
+                'which supplies the factory calibration.')
+            return
+        self._intrinsics = {'fx': k[0], 'fy': k[4], 'cx': k[2], 'cy': k[5]}
+        self.get_logger().info(
+            f'intrinsics: fx={k[0]:.1f} fy={k[4]:.1f} '
+            f'cx={k[2]:.1f} cy={k[5]:.1f}')
+
+    def _on_joint_states(self, msg: JointState) -> None:
+        try:
+            i = list(msg.name).index(self.pan_joint)
+        except ValueError:
+            self._warn_once(
+                'panjoint',
+                f'{self.pan_joint!r} is not in /joint_states (saw '
+                f'{list(msg.name)}), so the camera pan angle is unknown.')
+            return
+        if i < len(msg.position):
+            self._joint1_deg = math.degrees(msg.position[i])
 
     # Tunable while the stack runs. The depth filter is exactly the kind of
     # thing you want to adjust against a live scene rather than by relaunching
@@ -261,6 +383,60 @@ class DetectionBridgeNode(Node):
         point.point.y = float(cy)
         point.point.z = float(depth_mm)
         self._point_pub.publish(point)
+
+        self._publish_base_point(msg.header, cx, cy, depth_mm)
+
+    def _publish_base_point(self, header, cx, cy, depth_mm) -> None:
+        """The same detection as a point in the ARM's frame, when we can.
+
+        Pixels steer a servo; they cannot be reached for. This is the output
+        that lets the arm be commanded AT the button rather than merely turned
+        toward it, and it needs three things the pixel topic does not: the
+        camera's intrinsics, the eye-to-hand calibration, and joint1 -- which
+        on this mount is the one joint that moves the camera.
+
+        Silent when any of them is missing, and says why ONCE. A missing
+        calibration must not stop /button/point_px, which the servo depends
+        on and which needs none of this.
+        """
+        if self._cam_to_base is None or self._intrinsics is None:
+            return
+        if self._joint1_deg is None:
+            self._warn_once('joint1',
+                            'No /joint_states yet, so the camera\'s pan angle '
+                            'is unknown and the base-frame point cannot be '
+                            'computed. Is the driver running?')
+            return
+
+        try:
+            x, y, z = target_in_base(
+                cx, cy, depth_mm, self._intrinsics,
+                self._cam_to_base, self._joint1_deg)
+        except TargetError as e:
+            # Not a warning worth repeating every frame: out-of-range depth is
+            # the normal state of affairs while the panel is far away.
+            self.get_logger().debug(f'no base-frame point: {e}')
+            return
+
+        out = PointStamped()
+        out.header = header
+        out.header.frame_id = self.base_frame
+        out.point.x, out.point.y, out.point.z = float(x), float(y), float(z)
+        self._base_pub.publish(out)
+
+        if not self._published_base_any:
+            self._published_base_any = True
+            self.get_logger().info(
+                f'first base-frame target: ({x*1000:.0f}, {y*1000:.0f}, '
+                f'{z*1000:.0f})mm in {self.base_frame}, with joint1 at '
+                f'{self._joint1_deg:.1f}deg -- publishing to '
+                f'{self.base_output_topic}')
+
+    def _warn_once(self, key: str, text: str) -> None:
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        self.get_logger().warn(text)
 
     def _sample_depth(self, cx: float, cy: float) -> float:
         if self._depth_image is None:

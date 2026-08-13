@@ -389,6 +389,63 @@ class ArmState:
             'has_crash_text': (b'cmd_len' in buf) or (b'Guru' in buf),
         }
 
+    # Commands worth poking with. Different opcodes take different paths
+    # through the Atom's firmware, so one may answer when another does not.
+    PROBE_CMDS = {
+        'get_angles':   bytes([0xfe, 0xfe, 0x02, 0x20, 0xfa]),
+        'get_coords':   bytes([0xfe, 0xfe, 0x02, 0x23, 0xfa]),
+        'get_encoders': bytes([0xfe, 0xfe, 0x02, 0x35, 0xfa]),
+        'is_power_on':  bytes([0xfe, 0xfe, 0x02, 0x12, 0xfa]),
+        'get_fresh':    bytes([0xfe, 0xfe, 0x02, 0x3d, 0xfa]),
+    }
+
+    def probe(self, cmd='get_angles', wait=0.5, flush=True, repeat=1,
+              trials=6, gap=0.15, dtr=None, rts=None) -> dict:
+        """One parameterised read attempt, repeated, reporting the hit rate.
+
+        Exists so the read strategy can be SWEPT rather than guessed. Every
+        knob that could plausibly matter -- how long to wait, whether to flush
+        first, how many times to poke, which opcode, the modem lines -- is a
+        separate argument, and the caller can walk the space and measure.
+        """
+        hits = 0
+        total_bytes = 0
+        with self._lock:
+            if self._sp is None:
+                self._open()
+            sp = self._sp
+            if dtr is not None:
+                try: sp.setDTR(bool(dtr))
+                except Exception: pass
+            if rts is not None:
+                try: sp.setRTS(bool(rts))
+                except Exception: pass
+            payload = self.PROBE_CMDS.get(cmd, self.PROBE_CMDS['get_angles'])
+            for _ in range(trials):
+                if flush:
+                    sp.reset_input_buffer()
+                for _ in range(repeat):
+                    sp.write(payload)
+                    sp.flush()
+                    if repeat > 1:
+                        time.sleep(0.02)
+                d = b''
+                end = time.monotonic() + wait
+                while time.monotonic() < end:
+                    c = sp.read(4096)
+                    if c:
+                        d += c
+                        if d.find(b'\xfe\xfe') >= 0 and len(d) >= 5:
+                            break
+                    else:
+                        time.sleep(0.01)
+                total_bytes += len(d)
+                if d.find(b'\xfe\xfe') >= 0:
+                    hits += 1
+                time.sleep(gap)
+        return {'ok': True, 'hits': hits, 'trials': trials,
+                'rate': round(hits / trials, 3), 'bytes': total_bytes}
+
     def raw(self, data: bytes) -> dict:
         with self._lock:
             if self._sp is None:
@@ -436,6 +493,15 @@ class Handler(socketserver.StreamRequestHandler):
         if cmd == 'call':
             return STATE.call(req.get('method', ''), req.get('args', []),
                               req.get('kwargs', {}))
+        if cmd == 'probe':
+            return STATE.probe(
+                cmd=req.get('probe_cmd', 'get_angles'),
+                wait=float(req.get('wait', 0.5)),
+                flush=bool(req.get('flush', True)),
+                repeat=int(req.get('repeat', 1)),
+                trials=int(req.get('trials', 6)),
+                gap=float(req.get('gap', 0.15)),
+                dtr=req.get('dtr'), rts=req.get('rts'))
         if cmd == 'sniff':
             return STATE.sniff(float(req.get('seconds', 3.0)),
                                bool(req.get('poke', True)))

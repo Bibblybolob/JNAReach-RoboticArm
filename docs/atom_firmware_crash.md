@@ -104,6 +104,81 @@ reboots rather than of any real recovery.
 Servo zero calibration DOES survive: after recalibrating, encoders read 2048
 and joint6 still reported 2048 across subsequent power cycles and reflashes.
 
+## Recurrence, 2026-08-13 — and the UART formally cleared
+
+The same crash is back, and this time the Jetson side was measured rather than
+argued about. `{"cmd": "counters"}` reads the kernel's own `TIOCGICOUNT` tally
+either side of each transaction, which is the one view of the link that does
+not depend on anything in userspace parsing correctly.
+
+Captured live, `cmd_len error` and the full `Guru Meditation ... LoadProhibited`
+dump, unchanged from the 2026-08-10 capture above.
+
+**What the port is doing, over 40 transactions:**
+
+| counter | value | reading |
+|---|---|---|
+| `tx` | 200 | exactly 5 per poke. Every write reached the wire |
+| `rx` on a failed poll | **0** | not corrupted, not mis-parsed — absent |
+| `frame` | in bursts of ~556, else 0 | see below |
+| `parity`, `brk` | 0 | |
+
+The framing errors are not a link fault. They arrive in exact multiples of
+~556 and only alongside a reboot: that is the ESP32's boot output, emitted at
+the ROM's own rate rather than this port's, so it *cannot* frame at 1000000.
+It therefore doubles as a **reboot counter**, which hit rate alone cannot
+separate from ordinary silence.
+
+**The baud is right.** Poking at 1000000 and reading back at neighbouring
+rates, framing errors per character stayed at zero throughout and the reply
+rate did not improve:
+
+| read baud | 960000 | 980769 | 1000000 | 1020000 | 1041667 |
+|---|---|---|---|---|---|
+| replies | 10/16 | 8/16 | 13/16 | 13/16 | 12/16 |
+
+980769 and 1020000 are the two rates a 408MHz parent clock would land on if
+the divisor were being rounded. Neither is better, so it is not.
+
+**Waiting longer buys nothing; asking again does.** A reply that is coming has
+arrived within 30ms:
+
+| read wait | 30ms | 60ms | 120ms | 250ms | 500ms | 1000ms |
+|---|---|---|---|---|---|---|
+| replies | 67% | 80% | 57% | 73% | 80% | 70% |
+
+| pokes per attempt | 1 | 2 | 3 |
+|---|---|---|---|
+| replies | 76% | 86% | 92% |
+
+So the 1.5s poll window was spending a second and a half per failure to learn
+that nothing was coming. `_poll_once` now re-pokes instead — five attempts of
+50ms — which leaves the valid fraction where it was but makes a failed poll
+cost 250ms rather than 1500ms.
+
+**The break is not what crashes it.** It was worth checking, since the break
+added on 2026-08-13 is sent 4x a second and a break condition is exactly the
+kind of malformed input this firmware dies on. 60 trials per cell:
+
+| | replies | reboots |
+|---|---|---|
+| reconfigure + break | 40/60 (67%) | 2.0 |
+| reconfigure only | 37/60 (62%) | 3.2 |
+| neither | 25/60 (42%) | 1.1 |
+
+Break slightly reduces reboots rather than causing them, and the reconfigure
+is confirmed load-bearing at a larger cell size than the original 12.
+
+**The crash is provoked by traffic, not free-running.** A passive listen —
+3s, twice, no poke — returns zero bytes and no crash text. It only panics
+while being asked.
+
+So on 2026-08-13 the Jetson UART is clean by every measurement available:
+writes leave intact, received characters carry no line errors, the rate is
+correct, the DMA→PIO overlay is live in the running device tree, and the port
+has a single owner. What is left is the Atom, doing what this document
+already describes.
+
 ## Related
 
 `elephantrobotics/myCobot` issue #48 reports motors unresponsive after a power

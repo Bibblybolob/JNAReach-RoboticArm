@@ -106,6 +106,10 @@ class ArmState:
     # a wrong write there takes a joint off the bus entirely. Reading those
     # registers is fine and is how temperature is obtained.
     POLL_WINDOW = POLL_WINDOW_S
+    # How long one poke is given before re-poking, and how many pokes a poll
+    # may spend. Measured, not guessed -- see _poll_once.
+    POLL_ATTEMPT_S = 0.05
+    POLL_ATTEMPTS = 5
     # Re-apply termios before each poll. See _poll_once.
     RECONFIGURE_EACH_POLL = True
     BREAK_BEFORE_POLL = True
@@ -145,6 +149,10 @@ class ArmState:
         self.rebinds_since_good = 0
         self.started = time.time()
         self.last_error = None
+        # Pokes the last successful poll needed. 1 means the link answered
+        # first time; a figure creeping toward POLL_ATTEMPTS is the link
+        # degrading while the valid fraction still reads as healthy.
+        self.poll_attempts_used = 0
 
     # ---- serial ----
 
@@ -251,54 +259,71 @@ class ArmState:
         # it reproduced the four-way ranking -- but treat 75% as indicative.
         # A 3/3 result earlier in the same investigation evaporated when
         # rerun at 10 trials, which is why the cell size is written down.
-        if self.RECONFIGURE_EACH_POLL:
-            try:
-                self._sp.baudrate = BAUD    # tcsetattr even if unchanged
-            except Exception:
-                pass
-        if self.BREAK_BEFORE_POLL:
-            try:
-                self._sp.send_break(0.01)
-            except Exception:
-                pass
-        self._sp.reset_input_buffer()
-        self._sp.write(GET_ANGLES)
-        self._sp.flush()
-
-        # Read until the reply appears, up to POLL_WINDOW -- do NOT sleep a
-        # fixed guess and read once.
+        # ASK AGAIN rather than wait longer. Two measurements, 2026-08-13:
         #
-        # The fixed 250ms wait was silently discarding good replies. Measured
-        # 2026-08-12: a successful get_angles took 727ms, so the read found an
-        # empty buffer and the NEXT poll's reset_input_buffer() threw away the
-        # reply that had since arrived. Reads sat at 2% valid while writes
-        # worked perfectly -- which reads as a dead link and is not one.
+        #   how long the read waits    30ms 60ms 120ms 250ms 500ms 1000ms
+        #   replies                     67%  80%   57%   73%   80%    70%
         #
-        # Exits as soon as a complete frame is seen, so a healthy arm still
-        # polls fast; only a slow one costs the extra wait.
-        d = b''
+        # Flat. A reply that is coming has arrived inside 30ms; past that
+        # there is nothing to wait for, and the 1.5s window was spending a
+        # second and a half per failure to learn that. Repeating the poke
+        # instead moves the number that matters:
+        #
+        #   pokes per attempt   1     2     3
+        #   replies            76%   86%   92%     (80 trials per cell)
+        #
+        # Consistent with each poke failing on its own merits about a quarter
+        # of the time -- the outcome sequence is close to independent, runs
+        # test z = -1.35 over 160 -- which is why a second ask recovers most
+        # of what the first lost, and why waiting cannot.
+        #
+        # So a failed poll is now CHEAPER as well as rarer: several attempts
+        # of 50ms fit in the window that one attempt used to occupy alone.
+        #
+        # The 727ms reply this window was originally sized for was very
+        # probably a straggler answering an EARLIER poke, not one reply
+        # taking that long. Nothing in the sweep above reproduces it.
         deadline = time.monotonic() + self.POLL_WINDOW
-        i = -1
-        while time.monotonic() < deadline:
-            chunk = self._sp.read(4096)
-            if chunk:
-                d += chunk
-                i = d.find(REPLY_HEADER)
-                if i >= 0 and len(d) >= i + 17:
-                    break
-            else:
-                time.sleep(0.02)
-        if not d:
-            return False
-        i = d.find(REPLY_HEADER)
-        if i < 0 or len(d) < i + 17:
-            return False
-        body = d[i + 4:i + 16]
-        self.angles = [
-            int.from_bytes(body[k * 2:k * 2 + 2], 'big', signed=True) / 100.0
-            for k in range(6)]
-        self.angles_time = time.time()
-        return True
+        for attempt in range(self.POLL_ATTEMPTS):
+            # The full recipe every attempt: quiet the channel, then prompt
+            # it. See the table above -- the break is what elicits a reply and
+            # the reconfigure is what stops it arriving buried in junk.
+            if self.RECONFIGURE_EACH_POLL:
+                try:
+                    self._sp.baudrate = BAUD   # tcsetattr even if unchanged
+                except Exception:
+                    pass
+            if self.BREAK_BEFORE_POLL:
+                try:
+                    self._sp.send_break(0.01)
+                except Exception:
+                    pass
+            self._sp.reset_input_buffer()
+            self._sp.write(GET_ANGLES)
+            self._sp.flush()
+
+            d = b''
+            until = min(time.monotonic() + self.POLL_ATTEMPT_S, deadline)
+            while time.monotonic() < until:
+                chunk = self._sp.read(4096)
+                if chunk:
+                    d += chunk
+                    i = d.find(REPLY_HEADER)
+                    if i >= 0 and len(d) >= i + 17:
+                        body = d[i + 4:i + 16]
+                        self.angles = [
+                            int.from_bytes(body[k * 2:k * 2 + 2],
+                                           'big', signed=True) / 100.0
+                            for k in range(6)]
+                        self.angles_time = time.time()
+                        self.poll_attempts_used = attempt + 1
+                        return True
+                else:
+                    time.sleep(0.005)
+            if time.monotonic() >= deadline:
+                break
+        self.poll_attempts_used = self.POLL_ATTEMPTS
+        return False
 
     def poll_forever(self):
         consecutive_bad = 0
@@ -334,6 +359,7 @@ class ArmState:
             'healthy': (good / n) >= HEALTHY_FRACTION,
             'rebinds': self.rebinds,
             'rebinds_since_good': self.rebinds_since_good,
+            'poll_attempts_used': self.poll_attempts_used,
             'uptime_s': round(time.time() - self.started, 1),
             'last_error': self.last_error,
         }
@@ -572,6 +598,145 @@ class ArmState:
         return {'ok': True, 'hits': hits, 'trials': trials, 'bytes': total,
                 'sample': best_hex}
 
+    # struct serial_icounter_struct opens with 24 ints, the first ten being
+    # cts, dsr, rng, dcd, rx, tx, frame, overrun, parity, brk.
+    _ICOUNT_FIELDS = ('cts', 'dsr', 'rng', 'dcd', 'rx', 'tx',
+                      'frame', 'overrun', 'parity', 'brk')
+    TIOCGICOUNT = 0x545D
+
+    def _icount(self) -> dict:
+        """What the KERNEL says crossed this port. Caller holds self._lock."""
+        import fcntl
+        import struct
+        buf = fcntl.ioctl(self._sp.fileno(), self.TIOCGICOUNT,
+                          struct.pack('24i', *([0] * 24)))
+        return dict(zip(self._ICOUNT_FIELDS, struct.unpack('24i', buf)[:10]))
+
+    def counters(self, poke: bool = True, wait: float = 0.4,
+                 trials: int = 20, rx_baud: int | None = None,
+                 gap: float = 0.05,
+                 reconf: bool | None = None, brk: bool | None = None) -> dict:
+        """Per-transaction kernel counters, which userspace cannot infer.
+
+        Every probe so far measures the same thing: whether a frame turned up
+        in a buffer. That cannot separate the three mechanisms behind a
+        missing reply, and they need different fixes:
+
+            tx advanced, rx did not           nothing came back at all
+            rx advanced, frame/overrun too    bytes came back corrupted
+            rx advanced, counters clean       bytes came back and we lost them
+
+        TIOCGICOUNT is the driver's own tally of characters and line errors,
+        sampled either side of one transaction, so it answers that directly
+        rather than by inference. It also confirms the write left: a poll that
+        does not advance tx by 5 never reached the wire, and no amount of
+        read-side tuning would have helped it.
+
+        Uses the poll's own line discipline (reconfigure + break), so it
+        measures the read path actually in service -- the mistake that
+        invalidated the earlier strategy sweep.
+
+        rx_baud reads back at a different rate from the one written at, which
+        is what makes the framing-error count a BAUD measurement. Hit rate
+        cannot do that job: 40 trials carry about +/-8% of noise, so a 2%
+        clock error is invisible in it, while the same run yields thousands
+        of characters whose stop bits either land or do not.
+
+        The framing-error count doubles as a CRASH counter. The Atom's boot
+        output comes out at the ESP32 ROM's own rate, not this port's, so a
+        reboot lands as a burst of a few hundred framing errors -- measured
+        at ~556 each, arriving in exact multiples. That gives a count of
+        reboots per run, which hit rate cannot separate from ordinary silence.
+        """
+        out = {'absent': 0, 'framed': 0, 'unparsed': 0, 'line_errors': 0}
+        deltas = {k: 0 for k in self._ICOUNT_FIELDS}
+        rx_when_absent = []
+        # Per-trial outcome, in order. rx=0 cannot by itself say whether the
+        # arm stayed silent or this end went deaf -- but the two differ in
+        # SHAPE. A receiver that wedges fails in runs; a command lost on its
+        # own merits fails independently. Only the sequence shows that.
+        seq = []
+        if reconf is None:
+            reconf = self.RECONFIGURE_EACH_POLL
+        if brk is None:
+            brk = self.BREAK_BEFORE_POLL
+        t0 = time.monotonic()
+        with self._lock:
+            if self._sp is None:
+                self._open()
+            sp = self._sp
+            for _ in range(trials):
+                before = self._icount()
+                if reconf:
+                    try:
+                        sp.baudrate = BAUD
+                    except Exception:
+                        pass
+                if brk:
+                    try:
+                        sp.send_break(0.01)
+                    except Exception:
+                        pass
+                sp.reset_input_buffer()
+                if poke:
+                    sp.write(GET_ANGLES)
+                    sp.flush()
+                # Written at BAUD, which demonstrably works. Only the read
+                # rate varies, so the errors counted below are the read's.
+                if rx_baud and rx_baud != sp.baudrate:
+                    try:
+                        sp.baudrate = rx_baud
+                    except Exception:
+                        pass
+                d = b''
+                end = time.monotonic() + wait
+                while time.monotonic() < end:
+                    c = sp.read(4096)
+                    if c:
+                        d += c
+                        i = d.find(REPLY_HEADER)
+                        if i >= 0 and len(d) >= i + 17:
+                            break
+                    else:
+                        time.sleep(0.01)
+                after = self._icount()
+                if rx_baud:
+                    try:
+                        sp.baudrate = BAUD
+                    except Exception:
+                        pass
+                for k in self._ICOUNT_FIELDS:
+                    deltas[k] += after[k] - before[k]
+                if any(after[k] - before[k]
+                       for k in ('frame', 'overrun', 'parity')):
+                    out['line_errors'] += 1
+                i = d.find(REPLY_HEADER)
+                if i >= 0 and len(d) >= i + 17:
+                    out['framed'] += 1
+                    seq.append('.')
+                elif d:
+                    out['unparsed'] += 1
+                    seq.append('?')
+                else:
+                    out['absent'] += 1
+                    rx_when_absent.append(after['rx'] - before['rx'])
+                    seq.append('X')
+                time.sleep(gap)
+        rx = deltas['rx'] or 1
+        elapsed = time.monotonic() - t0
+        return {'ok': True, 'trials': trials, 'rx_baud': rx_baud or BAUD,
+                'reconf': reconf, 'brk': brk,
+                # ~556 framing errors per reboot; see the docstring.
+                'reboots': round(deltas['frame'] / 556.0, 1),
+                'elapsed_s': round(elapsed, 1),
+                'reboots_per_min': round(deltas['frame'] / 556.0
+                                         * 60.0 / max(elapsed, 1e-6), 1),
+                **out,
+                'sequence': ''.join(seq),
+                'frame_err_per_char': round(deltas['frame'] / rx, 4),
+                'rx_chars_when_no_bytes_read': rx_when_absent,
+                'icount_delta': deltas}
+
     def raw(self, data: bytes) -> dict:
         with self._lock:
             if self._sp is None:
@@ -640,6 +805,14 @@ class Handler(socketserver.StreamRequestHandler):
         if cmd == 'sniff':
             return STATE.sniff(float(req.get('seconds', 3.0)),
                                bool(req.get('poke', True)))
+        if cmd == 'counters':
+            return STATE.counters(
+                poke=bool(req.get('poke', True)),
+                wait=float(req.get('wait', 0.4)),
+                trials=int(req.get('trials', 20)),
+                rx_baud=req.get('rx_baud'),
+                gap=float(req.get('gap', 0.05)),
+                reconf=req.get('reconf'), brk=req.get('brk'))
         if cmd == 'rebind':
             with STATE._lock:
                 STATE._reopen_after_rebind()

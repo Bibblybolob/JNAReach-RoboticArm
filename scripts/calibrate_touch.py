@@ -385,10 +385,16 @@ def collect(args) -> int:
             colour, depth = cam.frame()
             seen = corners_3d(colour, depth, board, adict, cam.K)
             if len(seen) < 3:
-                print(f'only {len(seen)} corners visible with valid depth -- '
-                      'move the board into view, 70-500mm away, and press '
-                      'Enter to retry')
-                input()
+                # Usually the ARM, not the board: it is parked on the last
+                # corner it touched, in front of the very corners this needs
+                # to find. Say that first, since it is the common case and the
+                # fix is different from moving the board.
+                print(f'only {len(seen)} corners visible with valid depth.')
+                print('  Most likely the arm is still over the board from the '
+                      'last touch and is blocking the view -- it gets '
+                      'retracted automatically, so if this persists the board '
+                      'itself has moved or drifted outside 70-500mm.')
+                input('  clear the view, then press Enter to retry: ')
                 continue
 
             # Prefer corners far from the ones already used, so the point set
@@ -402,6 +408,11 @@ def collect(args) -> int:
             img_path = os.path.join(OUT_DIR, f'touch_{len(records):02d}.png')
             annotate(colour, seen, idx, img_path)
             cam_xyz = seen[idx][1]
+
+            st = request({'cmd': 'state'})
+            retract_to = (list(st['angles'])
+                          if st and st.get('angles')
+                          and st.get('age_ms', 1e9) < 5000 else None)
 
             print(f'\n--- touch {len(records)+1} of {args.points}')
             print(f'    target: corner {idx}, {cam_xyz[2]*1000:.0f}mm from '
@@ -449,6 +460,29 @@ def collect(args) -> int:
                   f'{cam_xyz[1]*1000:+.0f}, {cam_xyz[2]*1000:+.0f})mm  '
                   f'base ({base_xyz[0]*1000:+.0f}, {base_xyz[1]*1000:+.0f}, '
                   f'{base_xyz[2]*1000:+.0f})mm')
+
+            # Get out of the camera's way before the next capture. The arm
+            # ends each touch resting ON the board, directly in front of the
+            # corners the next iteration has to find -- so without this the
+            # detection degrades touch by touch as the arm works its way
+            # across the board, and the failure looks like the board drifting.
+            #
+            # Commanded, never by hand: that is what makes it free. Twelve
+            # commanded moves at near-maximum load produced zero Atom reboots.
+            if retract_to is not None:
+                ok, why = guard.check(retract_to)
+                if ok:
+                    print(f'    retracting to clear the view')
+                    request({'cmd': 'call', 'method': 'power_on'}, timeout=20)
+                    request({'cmd': 'send_angles',
+                             'angles': [float(a) for a in retract_to],
+                             'speed': args.speed, 'force': True}, timeout=30)
+                    travel = max(abs(a - b)
+                                 for a, b in zip(retract_to, angles))
+                    time.sleep(travel / 29.0 * (100.0 / max(args.speed, 1))
+                               * 0.6 + 1.0)
+                else:
+                    print(f'    not retracting -- that pose is unsafe: {why}')
     finally:
         cam.close()
 

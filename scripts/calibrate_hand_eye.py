@@ -184,17 +184,33 @@ def capture_poses(args) -> int:
         return 1
     print(f'link {frac*100:.0f}% valid -- proceeding')
 
+    # Start from home. The pose set is defined as offsets from it, so
+    # beginning anywhere else means the FIRST move can be enormous -- the arm
+    # was 93deg away on joint4 once, missed the settle window, and every pose
+    # was then rejected for not having arrived.
+    print('homing before the pose set...')
+    request({'cmd': 'send_angles', 'angles': HOME, 'speed': 30,
+             'force': True}, timeout=25)
+    time.sleep(6.0)
+
     pipe = rs.pipeline()
     cfg = rs.config()
     cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     pipe.start(cfg)
     records = []
     consecutive_failures = 0
+    last_cmd = list(HOME)
     try:
         for i, q in enumerate(safe):
             request({'cmd': 'send_angles', 'angles': q, 'speed': 30,
                      'force': True}, timeout=25)
-            time.sleep(args.settle)
+            # Wait in proportion to how far it actually has to travel. A fixed
+            # settle is wrong at both ends: consecutive poses here differ by up
+            # to 80deg of roll, which at speed 30 (~29deg/s measured) takes
+            # nearly 3s on its own, while a small move wastes the same wait.
+            travel = max(abs(a - b) for a, b in zip(q, last_cmd))
+            time.sleep(args.settle + travel / 25.0)
+            last_cmd = list(q)
             settled = time.monotonic()
             if args.commanded_angles:
                 # Give it longer to arrive, since nothing will confirm it did.

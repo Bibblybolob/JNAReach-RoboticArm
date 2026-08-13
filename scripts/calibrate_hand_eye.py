@@ -83,6 +83,120 @@ def make_board(square_mm: float):
         square_mm / 1000.0 * MARKER_RATIO, d), d
 
 
+def cmd_measure_square(args) -> int:
+    """Measure the PRINTED square with depth, instead of trusting the print.
+
+    Why this exists, measured 2026-08-13: the board in use here is printed at
+    **39mm squares, not the 30mm the script assumed** -- a 30% scale error,
+    almost certainly a printer "fit to page". Scale in the target is scale in
+    the answer, so every translation the old calibration produced was 30% out.
+
+    Nothing in the colour-only path can catch that. The board's pose is solved
+    FROM the assumed square size, so a wrong size yields a wrong range that is
+    perfectly self-consistent -- and all four solvers agree, because they were
+    handed the same wrong number. "Solvers agree to 1mm" measures agreement,
+    not accuracy.
+
+    Depth is independent of all of it. It measures the distance between
+    adjacent corners directly, in millimetres, with no reference to what the
+    board is supposed to be. On this board, 34 spacings gave 38.99mm with a
+    0.57mm spread -- and depth reconstructed a known-flat board to 1.31mm rms
+    at the same time, which is what says the sensor is worth believing.
+
+    Run this once per printed board, then pass the number to --square-mm.
+    """
+    import numpy as np
+    import pyrealsense2 as rs
+
+    pipe = rs.pipeline()
+    cfg = rs.config()
+    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    profile = pipe.start(cfg)
+    align = rs.align(rs.stream.color)
+    try:
+        for _ in range(40):          # let auto-exposure settle
+            frames = pipe.wait_for_frames(10000)
+        frames = align.process(frames)
+        colour = np.asanyarray(frames.get_color_frame().get_data()).copy()
+        scale = profile.get_device().first_depth_sensor().get_depth_scale()
+        depth_mm = (np.asanyarray(frames.get_depth_frame().get_data())
+                    .astype(float) * scale * 1000.0)
+    finally:
+        pipe.stop()
+
+    K = np.array(args.K, dtype=float).reshape(3, 3) if args.K else np.array(
+        [[393.8, 0, 318.1], [0, 393.4, 236.5], [0, 0, 1.0]])
+    board, adict = make_board(args.square_mm)
+    gray = cv2.cvtColor(colour, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = cv2.aruco.detectMarkers(gray, adict)
+    if ids is None or len(ids) < 4:
+        print('No board in view. Point the camera at it, filling a good part '
+              'of the frame, and try again.')
+        return 1
+    n, ch_c, ch_i = cv2.aruco.interpolateCornersCharuco(
+        corners, ids, gray, board)
+    if n is None or n < 6:
+        print(f'Only {n} board corners found; need at least 6.')
+        return 1
+
+    pts = {}
+    for k, idx in enumerate(ch_i.ravel()):
+        u, v = ch_c[k].ravel()
+        iu, iv = int(round(u)), int(round(v))
+        patch = depth_mm[max(0, iv - 2):iv + 3, max(0, iu - 2):iu + 3]
+        valid = patch[patch > 0]
+        if valid.size < 5:
+            continue
+        z = float(np.median(valid))
+        pts[int(idx)] = np.array([(u - K[0, 2]) * z / K[0, 0],
+                                  (v - K[1, 2]) * z / K[1, 1], z])
+
+    # The inner corners of an X-by-Y board form an (X-1) by (Y-1) grid.
+    gx = SQUARES_X - 1
+    gy = SQUARES_Y - 1
+    spacings = []
+    for idx, P in pts.items():
+        r, c = divmod(idx, gx)
+        for nr, nc in ((r, c + 1), (r + 1, c)):
+            if nc < gx and nr < gy and (nr * gx + nc) in pts:
+                spacings.append(float(np.linalg.norm(P - pts[nr * gx + nc])))
+    if len(spacings) < 5:
+        print(f'Only {len(spacings)} corner spacings had valid depth. Move the '
+              'board into the 70-500mm band where a D405 actually measures.')
+        return 1
+
+    s = np.array(spacings)
+    measured = float(np.median(s))
+
+    # Flatness is the sensor's own credibility check. A known-flat board that
+    # depth renders as flat means the depth is worth believing; if this is
+    # poor, so is the measurement above.
+    P = np.array(list(pts.values()))
+    centred = P - P.mean(axis=0)
+    normal = np.linalg.svd(centred)[2][2]
+    flat_rms = float(np.abs(centred @ normal).std())
+
+    print(f'{len(s)} adjacent-corner spacings measured by depth')
+    print(f'  median {measured:.2f}mm, mean {s.mean():.2f}mm, '
+          f'spread {s.std():.2f}mm')
+    print(f'  depth renders this flat board flat to {flat_rms:.2f}mm rms '
+          f'-- that is what makes the number above trustworthy')
+    print()
+    print(f'configured square size: {args.square_mm:.2f}mm')
+    err = 100.0 * (measured / args.square_mm - 1.0)
+    if abs(err) < 2.0:
+        print(f'measured agrees to {err:+.1f}% -- the configured size is right')
+        return 0
+    print(f'measured is {err:+.1f}% off the configured size.')
+    print(f'\n  Use --square-mm {measured:.1f}')
+    print('\nScale in the target is scale in the answer: a calibration solved '
+          f'at {args.square_mm:.0f}mm from a board that is really '
+          f'{measured:.0f}mm has every translation wrong by {err:+.0f}%, and '
+          'nothing in the colour-only path can notice.')
+    return 0
+
+
 def cmd_make_board(args) -> int:
     board, _ = make_board(args.square_mm)
     # 10 px/mm gives a crisp print at any sane printer DPI.
@@ -472,6 +586,12 @@ def main() -> int:
     ap.add_argument('--square-mm', type=float, default=DEFAULT_SQUARE_MM,
                     help='MEASURED square size of the printed board')
     ap.add_argument('--settle', type=float, default=2.5)
+    ap.add_argument('--measure-square', action='store_true',
+                    help='measure the PRINTED square with depth and stop. '
+                         'Run this once per printed board -- a printer '
+                         '"fit to page" put 30%% of scale error into this '
+                         "project's board and nothing in the colour path "
+                         'could see it.')
     ap.add_argument('--eye-to-hand', action='store_true',
                     help='camera is STATIC and the board rides on the flange, '
                          'which is the case once the camera leaves the flange. '
@@ -492,6 +612,8 @@ def main() -> int:
                     help='camera matrix, row-major; defaults to D405 factory')
     args = ap.parse_args()
 
+    if args.measure_square:
+        return cmd_measure_square(args)
     if args.make_board:
         return cmd_make_board(args)
     if args.collect:

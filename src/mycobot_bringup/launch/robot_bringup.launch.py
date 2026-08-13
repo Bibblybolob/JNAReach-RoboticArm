@@ -111,6 +111,12 @@ def generate_launch_description():
     rs_serial_arg = DeclareLaunchArgument('rs_serial', default_value='')
     rs_align_arg = DeclareLaunchArgument(
         'rs_align_depth_to_color', default_value='false')
+    rs_emitter_arg = DeclareLaunchArgument(
+        'rs_emitter', default_value='true',
+        description='IR projector. Off means no depth on flat, matte targets')
+    rs_laser_power_arg = DeclareLaunchArgument(
+        'rs_laser_power', default_value='150.0',
+        description='Projector strength; 0 leaves the firmware default')
     device_height_arg = DeclareLaunchArgument('device_height', default_value='480')
     connection_arg = DeclareLaunchArgument(
         'connection', default_value='tcp', choices=['tcp', 'serial'],
@@ -177,7 +183,7 @@ def generate_launch_description():
             'adaptive_speed': True,
             'speed_at_100_deg_s': _f('speed_at_100_deg_s'),
             'speed_headroom': 1.3,
-            'home_angles_deg': [0.0, 90.0, -90.0, 0.0, 0.0, 0.0],
+            'home_angles_deg': [0.0, 90.0, -150.0, 55.0, 0.0, 0.0],
             'home_speed': 30,
             'home_on_start': _b('home_on_start'),
             'connection': _s('connection'),
@@ -233,6 +239,8 @@ def generate_launch_description():
             'rs_depth': _b('rs_depth'),
             'rs_serial': _s('rs_serial'),
             'rs_align_depth_to_color': _b('rs_align_depth_to_color'),
+            'rs_emitter': _b('rs_emitter'),
+            'rs_laser_power': _f('rs_laser_power'),
             'device_height': _i('device_height'),
         }],
         output='screen',
@@ -267,6 +275,8 @@ def generate_launch_description():
         rs_fps_arg,
         rs_depth_arg,
         rs_serial_arg,
+        rs_emitter_arg,
+        rs_laser_power_arg,
         rs_align_arg,
         device_height_arg,
         robot_state_publisher,

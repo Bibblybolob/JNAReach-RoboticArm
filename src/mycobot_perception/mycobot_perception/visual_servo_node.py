@@ -649,8 +649,13 @@ class VisualServoNode(Node):
         self.declare_parameter('approach_gain', 6.0)
         self.declare_parameter('approach_deadband', 0.03)
         self.declare_parameter('max_approach_step_deg', 1.5)
+        # --- Depth-based approach ---
+        # When true, interpret point.z as depth in mm (from a depth camera)
+        # instead of palm width in pixels. Drives the approach joint until the
+        # target reaches target_depth_mm. Requires the upstream node to publish
+        # depth as point.z (detection_bridge_node does this).
         self.declare_parameter('depth_approach', False)
-        self.declare_parameter('target_depth_mm', 50.0)
+        self.declare_parameter('target_depth_mm', 70.0)
 
         # --- Search / idle behaviour ---
         # Seconds without a sighting before giving up and homing.
@@ -793,8 +798,8 @@ class VisualServoNode(Node):
         self._max_approach_step = float(
             self.get_parameter('max_approach_step_deg').value)
         self._depth_approach = bool(self.get_parameter('depth_approach').value)
-        self._target_depth_mm = float(
-            self.get_parameter('target_depth_mm').value)
+        self._target_depth_mm = float(self.get_parameter('target_depth_mm').value)
+        self._last_depth_mm: float | None = None
 
         self._lost_timeout = float(self.get_parameter('lost_timeout').value)
         self._resume_search_after = float(
@@ -935,7 +940,13 @@ class VisualServoNode(Node):
             self._arm_timer = self.create_timer(
                 2.0, self._arm_jog_once, callback_group=cb)
 
-        if bool(self.get_parameter('search_on_start').value):
+        # Deferred until the jog gate is actually open (see _armed). Sweeping
+        # before then advances the sweep bookkeeping while the driver discards
+        # every jog, so the node believes it has swept a range the arm never
+        # moved through -- and it cannot see anything, because the arm is
+        # still homing.
+        self._search_on_start = bool(self.get_parameter('search_on_start').value)
+        if self._search_on_start and not bool(self.get_parameter('auto_arm_jog').value):
             self._set_state(SEARCHING)
 
         self.get_logger().info(
@@ -969,7 +980,6 @@ class VisualServoNode(Node):
         'target_size_fraction': '_target_size',
         'approach_gain': '_approach_gain',
         'max_approach_step_deg': '_max_approach_step',
-        'depth_approach': '_depth_approach',
         'target_depth_mm': '_target_depth_mm',
     }
 
@@ -1049,9 +1059,18 @@ class VisualServoNode(Node):
                 self.get_logger().info(
                     'Armed the driver jog gate (/arm/jog_enable).')
                 self._arm_timer.cancel()
+                # Now, and not before: the driver holds this shut until
+                # startup homing has finished, so this is the earliest moment
+                # a sweep can actually move the arm.
+                if getattr(self, '_search_on_start', False) and self._state == IDLE:
+                    self.get_logger().info(
+                        'Jog gate open and homing done -- starting search.')
+                    self._set_state(SEARCHING)
             else:
-                self.get_logger().warn(
-                    '/arm/jog_enable refused; will retry.')
+                msg = getattr(res, 'message', '') if res is not None else ''
+                self.get_logger().info(
+                    f'/arm/jog_enable refused ({msg or "no reason given"}); '
+                    'will retry.', throttle_duration_sec=5.0)
 
         future.add_done_callback(_armed)
 
@@ -1181,8 +1200,11 @@ class VisualServoNode(Node):
                     'ros2 service call /servo/search std_srvs/srv/Trigger')
             self._ever_received_point = True
         self._last_point = (msg.point.x, msg.point.y)
-        # z carries palm width in pixels, not a depth. See hand_tracker_node.
-        self._last_size_px = msg.point.z if msg.point.z > 0 else None
+        if self._depth_approach:
+            self._last_depth_mm = msg.point.z if msg.point.z > 0 else None
+            self._last_size_px = None
+        else:
+            self._last_size_px = msg.point.z if msg.point.z > 0 else None
         self._last_point_time = time.monotonic()
 
         # The frame's own timestamp, carried through by the tracker. This is
@@ -1998,30 +2020,15 @@ class VisualServoNode(Node):
             return 0.0
 
         if self._depth_approach:
-            return self._approach_step_depth()
-        return self._approach_step_size()
+            if self._last_depth_mm is None or self._last_depth_mm <= 0.0:
+                return 0.0
+            error = (self._last_depth_mm - self._target_depth_mm) / self._target_depth_mm
+            if abs(error) < self._approach_deadband:
+                return 0.0
+            step = self._approach_gain * error * self._approach_sign
+            return max(-self._max_approach_step,
+                       min(self._max_approach_step, step))
 
-    def _approach_step_depth(self) -> float:
-        """Depth-based approach: drive until the sensor reads target_depth_mm."""
-        if self._last_size_px is None or self._last_size_px <= 0.0:
-            self.get_logger().warn(
-                'Not closing in: depth reading is zero or unavailable. '
-                'Check that the detection bridge is publishing depth in '
-                'point.z and that the target is within the depth sensor range.',
-                throttle_duration_sec=10.0)
-            return 0.0
-
-        depth_mm = self._last_size_px
-        error = (depth_mm - self._target_depth_mm) / self._target_depth_mm
-        if abs(error) < self._approach_deadband:
-            return 0.0
-
-        step = self._approach_gain * error * self._approach_sign
-        return max(-self._max_approach_step,
-                   min(self._max_approach_step, step))
-
-    def _approach_step_size(self) -> float:
-        """Size-based approach: drive until apparent size reaches target."""
         if self._last_size_px is None or self._width is None:
             self.get_logger().warn(
                 'Not closing in: the tracker is not reporting palm size, so '

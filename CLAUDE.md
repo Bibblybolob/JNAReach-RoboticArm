@@ -5,6 +5,67 @@ doing visual servoing. The long-term goal is autonomously **pressing elevator
 buttons**; hand-following is the stepping stone that proves the
 perception-to-motion loop works.
 
+## Working agreements
+
+**Never ask for a power cycle.** It is not a diagnosis, it clears the evidence
+that would have identified the fault, and on 2026-08-12 the four faults that
+actually cost time were all found and fixed in software after power cycles had
+failed to help.
+
+**The wiring is not the problem. Do not raise it.** Every time it was blamed
+this project, the real cause was elsewhere and the accusation cost hours.
+
+**When something is unexpected, work through at least ten distinct hypotheses
+before concluding anything.** Not ten retries of the same idea — ten different
+mechanisms. The failures here impersonate each other: a dead link, a crashed
+controller, a stalled joint and a script sitting at a prompt all present as
+silence.
+
+The checklist below is not hypothetical. Every entry is a fault that really
+happened here and was mistaken for something else first:
+
+1. **Another process holds the port.** `fuser -v /dev/ttyTHS1`. A script
+   waiting at an interactive prompt held it for a whole session while
+   diagnostics read silence and the arm was declared dead.
+2. **Two writers on one tty.** Interleaved bytes produce a length field that
+   does not match its payload, which the Atom reports as `cmd_len error` — so
+   concurrent access MANUFACTURES the firmware crash that gets blamed on the
+   flash. `scripts/arm_broker.py` makes this impossible; use it.
+3. **The parser assumes the reply is at offset 0.** It routinely arrives
+   behind 100+ bytes of internal Feetech servo-bus traffic. Two separate tools
+   scored a working arm as dead this way. SEARCH for `fe fe 0e 20`.
+4. **The Tegra UART controller wedges.** Zero bytes, no crash text, nothing
+   unsolicited. Unbind/rebind `3100000.serial` — `arm_link.rebind_uart()`
+   does it without root if the sudoers rule is installed.
+5. **Return values lie.** pymycobot returns -1 for anything it cannot parse,
+   and `power_on`/`focus_all_servos` return -1 while working perfectly. Judge
+   by effect: `set_color` and look at the LED.
+6. **Writes and reads fail independently.** Confirmed 2026-08-12: the LED
+   cycled on command while reads sat at 2%. Test the two directions
+   separately before concluding "the link is down" — the arm may still be
+   fully commandable.
+7. **Units.** The D405 reports depth in 0.1mm, not mm. Every distance was 10x
+   too large for a whole session, and the symptom was "the panel is not in
+   view" while it sat in front of the camera.
+8. **Stale reads paired with fresh data.** A joint reading that arrives late
+   gets attributed to the wrong image or the wrong moment. Require samples
+   taken AFTER the event, not merely recent.
+9. **A tolerance set below the hardware's resolution.** 0.8deg of backlash
+   tripped a "joint has not moved" alarm for six cycles about a joint that was
+   holding fine.
+10. **A diagnostic message that lies.** A 10s wait reported as "timed out
+    after 40.0s" sent an investigation after a mechanical fault that did not
+    exist. Check what the code actually did before believing what it printed.
+11. **Class or index order.** Labels are written as indices; a different order
+    silently relabels every box with no error anywhere.
+12. **The commanded pose is not the measured pose.** The jog target is seeded
+    from the MEASURED pose, so an untouched joint gets re-commanded to
+    wherever gravity left it — a sag ratchet that looks exactly like lost
+    torque and is not.
+
+Only after all of those come up empty is it worth suspecting hardware — and
+then say what evidence points there, not "check the wiring".
+
 ## Layout
 
 **The target topology is a Jetson Orin Nano doing everything** — RealSense on
@@ -511,11 +572,82 @@ hardware as of this writing; the port may be power-only.
 
 ## Gotchas
 
-- **The home pose `[0, 90, -90, 0, 0, 0]` is defined in five places** and they
-  must agree: the driver node default, `robot_bringup.launch.py`,
+- **The home pose `[0, 90, -150, 55, 0, 0]` is defined in five places** and
+  they must agree: the driver node default, `robot_bringup.launch.py`,
   `moveit_bringup.launch.py`, `driver.launch.py`, and
-  `src/mycobot_moveit_config/config/mycobot_280pi.srdf` (in radians).
-  Consolidating this is outstanding work.
+  `src/mycobot_moveit_config/config/mycobot_280pi.srdf` (in radians —
+  `[0, 1.5708, -2.618, 0.9599, 0, 0]`). Consolidating this is outstanding work.
+  Measured poses, including this one, are in
+  [docs/recorded_poses.md](docs/recorded_poses.md).
+
+  **Home is chosen for where the CAMERA points, not just for the arm.** The
+  stock `[0, 90, -90, 0, 0, 0]` is mechanically fine — reaches to 1 degree,
+  holds with zero drift, no torque problem whatever an earlier note in this
+  file claimed — but it folds the arm over and aims the flange camera at the
+  ceiling. The search sweep only tilts joint5 from wherever the arm starts, so
+  homing there means sweeping empty air and never seeing a button, which
+  presents as "the detector does not work" when the detector is fine.
+
+  **joint3 sits at its -150 limit.** pymycobot validates that range and RAISES
+  rather than clamping, so a reading a fraction past it makes `send_angles`
+  fail outright — an arm resting at -150.6 cost a session. The driver clamps
+  to `joint_limits_deg` before sending, which covers the normal path. If
+  homing starts failing with `Has invalid angle value ... index 2`, back
+  joint3 off to -149 rather than looking elsewhere.
+
+- **If the arm accepts commands and never moves, suspect the Atom firmware
+  before anything else.** On 2026-08-10 the ESP32 was crash-looping — it
+  rejected a command as malformed, dereferenced a null pointer, panicked and
+  rebooted, forever:
+
+  ```
+  cmd_len error cmd_len error cmd_len error
+  Guru Meditation Error: Core  1 panic'ed (LoadProhibited)
+  ```
+
+  **The fix took THREE reflashes of atomMain 6.2 with myStudio.** The first two
+  changed nothing measurable; the third cleared it (55/60 valid replies, 0
+  crashes). Do not conclude a reflash failed after one attempt. Reflashing also
+  **loses the servo zero calibration** — redo it with
+  `./scripts/calibrate_zero.py`, which is a separate and equally necessary
+  step. Calibration then survives power cycles and further reflashes.
+
+  Full capture, reproduction and everything ruled out:
+  [docs/atom_firmware_crash.md](docs/atom_firmware_crash.md).
+
+- **Read the raw serial bytes, not pymycobot's return value.** This is the
+  lesson that cost most of a session. pymycobot returns `-1` for anything it
+  cannot parse, and the host UART carries the ESP32's panic text, its boot
+  output and the arm's **internal Feetech servo bus** (`ff ff 01 11 00 ...`)
+  alongside real `fe fe 0e 20 ... fa` replies. That mixture reads as `-1`,
+  which is indistinguishable from a dead link. Six confident diagnoses were
+  built on `-1` and every one was wrong — wiring, torque, power rail, free
+  mode, servo bus, protocol mismatch. One raw dump found the real fault in
+  minutes:
+
+  ```bash
+  python3 -c "
+  import serial, time
+  sp = serial.Serial('/dev/ttyTHS1', 1000000, timeout=1.0); time.sleep(2)
+  for _ in range(20):
+      sp.write(bytes([0xfe,0xfe,0x02,0x20,0xfa])); sp.flush(); time.sleep(0.4)
+      d = sp.read(16384)
+      if d: print(len(d), d[:60].hex(' '))"
+  ```
+
+- **`set_color` is the write test to reach for first.** It drives the Atom's
+  own LED: no servo, no meaningful current, nothing mechanical to block. If the
+  LED changes, the controller executes writes, and torque/power/gearing/wiring
+  are all eliminated in one step. If it does not, nothing you command is
+  landing. Hours went into torque and power theories that this would have
+  killed immediately.
+
+- **`jog_angle` does nothing on atomMain 6.2** — silently ignored, every time,
+  at every speed. `send_angles` is the working motion path, which is what
+  `mycobot_hardware_node` already uses, so the driver is unaffected. Worth
+  knowing before writing a diagnostic script around `jog_angle` and concluding
+  the arm is dead.
+
 - `colcon build --symlink-install` — without the symlink flag, edits to Python
   nodes do not take effect and `ros2 param get` keeps reporting old values.
 - The arm keeps moving after the stack dies unless `mc.stop()` runs; the
@@ -640,12 +772,24 @@ hardware as of this writing; the port may be power-only.
       would be mandatory.
     - **The lens is much wider, and that invalidates the servo gains.** Error
       is normalised per axis, so 1.0 means "at the edge" on any camera — but
-      the edge is ~25° away on the current webcam and ~43° on a D405. The same
-      normalised error therefore commands nearly twice the rotation, and the
-      loop will over-command and ring. `camera_node` computes the real FOV from
-      the intrinsics and warns when it is this much wider, naming
-      `skip_probe:=false` as the fix. **Re-measure before trusting any tuning
-      in this file.**
+      the edge is ~25° away on the current webcam and **39.1° on this D405 at
+      640x480** (31.4° vertically) — read off the factory intrinsics
+      2026-08-13, `fx=393.8 fy=393.4`, correcting the ~43° estimate this line
+      used to carry. The same normalised error therefore commands nearly twice
+      the rotation, and the loop will over-command and ring. `camera_node`
+      computes the real FOV from the intrinsics and warns when it is this much
+      wider, naming `skip_probe:=false` as the fix. **Re-measure before
+      trusting any tuning in this file.**
+
+    **The camera is now on the FIRST ARM PIECE, not the flange**, so only
+    joint1 moves it and the servo's 2x2 image Jacobian is singular by
+    construction — measured, joints 2-6 shift the image by under 0.08 px/deg
+    while joint1 gives 10.49. Keep `skip_probe:=false`: it refuses for exactly
+    this reason, and the usual runaway guard does NOT fire here because joint5
+    moves fine, it just does nothing to the image. Hand-eye calibration is
+    degenerate rather than merely stale. See
+    [docs/camera_mount.md](docs/camera_mount.md) and
+    `scripts/measure_jacobian.py`.
 
     `pyrealsense2` is left optional in `requirements.txt` because the mjpeg
     and device sources do not need it; the node reports it missing and keeps

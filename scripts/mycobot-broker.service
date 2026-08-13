@@ -1,0 +1,38 @@
+[Unit]
+Description=myCobot arm serial broker (single owner of /dev/ttyTHS1)
+Documentation=file:///home/jonathan/mycobot_project/scripts/arm_broker.py
+After=multi-user.target
+# Nothing to broker if the UART is not there. The unit still starts on a
+# machine with the arm unplugged; it just exits and Restart= brings it back
+# when the device appears.
+ConditionPathExists=/dev/ttyTHS1
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/jonathan/mycobot_project/scripts/arm_broker.py
+
+# Must be the same user the sudoers rule names, or the UART rebind that
+# recovers a wedged controller will be refused and the broker degrades to
+# reporting silence it cannot fix. See rebind_uart() in arm_link.py.
+User=jonathan
+Group=dialout
+
+# LOAD-BEARING. With a private /tmp the broker gets its own namespace, so
+# /tmp/mycobot-arm.sock exists only inside the service and every client --
+# the ROS driver included -- silently falls back to opening the serial port
+# directly. That reintroduces exactly the concurrent-access corruption this
+# whole thing exists to prevent, and it would look like the broker working
+# fine, because from inside the unit it is.
+PrivateTmp=no
+
+Restart=always
+RestartSec=3
+# A crash loop should be visible, not silently absorbed.
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,228 +1,288 @@
-#!/usr/bin/env python3
-"""Bridge between a YOLO-style Detection2DArray and the PointStamped the
-visual servo expects.
+"""
+Bridges vision_msgs/Detection2DArray + a depth image into the PointStamped
+contract the visual servo expects.
 
-Subscribes to `vision_msgs/Detection2DArray` button detections and an
-optional 16UC1 depth image (RealSense, mm), and republishes the selected
-button's bbox centre as `geometry_msgs/PointStamped` on `/button/point_px`.
+    /button/point_px    geometry_msgs/PointStamped
+                         x, y = detection bbox centre, in FULL-frame pixels
+                         z    = depth at that point, in millimetres (0 if
+                                unavailable)
 
-Target selection is a runtime ROS parameter (`target_label`), following the
-same live-tunable pattern as `visual_servo_node.py` — no custom service type
-is needed since ROS 2 already exposes parameter get/set as services. When
-`target_label` is empty, the highest-confidence detection of any label is
-forwarded; when set, only detections whose `class_id` matches
-(case-insensitive) are considered, and the highest-confidence match wins.
+Which detection gets published is controlled by the `target_label` parameter:
 
-Depth lookup takes a 5x5 median around the detection centre for noise
-rejection and clamps to positive values; if depth is zero or the depth topic
-has not produced a frame yet, `point.z` falls back to the bbox diagonal in
-pixels so the servo still has a distance proxy to reason about.
+    ros2 param set /detection_bridge_node target_label button-5
+
+Empty (the default) means "steer at the best button you can see, whatever it
+is" -- the highest-confidence detection of any class. That is what bring-up
+wants, and what button_servo.launch.py's own description has always claimed
+this did; it used to publish nothing instead, which silently pinned the servo
+in SEARCHING forever because /button/point_px never carried a single message.
+
+Set the label once a specific floor is wanted. If more than one detection
+matches, the highest-confidence one wins.
+
+Depth is sampled as the median of a 5x5 patch around the bbox centre,
+with zero (invalid) pixels excluded, so a single missing depth reading at the
+exact centre pixel does not zero out the whole point.
 """
 
+from __future__ import annotations
+
 import numpy as np
+
 import rclpy
-from cv_bridge import CvBridge
-from geometry_msgs.msg import PointStamped
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+from rcl_interfaces.msg import SetParametersResult
+
+from cv_bridge import CvBridge
+
+from geometry_msgs.msg import PointStamped
 from sensor_msgs.msg import Image
 from vision_msgs.msg import Detection2DArray
 
 
 class DetectionBridgeNode(Node):
-    def __init__(self):
+
+    def __init__(self) -> None:
         super().__init__('detection_bridge_node')
 
-        self.declare_parameter(
-            'detections_topic', '/perception/button_detections',
-            ParameterDescriptor(description='Detection2DArray topic from the YOLO detector'))
-        self.declare_parameter(
-            'depth_topic', '/camera/depth_raw',
-            ParameterDescriptor(description='16UC1 depth image topic, mm'))
-        self.declare_parameter(
-            'output_topic', '/button/point_px',
-            ParameterDescriptor(description='PointStamped output topic for the servo'))
-        self.declare_parameter(
-            'target_label', '',
-            ParameterDescriptor(
-                type=ParameterType.PARAMETER_STRING,
-                description=(
-                    "Floor label to target, e.g. '3'. Empty = highest-confidence "
-                    "detection of any label. Set live with "
-                    "`ros2 param set /detection_bridge_node target_label 3`.")))
-        self.declare_parameter(
-            'use_depth', True,
-            ParameterDescriptor(description='Look up depth at the detection centre when true'))
-        self.declare_parameter(
-            'min_confidence', 0.2,
-            ParameterDescriptor(description='Minimum hypothesis score to consider a detection'))
+        self.declare_parameter('detection_topic', '/perception/button_detections')
+        self.declare_parameter('depth_topic', '/camera/depth_raw')
+        self.declare_parameter('output_topic', '/button/point_px')
+        self.declare_parameter('target_label', '')
 
-        self._detections_topic = self.get_parameter('detections_topic').value
-        self._depth_topic = self.get_parameter('depth_topic').value
-        self._output_topic = self.get_parameter('output_topic').value
-        self._target_label = self.get_parameter('target_label').value
-        self._use_depth = self.get_parameter('use_depth').value
-        self._min_confidence = self.get_parameter('min_confidence').value
+        # --- Depth sanity filter ---
+        #
+        # A button is a physical thing on a flat panel: it has a depth, that
+        # depth is inside the sensor's valid range, and it does not move.
+        # A false detection has none of those properties, and the detector
+        # produces plenty of them -- measured on this panel, it locked onto
+        # 'down' (a class this panel does not even have) at 0.21 and the
+        # target teleported from (+0.94,-0.52) to (+0.40,-0.96) to
+        # (+0.96,-0.60) between consecutive sightings, saturating every jog.
+        #
+        # Depth rejects that for free, without touching the model: noise
+        # lands wherever it lands, and mostly not on the panel.
+        self.declare_parameter('require_depth', True)
+        # D405 range. Outside 70-500mm its depth is not trustworthy, which is
+        # a property of the sensor rather than a tuning choice.
+        self.declare_parameter('min_depth_mm', 70.0)
+        self.declare_parameter('max_depth_mm', 500.0)
+        # How far from the recently-agreed panel distance a detection may sit
+        # before it is treated as something else in the scene. 0 disables.
+        self.declare_parameter('depth_consistency_mm', 80.0)
+
+        self.detection_topic = self.get_parameter('detection_topic').value
+        self.depth_topic = self.get_parameter('depth_topic').value
+        self.output_topic = self.get_parameter('output_topic').value
+        self.target_label = self.get_parameter('target_label').value
+        self.require_depth = self.get_parameter('require_depth').value
+        self.min_depth_mm = self.get_parameter('min_depth_mm').value
+        self.max_depth_mm = self.get_parameter('max_depth_mm').value
+        self.depth_consistency_mm = self.get_parameter('depth_consistency_mm').value
+
+        self._bridge = CvBridge()
+        self._depth_image: np.ndarray | None = None
+        self._published_any = False
+        self._warned_no_match = False
+        # Recent accepted depths, for the consistency test. A median over a
+        # short window rather than a running mean: one bad reading should not
+        # drag the reference, and the panel does not move.
+        self._recent_depths: list[float] = []
+        self._rejected = {'no_depth': 0, 'out_of_range': 0, 'inconsistent': 0}
+        self._accepted = 0
+        # Depths actually observed at rejected detections. Without these the
+        # filter is a black box: "rejected 150" cannot distinguish "the panel
+        # is out of range" from "these are all background noise", and those
+        # need opposite fixes.
+        self._seen_depths: list[float] = []
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        self._detection_sub = self.create_subscription(
+            Detection2DArray, self.detection_topic, self._detection_cb, qos)
+        self._depth_sub = self.create_subscription(
+            Image, self.depth_topic, self._depth_cb, qos)
+
+        self._point_pub = self.create_publisher(PointStamped, self.output_topic, 10)
 
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
-        self._bridge = CvBridge()
-        self._latest_depth = None  # numpy uint16 array, mm
-
-        reliable_qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10)
-        depth_qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1)
-
-        self._det_sub = self.create_subscription(
-            Detection2DArray, self._detections_topic, self._on_detections, reliable_qos)
-        self._depth_sub = self.create_subscription(
-            Image, self._depth_topic, self._on_depth, depth_qos)
-        self._point_pub = self.create_publisher(PointStamped, self._output_topic, reliable_qos)
-
         self.get_logger().info(
-            f"detection_bridge_node up: detections='{self._detections_topic}' "
-            f"depth='{self._depth_topic}' output='{self._output_topic}' "
-            f"target_label='{self._target_label}' use_depth={self._use_depth}")
+            f'detection_bridge_node up: {self.detection_topic} + '
+            f'{self.depth_topic} -> {self.output_topic}, '
+            f"target_label={self.target_label!r}")
 
-    # -- parameter handling -------------------------------------------------
+    # Tunable while the stack runs. The depth filter is exactly the kind of
+    # thing you want to adjust against a live scene rather than by relaunching
+    # and losing the state you were looking at.
+    _LIVE = ('require_depth', 'min_depth_mm', 'max_depth_mm',
+             'depth_consistency_mm')
 
-    def _on_set_parameters(self, params):
+    def _on_set_parameters(self, params) -> SetParametersResult:
         for p in params:
             if p.name == 'target_label':
-                new_label = p.value
-                if new_label != self._target_label:
-                    self.get_logger().info(
-                        f"target_label changed: '{self._target_label}' -> '{new_label}'")
-                self._target_label = new_label
-            elif p.name == 'use_depth':
-                self._use_depth = p.value
-            elif p.name == 'min_confidence':
-                self._min_confidence = p.value
-            elif p.name == 'detections_topic':
-                return SetParametersResult(
-                    successful=False,
-                    reason='detections_topic is structural; restart the node to change it')
-            elif p.name == 'depth_topic':
-                return SetParametersResult(
-                    successful=False,
-                    reason='depth_topic is structural; restart the node to change it')
-            elif p.name == 'output_topic':
-                return SetParametersResult(
-                    successful=False,
-                    reason='output_topic is structural; restart the node to change it')
+                self.target_label = p.value
+                self._warned_no_match = False
+                self.get_logger().info(
+                    f'target_label -> {self.target_label!r}'
+                    + ('' if self.target_label else ' (best detection of any class)'))
+            elif p.name in self._LIVE:
+                setattr(self, p.name, p.value)
+                # Forget the agreed panel distance: it was learned under the
+                # old rules, and keeping it would let a stale reference veto
+                # detections the new settings are meant to admit.
+                self._recent_depths.clear()
+                self.get_logger().info(f'{p.name} -> {p.value}')
         return SetParametersResult(successful=True)
 
-    # -- subscriptions --------------------------------------------------
-
-    def _on_depth(self, msg: Image):
+    def _depth_cb(self, msg: Image) -> None:
         try:
-            self._latest_depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        except Exception as exc:
-            self.get_logger().warn(f'depth conversion failed: {exc}', throttle_duration_sec=1.0)
+            self._depth_image = self._bridge.imgmsg_to_cv2(msg, desired_encoding='16UC1')
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'depth conversion failed: {exc}')
 
-    def _on_detections(self, msg: Detection2DArray):
-        best = self._select_detection(msg)
-        if best is None:
+    def _panel_depth(self) -> float | None:
+        """The distance the panel has recently been agreed to be at."""
+        if len(self._recent_depths) < 3:
+            return None
+        return float(np.median(self._recent_depths))
+
+    # uint16 saturation. A D405 reports this where it resolved nothing, so it
+    # is "no measurement", not "65 metres away" -- and reporting it as a
+    # distance makes the diagnostics nonsense ("depths seen: 2021-65535mm").
+    DEPTH_INVALID = 65535
+
+    def _depth_ok(self, depth_mm: float) -> tuple[bool, str]:
+        """Could a real button be here? (accepted, reason-if-not)"""
+        if depth_mm <= 0.0 or depth_mm >= self.DEPTH_INVALID:
+            # No depth at all. On a D405 that means nothing solid was
+            # resolved there -- which is what empty space returns, and what
+            # most false positives sit on.
+            return (not self.require_depth), 'no_depth'
+        if not (self.min_depth_mm <= depth_mm <= self.max_depth_mm):
+            return False, 'out_of_range'
+        ref = self._panel_depth()
+        if (self.depth_consistency_mm > 0 and ref is not None
+                and abs(depth_mm - ref) > self.depth_consistency_mm):
+            # Something solid, but not on the surface the panel is on.
+            return False, 'inconsistent'
+        return True, ''
+
+    def _detection_cb(self, msg: Detection2DArray) -> None:
+        # vision_msgs in Humble uses string class_id (see food_detector_node).
+        #
+        # Pick the best candidate that PASSES the depth test, not the best
+        # candidate overall. Filtering after the choice would let one
+        # high-scoring phantom suppress a real button behind it.
+        target = None
+        any_label_match = False
+        for det in msg.detections:
+            for result in det.results:
+                class_id = result.hypothesis.class_id
+                score = result.hypothesis.score
+                # No label set: any class will do, best score wins.
+                if self.target_label and class_id.lower() != self.target_label.lower():
+                    continue
+                any_label_match = True
+                d = self._sample_depth(det.bbox.center.position.x,
+                                       det.bbox.center.position.y)
+                ok, why = self._depth_ok(d)
+                if not ok:
+                    self._rejected[why] = self._rejected.get(why, 0) + 1
+                    if 0 < d < self.DEPTH_INVALID:
+                        self._seen_depths.append(d)
+                        del self._seen_depths[:-200]
+                    continue
+                if target is None or score > target[1]:
+                    target = (det, score, class_id, d)
+
+        if target is None and any_label_match:
+            total = sum(self._rejected.values())
+            if total and total % 50 == 0:
+                ref = self._panel_depth()
+                obs = ''
+                if self._seen_depths:
+                    arr = np.array(self._seen_depths)
+                    obs = (f'Depths seen at rejected detections: '
+                           f'{arr.min():.0f}-{arr.max():.0f}mm '
+                           f'(median {np.median(arr):.0f}). ')
+                self.get_logger().info(
+                    f'depth filter has rejected {total} detection(s): '
+                    f'{self._rejected} (accepted {self._accepted}). '
+                    + obs
+                    + (f'Panel taken to be at {ref:.0f}mm. '
+                       if ref is not None else '')
+                    + f'Accepting {self.min_depth_mm:.0f}-'
+                      f'{self.max_depth_mm:.0f}mm. If those depths look like '
+                      'your panel, widen the range; if they are far away, the '
+                      'detector is firing on background and the panel is not '
+                      'in view.',
+                    throttle_duration_sec=10.0)
+
+        if target is None:
+            if self.target_label and msg.detections and not self._warned_no_match:
+                self._warned_no_match = True
+                seen = sorted({r.hypothesis.class_id
+                               for d in msg.detections for r in d.results})
+                self.get_logger().warn(
+                    f'target_label={self.target_label!r} matches nothing; '
+                    f'detector is reporting {seen}. Nothing will be published '
+                    f'until it matches, so the servo will keep searching.')
             return
 
-        cx = best.bbox.center.position.x
-        cy = best.bbox.center.position.y
-        size_x = best.bbox.size_x
-        size_y = best.bbox.size_y
+        det, score, class_id, depth_mm = target
 
-        depth_mm = None
-        if self._use_depth:
-            depth_mm = self._lookup_depth(cx, cy)
+        # Only accepted depths shape the panel reference, so a rejected
+        # outlier can never drag it toward itself and start admitting more
+        # like it.
+        if depth_mm > 0.0:
+            self._recent_depths.append(depth_mm)
+            del self._recent_depths[:-25]
+        self._accepted += 1
 
-        if depth_mm is None or depth_mm <= 0:
-            z = float(np.hypot(size_x, size_y))
-            self.get_logger().warn(
-                'depth unavailable at detection centre, falling back to bbox diagonal',
-                throttle_duration_sec=1.0)
-        else:
-            z = float(depth_mm)
+        if not self._published_any:
+            self._published_any = True
+            self.get_logger().info(
+                f'first target: {class_id!r} score {score:.2f} at '
+                f'{depth_mm:.0f}mm -- publishing to {self.output_topic}')
+
+        cx = det.bbox.center.position.x
+        cy = det.bbox.center.position.y
 
         point = PointStamped()
-        point.header = best.header if best.header.stamp.sec or best.header.stamp.nanosec else msg.header
+        point.header = msg.header
         point.point.x = float(cx)
         point.point.y = float(cy)
-        point.point.z = z
+        point.point.z = float(depth_mm)
         self._point_pub.publish(point)
 
-        label = self._best_label(best)
-        self.get_logger().info(
-            f"selected button '{label}' at ({cx:.1f}, {cy:.1f}) z={z:.1f}",
-            throttle_duration_sec=1.0)
+    def _sample_depth(self, cx: float, cy: float) -> float:
+        if self._depth_image is None:
+            return 0.0
 
-    # -- selection logic --------------------------------------------------
-
-    def _select_detection(self, msg: Detection2DArray):
-        target = self._target_label.strip().lower()
-        best = None
-        best_score = -1.0
-
-        for det in msg.detections:
-            if not det.results:
-                continue
-            hyp_result, score = self._best_result(det)
-            if hyp_result is None or score < self._min_confidence:
-                continue
-
-            if target:
-                if hyp_result.hypothesis.class_id.strip().lower() != target:
-                    continue
-
-            if score > best_score:
-                best_score = score
-                best = det
-
-        return best
-
-    @staticmethod
-    def _best_result(det):
-        best_result = None
-        best_score = -1.0
-        for r in det.results:
-            score = r.hypothesis.score
-            if score > best_score:
-                best_score = score
-                best_result = r
-        return best_result, best_score
-
-    def _best_label(self, det):
-        result, _ = self._best_result(det)
-        return result.hypothesis.class_id if result is not None else '?'
-
-    # -- depth ------------------------------------------------------------
-
-    def _lookup_depth(self, cx: float, cy: float):
-        if self._latest_depth is None:
-            return None
-
-        depth = self._latest_depth
-        h, w = depth.shape[:2]
+        h, w = self._depth_image.shape[:2]
         ix, iy = int(round(cx)), int(round(cy))
 
         x0, x1 = max(0, ix - 2), min(w, ix + 3)
         y0, y1 = max(0, iy - 2), min(h, iy + 3)
-        if x1 <= x0 or y1 <= y0:
-            return None
+        if x0 >= x1 or y0 >= y1:
+            return 0.0
 
-        patch = depth[y0:y1, x0:x1].astype(np.float32)
+        patch = self._depth_image[y0:y1, x0:x1]
         valid = patch[patch > 0]
         if valid.size == 0:
-            return None
+            return 0.0
 
         return float(np.median(valid))
 
 
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = DetectionBridgeNode()
     try:
@@ -231,10 +291,7 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        try:
-            rclpy.shutdown()
-        except Exception:
-            pass
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

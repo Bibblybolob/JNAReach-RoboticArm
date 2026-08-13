@@ -132,6 +132,12 @@ class CameraNode(Node):
         # sensor on a different baseline, alignment is required for a pixel in
         # one image to mean anything in the other.
         self.declare_parameter('rs_align_depth_to_color', False)
+        # IR projector. On by default because this arm looks at flat, matte
+        # targets -- a printed panel gives stereo matching nothing to work
+        # with, and the depth simply comes back empty. 0 laser power leaves
+        # whatever the firmware defaulted to.
+        self.declare_parameter('rs_emitter', True)
+        self.declare_parameter('rs_laser_power', 150.0)
         # AUTO-EXPOSURE IS A FRAME RATE CONTROL. The same trap as the V4L2
         # path, and it was missed here: a sensor in dim light lengthens its
         # exposure to brighten the image, and frame time cannot be shorter
@@ -191,6 +197,8 @@ class CameraNode(Node):
         self._height = None
         self._latest_frame = None
         self._latest_depth = None
+        # Millimetres per raw depth unit; set once the device is open.
+        self._depth_scale_mm = 1.0
         self._frame_lock = threading.Lock()
         # Camera intrinsics. None until a source supplies them, which today
         # only source:=realsense does -- the other two paths have no way to
@@ -491,7 +499,30 @@ class CameraNode(Node):
                         f'3 for full rate -- expect a silently reduced frame '
                         f'rate, which caps the whole servo loop.')
 
+                # Depth scale: metres per raw unit. NOT the same across
+                # models, and assuming it is silently scales every distance.
+                # A D435 uses 0.001 (1mm per unit) which matches the 16UC1
+                # convention of millimetres, so publishing raw is correct
+                # there. A D405 uses 0.0001 -- tenths of a millimetre -- so
+                # raw values are 10x the millimetre figure.
+                #
+                # That was live for a whole session: the depth filter saw
+                # "3423-35561mm, median 5451" and rejected everything as far
+                # beyond the sensor's 50cm range, when those were really
+                # 342-3556mm with the panel sitting at 545mm. The panel was
+                # in view the entire time.
+                try:
+                    ds = dev.first_depth_sensor().get_depth_scale()
+                except Exception:
+                    ds = 0.001
+                self._depth_scale_mm = ds * 1000.0
+                self.get_logger().info(
+                    f'depth scale: {ds:.6f} m per unit '
+                    f'({self._depth_scale_mm:.4f} mm) -- /camera/depth_raw is '
+                    'published in millimetres regardless of model.')
+
                 self._apply_rs_exposure(rs, dev)
+                self._apply_rs_emitter(rs, dev)
 
                 # Factory intrinsics. Nothing else in this project has ever
                 # had them, so this is what unblocks depth downstream.
@@ -525,9 +556,23 @@ class CameraNode(Node):
                     if want_depth:
                         depth = frames.get_depth_frame()
                         if depth:
+                            raw = np.asanyarray(depth.get_data())
+                            # Convert to millimetres HERE, so every consumer
+                            # gets the same units whatever camera is fitted.
+                            # Scaling downstream instead means each consumer
+                            # has to know the model, and one that does not
+                            # silently reads distances 10x too large.
+                            scale = getattr(self, '_depth_scale_mm', 1.0)
+                            if abs(scale - 1.0) > 1e-6:
+                                mm = raw.astype(np.float32) * scale
+                                # Preserve 0 as "no measurement" rather than
+                                # letting it round into a real distance.
+                                out = np.zeros_like(raw)
+                                np.clip(mm, 0, 65535, out=mm)
+                                out[raw > 0] = mm[raw > 0].astype(np.uint16)
+                                raw = out
                             with self._frame_lock:
-                                self._latest_depth = np.asanyarray(
-                                    depth.get_data())
+                                self._latest_depth = raw
 
                     grabbed += 1
                     elapsed = time.monotonic() - rate_since
@@ -548,6 +593,65 @@ class CameraNode(Node):
                         pipeline.stop()
                     except Exception:
                         pass
+
+    def _apply_rs_emitter(self, rs, dev) -> None:
+        """Project IR texture, so flat surfaces get a depth reading.
+
+        Stereo depth works by matching features between two images. A blank
+        wall, or a MATTE PRINTED SHEET, has nothing to match, so the sensor
+        returns no measurement there rather than a wrong one. The projector
+        paints a speckle pattern that gives it something to correlate.
+
+        Measured need: with the panel in view and depth otherwise working,
+        the detection filter reported {'no_depth': 320, 'out_of_range': 12,
+        'inconsistent': 18} -- nine detections in ten landing where the D405
+        resolved nothing at all. Every one of those ends a TRACKING episode,
+        which is why the approach never got more than two jogs in before the
+        target evaporated.
+
+        Not free on colour: the D405's colour comes from the same stereo
+        imagers, so a strong projector can put a visible speckle into the
+        image the detector runs on. laser_power is exposed for that trade --
+        raise it for depth on blank surfaces, lower it if detections start
+        suffering.
+        """
+        if not bool(self.get_parameter('rs_emitter').value):
+            self.get_logger().info(
+                'IR emitter left off (rs_emitter:=false). On a flat, matte '
+                'target expect depth dropouts -- there is nothing for stereo '
+                'matching to lock onto.')
+            return
+
+        power = float(self.get_parameter('rs_laser_power').value)
+        applied = False
+        for sensor in dev.query_sensors():
+            try:
+                if sensor.supports(rs.option.emitter_enabled):
+                    sensor.set_option(rs.option.emitter_enabled, 1)
+                    applied = True
+                if power > 0 and sensor.supports(rs.option.laser_power):
+                    rng = sensor.get_option_range(rs.option.laser_power)
+                    want = max(rng.min, min(rng.max, power))
+                    sensor.set_option(rs.option.laser_power, want)
+                    self.get_logger().info(
+                        f'IR emitter on, laser power {want:.0f} '
+                        f'(range {rng.min:.0f}-{rng.max:.0f}).')
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warn(f'emitter option refused: {e}')
+        if applied:
+            self.get_logger().info(
+                'IR emitter enabled -- flat surfaces should now return depth. '
+                'If detection confidence drops, the speckle is showing in the '
+                'colour image: lower rs_laser_power.')
+        else:
+            self.get_logger().info(
+                'This camera has no IR projector, which for a D405 is by '
+                'design -- it is a PASSIVE close-range stereo camera, unlike '
+                'a D435/D455. So depth on a flat, matte target cannot be '
+                'improved by projecting texture; there is nothing to switch '
+                'on. Give the surface real texture, light it better, or '
+                'accept the dropouts and let the depth filter drop those '
+                'detections.')
 
     def _apply_rs_exposure(self, rs, dev) -> None:
         """Stop the sensor trading frame rate for brightness.

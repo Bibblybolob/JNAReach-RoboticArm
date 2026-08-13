@@ -1,20 +1,18 @@
 """
-ROS 2 elevator-button-detection node for myCobot 280 Pi.
+ROS 2 elevator-button-detection node for myCobot 280.
 
-Subscribes to a sensor_msgs/Image stream (default: /camera/image_raw),
-runs Ultralytics inference with a custom-trained button-detection model,
-and publishes:
+Subscribes to a sensor_msgs/Image stream (default: /camera/image_raw), runs
+inference with a trained YOLOv11n model, and publishes:
 
   1. A CV2 window with bboxes + labels (for humans).
   2. The annotated frame on /perception/button_detections/image
      (so RViz2 / other consumers can subscribe).
   3. Structured detections on /perception/button_detections as
-     vision_msgs/Detection2DArray (for downstream approach/press logic).
+     vision_msgs/Detection2DArray (for downstream targeting/pressing logic).
 
-Unlike food_detector_node, there is no open-vocabulary mode and no class
-filter: the model is trained specifically on elevator buttons, so its
-classes ARE the button labels (e.g. "1", "2", "3", "lobby", "open",
-"close"). Every detection above the confidence threshold is published.
+No class filtering is applied -- every detection the model produces is
+published. The model's own class names (e.g. "3", "lobby", "open") go into
+`hypothesis.hypothesis.class_id`.
 
 Design notes
 ------------
@@ -22,15 +20,27 @@ Design notes
 - `cv2.waitKey(1)` is mandatory after `imshow` to pump the GUI loop.
 - All tunables are ROS 2 parameters; same binary works headless
   (`show_window:=false`) or with a custom-trained .pt
-  (`model_path:=/path/to/my_buttons.pt`).
-- `confidence_threshold` defaults lower than food_detector_node's (0.3
-  vs 0.4) because button glyphs are small in-frame and often partially
-  occluded by a hand reaching for them.
-- `device` defaults to `cuda:0` since this node is meant to run on the
-  Jetson's GPU rather than CPU.
+  (`model_path:=/path/to/elevator_buttons.pt`).
 """
 
 from __future__ import annotations
+
+import torch
+
+# cuDNN OFF, deliberately, and this must run before any CUDA work.
+#
+# NVIDIA's torch 2.5.0a0 for JetPack 6.1 links against cuDNN 9 and will not
+# even import without libcudnn.so.9 present, but the cuDNN 9 pip wheels
+# (cu12 and cu13 both) fail at runtime on this Jetson's CUDA 12.2 with
+# CUDNN_STATUS_NOT_INITIALIZED the moment a convolution runs. So the symlinks
+# into site-packages/nvidia/cudnn/lib have to STAY -- removing them breaks the
+# import -- while cuDNN itself has to be switched off.
+#
+# Disabling it falls back to native CUDA convolutions, which cost nothing that
+# matters here: measured 24 fps against roughly 2 fps on CPU. Deleting this
+# line does not "re-enable acceleration", it crashes the node on the first
+# frame.
+torch.backends.cudnn.enabled = False
 
 import cv2
 import numpy as np
@@ -41,11 +51,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from vision_msgs.msg import (
-    Detection2D,
-    Detection2DArray,
-    ObjectHypothesisWithPose,
-)
+from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
 from ultralytics import YOLO
 
@@ -57,7 +63,7 @@ class ButtonDetectorNode(Node):
 
         self.declare_parameter('image_topic', '/camera/image_raw')
         self.declare_parameter('model_path', 'elevator_buttons.pt')
-        self.declare_parameter('confidence_threshold', 0.3)
+        self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('show_window', True)
         self.declare_parameter('window_name', 'Button Detection')
         self.declare_parameter('device', 'cuda:0')
@@ -74,9 +80,6 @@ class ButtonDetectorNode(Node):
         self.get_logger().info(f'Loading model: {model_path} (device={self._device})')
         self._model = YOLO(model_path)
         self._class_names = self._model.names
-        self.get_logger().info(
-            f'Button model classes ({len(self._class_names)}) -> {self._class_names}'
-        )
 
         # BEST_EFFORT + depth 1 = latest-frame-wins, drop stale frames.
         sensor_qos = QoSProfile(
@@ -186,8 +189,7 @@ class ButtonDetectorNode(Node):
         det.bbox.size_y = float(y2 - y1)
 
         hypothesis = ObjectHypothesisWithPose()
-        # vision_msgs in Humble uses string class_id -- here the button
-        # label itself (e.g. "3", "lobby", "open").
+        # vision_msgs in Humble uses string class_id.
         hypothesis.hypothesis.class_id = label
         hypothesis.hypothesis.score = float(conf)
         det.results.append(hypothesis)

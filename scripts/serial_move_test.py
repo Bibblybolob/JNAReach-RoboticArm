@@ -43,6 +43,19 @@ import argparse
 import sys
 import time
 
+# Route through the arm broker when one is running, so this script does not
+# open /dev/ttyTHS1 itself. Two openers interleave bytes on that tty and the
+# Atom reports the resulting bad length field as `cmd_len error` -- which
+# reads as a firmware fault and has cost whole sessions.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+try:
+    from arm_broker import connect_arm as _connect_arm
+except Exception:  # broker module unavailable; behave exactly as before
+    def _connect_arm(port, factory, **kw):
+        return factory()
+
+
 
 # myCobot 280 software limits, per joint, degrees. Hardcoded rather than read
 # from the arm: get_joint_min_angle is 6 more round trips on a link whose
@@ -61,7 +74,7 @@ def connect(port, baud):
         sys.exit(f'pymycobot missing: {e}')
     print(f'Opening {port} at {baud} baud...')
     try:
-        return MyCobot280(port, str(baud))
+        return _connect_arm(port, lambda: MyCobot280(port, str(baud)))
     except Exception as e:
         name = e.__class__.__name__
         if 'Permission' in name or 'Permission' in str(e):

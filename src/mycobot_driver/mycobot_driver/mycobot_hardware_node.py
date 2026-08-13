@@ -17,6 +17,7 @@ carries everything.
 
 import math
 import os
+import pathlib
 import time
 import threading
 
@@ -155,10 +156,25 @@ class MyCobotHardwareNode(Node):
         # --- Homing ---
         # Fixed joint-angle home pose, in degrees.
         # Kept in sync with the "home" group_state in mycobot_280pi.srdf
-        # ([0, 1.5708, -1.5708, 0, 0, 0] rad) — change both together or
+        # ([0, 1.5708, -2.618, 0.9599, 0, 0] rad) — change both together or
         # RViz's named "home" and this service will disagree.
+        #
+        # Operator-chosen 2026-08-11 so the flange camera looks outward. The
+        # stock [0, 90, -90, 0, 0, 0] is mechanically fine — reaches to 1
+        # degree, holds with zero drift — but it folds the arm over and aims
+        # the camera at the ceiling, and the search sweep only tilts joint5
+        # from wherever the arm starts, so hunting for buttons from there
+        # scans empty air and finds nothing.
+        #
+        # joint3 sits AT its -150 limit. pymycobot validates this range and
+        # RAISES rather than clamping, so a reading a fraction past it makes
+        # send_angles fail outright — that cost a debugging session when the
+        # arm was resting at -150.6. The driver clamps targets to
+        # joint_limits_deg before sending, which covers the normal path; if
+        # homing ever starts failing with "Has invalid angle value ... index
+        # 2", back this off to -149 rather than hunting elsewhere.
         self.declare_parameter(
-            'home_angles_deg', [0.0, 90.0, -90.0, 0.0, 0.0, 0.0]
+            'home_angles_deg', [0.0, 90.0, -150.0, 55.0, 0.0, 0.0]
         )
         # Homing runs slower than normal motion on purpose: it is commanded
         # from an arbitrary unknown starting pose, which makes it the single
@@ -180,6 +196,54 @@ class MyCobotHardwareNode(Node):
         # deliberately starting the whole stack and expects the arm to
         # settle at home before anything else happens.
         self.declare_parameter('home_on_start', False)
+        self.declare_parameter('home_settle_time', 0.5)
+        # Waypoints to break a homing move into. One big send_angles lets the
+        # joints race each other and the arm swings through a stretched-out
+        # pose on the way, which is the largest torque it ever sees. Capped by
+        # the actual distance travelled, so a short home is still one step.
+        self.declare_parameter('home_steps', 8)
+
+        # --- Hold watchdog (torque loss) ---
+        # A released arm sags, and because the jog profiler seeds its goal
+        # from the MEASURED pose, it then commands the arm further down each
+        # cycle -- a positive feedback loop that walks the arm out of the
+        # workspace while every log line looks reasonable. These bound it.
+        # 0 disables the watchdog entirely.
+        self.declare_parameter('droop_tolerance_deg', 10.0)
+        # How long the arm may sit that far off before it counts as torque
+        # loss rather than simply not keeping up with a fast command.
+        self.declare_parameter('droop_grace_s', 2.0)
+        # Re-commanding the reference pose after re-powering the servos is
+        # what actually recovers; false leaves the arm where it sagged to and
+        # only re-powers, for cases where unexpected motion is worse.
+        self.declare_parameter('droop_recover', True)
+        # Per-command correction applied to joints nobody is jogging, pulling
+        # them back toward the pose they are meant to hold. The jog target is
+        # seeded from the MEASURED pose, so without this an untouched joint is
+        # re-commanded to wherever gravity just left it -- the sag is ratified
+        # twice a second and ratchets. Eased rather than snapped so an arm
+        # that really was moved by hand does not lurch. 0 restores the old
+        # behaviour of carrying the measured value straight through.
+        self.declare_parameter('hold_correction_deg', 2.0)
+        # Corrections with no progress before a joint is written off as
+        # stalled and left alone.
+        self.declare_parameter('hold_give_up_after', 6)
+        # Error below which a joint counts as already holding. Must exceed
+        # the servo's own resolution and backlash or it chases noise and then
+        # reports a stall that is not happening.
+        self.declare_parameter('hold_deadband_deg', 1.5)
+
+        # --- Collision guard ---
+        # The servo jogs joints straight from image error with no MoveIt in
+        # the path, so nothing else checks whether the destination is
+        # occupied. Per-joint limits do not help: every self-collision on
+        # this arm is reachable well inside them.
+        self.declare_parameter('collision_guard', True)
+        self.declare_parameter('collision_min_z_m', 0.02)
+        self.declare_parameter('collision_base_radius_m', 0.06)
+        self.declare_parameter('collision_base_height_m', 0.12)
+        self.declare_parameter('collision_max_reach_m', 0.32)
+        self.declare_parameter('collision_tool_offset_m', 0.055)
 
         # --- Jogging (visual servoing) ---
         # Largest displacement honoured in a single JointJog, in degrees. A
@@ -344,9 +408,38 @@ class MyCobotHardwareNode(Node):
         )
         self._home_speed = self.get_parameter('home_speed').get_parameter_value().integer_value
         self._home_timeout = self.get_parameter('home_timeout').get_parameter_value().double_value
+        self._home_steps = self.get_parameter('home_steps').get_parameter_value().integer_value
         self._home_on_start = self.get_parameter(
             'home_on_start').get_parameter_value().bool_value
+        self._droop_tolerance = self.get_parameter(
+            'droop_tolerance_deg').get_parameter_value().double_value
+        self._droop_grace = self.get_parameter(
+            'droop_grace_s').get_parameter_value().double_value
+        self._droop_recover = self.get_parameter(
+            'droop_recover').get_parameter_value().bool_value
+        self._hold_correction = self.get_parameter(
+            'hold_correction_deg').get_parameter_value().double_value
+        self._hold_give_up = self.get_parameter(
+            'hold_give_up_after').get_parameter_value().integer_value
+        self._hold_deadband = self.get_parameter(
+            'hold_deadband_deg').get_parameter_value().double_value
+
+        from .collision_guard import CollisionGuard
+        self._guard = CollisionGuard(
+            min_z=self.get_parameter('collision_min_z_m').value,
+            base_radius=self.get_parameter('collision_base_radius_m').value,
+            base_height=self.get_parameter('collision_base_height_m').value,
+            max_reach=self.get_parameter('collision_max_reach_m').value,
+            tool_offset_m=self.get_parameter('collision_tool_offset_m').value,
+            enabled=self.get_parameter('collision_guard').value)
+        self._guard_blocks = 0
+        self._home_settle_time = self.get_parameter(
+            'home_settle_time').get_parameter_value().double_value
         self._start_homed = False
+        # Startup homing has finished (or was never asked for). The jog gate
+        # stays shut until this is True so a servo cannot fight the homing
+        # trajectory; visual_servo_node already retries a refusal.
+        self._start_home_done = False
         if len(self._home_angles) != 6:
             self.get_logger().warn(
                 f'home_angles_deg has {len(self._home_angles)} entries, expected 6. '
@@ -371,6 +464,24 @@ class MyCobotHardwareNode(Node):
         # have to be leashed to where the arm actually is or the target runs
         # away from a robot that cannot keep up.
         self._measured_angles_rad = None
+        # Last reading trusted as real, and when. Used to reject readings that
+        # are individually plausible but imply the arm teleported -- see
+        # _angles_continuous. Cleared on (re)connect, since the arm may
+        # genuinely be somewhere new by then.
+        self._last_good_deg = None
+        self._last_good_time = 0.0
+        # Pose the arm is supposed to be holding when nothing is being jogged.
+        # Set once homing succeeds; the jog goal takes over while jogging.
+        self._hold_reference_deg = None
+        # When each joint was last commanded to move, so the hold watchdog
+        # can ignore joints that are actively being driven.
+        self._last_jog_time_per_joint: dict[int, float] = {}
+        self._droop_since = None
+        self._droop_recoveries = 0
+        # Per-joint progress tracking for the hold correction, so a joint that
+        # cannot move is abandoned rather than held in a stall.
+        self._hold_last_err: dict[int, float] = {}
+        self._hold_no_progress: dict[int, int] = {}
         self._last_jog_time = 0.0
         self._jog_profile = self.get_parameter(
             'jog_profile').get_parameter_value().bool_value
@@ -494,6 +605,14 @@ class MyCobotHardwareNode(Node):
             2.0, self._keepalive, callback_group=service_cb_group,
         )
 
+        # Same group again: recovery sends angles on the link, so it must not
+        # overlap the keepalive or a reconnect. 2Hz is ample -- droop_grace
+        # is measured in seconds, so a faster tick buys nothing.
+        if self._droop_tolerance > 0.0:
+            self._hold_watchdog_timer = self.create_timer(
+                0.5, self._hold_watchdog, callback_group=service_cb_group,
+            )
+
         if self._home_on_start:
             # A timer rather than a call in __init__: homing blocks for up to
             # home_timeout, and the arm may not even be connected yet. This
@@ -516,16 +635,54 @@ class MyCobotHardwareNode(Node):
 
     # ---- Connection ----
 
+    def _connect_via_broker(self):
+        """Use scripts/arm_broker.py if it is running, else None.
+
+        The broker owns /dev/ttyTHS1 for the life of the machine and serves
+        every client over a Unix socket. Going through it matters for two
+        reasons beyond tidiness:
+
+        - Two openers on this tty interleave their bytes, and a frame whose
+          length field does not match its payload is what the Atom reports as
+          `cmd_len error` before it panics. So a driver opening the port
+          while any diagnostic is attached does not merely lose replies, it
+          manufactures the firmware crash.
+        - Repeated open/close is itself unreliable here. The driver opening
+          on every reconnect is exactly that pattern.
+
+        Falls back to a direct open when no broker is running, so nothing
+        depends on it being installed. Returns a MyCobot-compatible proxy.
+        """
+        try:
+            import os
+            import sys
+            scripts = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))))), 'scripts')
+            if scripts not in sys.path:
+                sys.path.insert(0, scripts)
+            from arm_broker import BrokerMyCobot
+            mc = BrokerMyCobot()
+        except Exception:
+            return None
+        self.get_logger().info(
+            'Connected through the arm broker; the driver is NOT opening '
+            f'{self._serial_port} itself, so diagnostics can run alongside '
+            'it without corrupting the link.')
+        return mc
+
     def _connect(self) -> bool:
         """Try to open the link to the arm. Never raises."""
         try:
             if self._connection == 'serial':
-                self.get_logger().info(
-                    f'Connecting to myCobot DIRECTLY over '
-                    f'{self._serial_port} at {self._serial_baud} baud '
-                    f'(no Pi, no network). Stop mycobot_server on the Pi '
-                    f'first -- two masters on one bus behaves erratically.')
-                mc = MyCobot280(self._serial_port, str(self._serial_baud))
+                mc = self._connect_via_broker()
+                if mc is None:
+                    self.get_logger().info(
+                        f'Connecting to myCobot DIRECTLY over '
+                        f'{self._serial_port} at {self._serial_baud} baud '
+                        f'(no Pi, no network). Stop mycobot_server on the Pi '
+                        f'first -- two masters on one bus behaves erratically.')
+                    mc = MyCobot280(self._serial_port, str(self._serial_baud))
             else:
                 self.get_logger().info(
                     f'Connecting to myCobot at {self._ip}:{self._port} ...')
@@ -556,8 +713,15 @@ class MyCobotHardwareNode(Node):
             # it is not a reason to refuse the arm -- see _angles_plausible.
             self._warn_if_outside_limits(angles)
             self._mc = mc
+            # Seed the continuity check from the connect-time pose. Without
+            # this the first real read has nothing to compare against, and on
+            # a RECONNECT the stale pre-drop pose would reject every reading
+            # until the budget grew past the distance the arm moved meanwhile.
+            self._last_good_deg = list(angles)
+            self._last_good_time = time.monotonic()
             self.get_logger().info(f'Connected. Joint angles: '
                                    f'{[round(a, 1) for a in angles]}')
+            self._focus_servos()
             try:
                 if self._mc.get_fresh_mode() != 1:
                     self._mc.set_fresh_mode(1)
@@ -602,9 +766,54 @@ class MyCobotHardwareNode(Node):
             )
             return False
 
+    _consecutive_failures: int = 0
+
+    def _reset_uart(self) -> None:
+        """Unbind and rebind the Tegra UART driver to reset the controller.
+
+        On Orin Nano Super devkits, ttyTHS1's TX pad intermittently stops
+        driving.  A driver unbind/rebind resets the hardware without a full
+        reboot.  Requires write access to sysfs (run as root or with udev
+        rules granting the dialout group access).
+        """
+        sysfs = pathlib.Path('/sys/class/tty') / pathlib.Path(
+            self._serial_port).name / 'device'
+        if not sysfs.exists():
+            return
+        try:
+            dev_id = (sysfs / 'uevent').read_text()
+            # Extract e.g. "3100000.serial" from OF_FULLNAME or DRIVER line
+            dev_name = sysfs.resolve().name          # e.g. "3100000.serial"
+            driver = (sysfs / 'driver').resolve()    # e.g. .../serial-tegra
+            unbind = driver / 'unbind'
+            bind = driver / 'bind'
+            if not unbind.exists():
+                return
+            self.get_logger().info(
+                f'Resetting UART controller {dev_name} (unbind/rebind)')
+            unbind.write_text(dev_name)
+            time.sleep(0.3)
+            bind.write_text(dev_name)
+            time.sleep(0.5)
+            self.get_logger().info('UART controller reset complete')
+        except PermissionError:
+            self.get_logger().warn(
+                'Cannot reset UART: permission denied on sysfs. '
+                'Run as root or add a udev rule for the dialout group.',
+                throttle_duration_sec=60.0)
+        except Exception as e:
+            self.get_logger().warn(f'UART reset failed: {e}')
+
     def _retry_connect(self) -> None:
         if self._mc is None:
-            self._connect()
+            if (self._connection == 'serial'
+                    and self._consecutive_failures >= 3):
+                self._reset_uart()
+                self._consecutive_failures = 0
+            if self._connect():
+                self._consecutive_failures = 0
+            else:
+                self._consecutive_failures += 1
 
     def _keepalive(self) -> None:
         """Keep the TCP link warm so the Pi never sees it as idle.
@@ -665,9 +874,160 @@ class MyCobotHardwareNode(Node):
         self.get_logger().info(
             f'Homing on startup to {self._home_angles} '
             '(set home_on_start:=false to skip)')
-        # Reuse the service path so startup homing and /arm/home cannot drift
-        # apart in behaviour.
-        self._home_callback(SetBool.Request(), SetBool.Response())
+        res = SetBool.Response()
+        try:
+            # Reuse the service path so startup homing and /arm/home cannot
+            # drift apart in behaviour.
+            self._home_callback(SetBool.Request(), res)
+        finally:
+            # Open the jog gate only now. A servo that arms while this is
+            # still running pins the jog goal to the measured pose and
+            # overrides the homing trajectory, so the arm never reaches home
+            # AND every search jog is rejected as "a trajectory is executing"
+            # -- 40s of the two fighting, ending in a homing timeout.
+            #
+            # The gate opens even if homing FAILED, deliberately: refusing
+            # forever would leave the stack alive but unable to move at all,
+            # with no way back. But say so loudly, because searching from an
+            # unknown pose is how the camera ends up pointing at the ceiling.
+            self._start_home_done = True
+            if getattr(res, 'success', False):
+                self.get_logger().info(
+                    'Startup homing finished; jogging may arm.')
+            else:
+                self._hold_reference_deg = None
+                self.get_logger().error(
+                    'Startup homing did NOT reach home, but jogging is being '
+                    'armed anyway so the stack is not stuck. The arm is at an '
+                    'unknown pose, so the search sweep starts from wherever '
+                    'it is -- expect the camera to be aimed somewhere '
+                    'arbitrary. Fix the homing before trusting a hunt.')
+
+    def _hold_watchdog(self) -> None:
+        """Catch torque loss before the jog profiler follows the arm down.
+
+        The failure this exists for: the servos release, the arm sags, the
+        profiler seeds its goal from the measured pose, and each cycle
+        commands the arm a little further from where it was told to be. It is
+        a positive feedback loop, and it does not look like one in the log --
+        every jog is small, every reading is continuous and individually
+        legal, and homing has already reported success. An arm that homed to
+        joint2=90 was found at joint2=2.5 this way.
+
+        The tell is that the arm sits far from the pose it was last told to
+        hold and STAYS there. Not keeping up is transient and resolves within
+        a command or two, so it is the persistence that separates the two --
+        hence the grace period rather than an instant trip.
+        """
+        if self._mc is None or self._droop_tolerance <= 0.0:
+            return
+        # A trajectory owns the arm and legitimately moves it far from any
+        # held pose; joint-state reads are suppressed then anyway.
+        if self._in_motion.is_set():
+            self._droop_since = None
+            return
+
+        meas = self._measured_angles_rad
+        # Deliberately NOT _jog_target_deg: that is seeded from the measured
+        # pose and leashed to it, so a sagging arm drags it along and the
+        # comparison below reads zero error while the arm walks away. The hold
+        # reference accumulates commanded intent instead.
+        reference = self._hold_reference_deg
+        if meas is None or reference is None:
+            return
+
+        # Only joints that are NOT being driven right now. A joint under
+        # active jogging legitimately trails its commanded intent -- the jog
+        # goal is leashed to the measured pose, so on a fast sweep the intent
+        # runs ahead by design and comparing against it trips instantly (seen:
+        # 'joint5 14.3 vs 47.8' mid-sweep, which was the sweep working, not
+        # torque loss). Gravity acts on the joints nobody is commanding, and
+        # those are exactly the ones that sag, so that is where to look.
+        now = time.monotonic()
+        idle = [i for i in range(len(self.JOINT_NAMES))
+                if now - self._last_jog_time_per_joint.get(i, 0.0) > self._droop_grace]
+        if not idle:
+            self._droop_since = None
+            return
+
+        meas_deg = [math.degrees(m) for m in meas]
+        worst = max(abs(meas_deg[i] - reference[i]) for i in idle)
+        if worst <= self._droop_tolerance:
+            self._droop_since = None
+            return
+
+        now = time.monotonic()
+        if self._droop_since is None:
+            self._droop_since = now
+            return
+        if now - self._droop_since < self._droop_grace:
+            return
+
+        # Persistent and large: treat as torque loss.
+        self._droop_since = None
+        self._droop_recoveries += 1
+        off = ', '.join(
+            f'{self.JOINT_NAMES[i]} {meas_deg[i]:.1f} vs {reference[i]:.1f}'
+            for i in idle
+            if abs(meas_deg[i] - reference[i]) > self._droop_tolerance)
+        self.get_logger().error(
+            f'Arm is {worst:.1f}deg off the pose it should be holding for '
+            f'over {self._droop_grace:.0f}s ({off}). That is lost holding '
+            'torque, not a slow joint -- re-powering the servos. If this '
+            'repeats, the arm is losing power or the servos are being '
+            'released elsewhere; jogging from a sagging arm walks it further '
+            'out every cycle.')
+
+        self._focus_servos()
+        # Drop the profiler's state: its goal was seeded off the sagged pose.
+        self._jog_reset_profile()
+
+        if self._droop_recover:
+            target = list(reference)
+            self.get_logger().warn(f'Recovering to {[round(t, 1) for t in target]}')
+            try:
+                with self._lock:
+                    self._send_angles(self._mc, target, self._home_speed)
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().error(f'Droop recovery failed: {e}')
+
+    def _focus_servos(self) -> None:
+        """Power the servos and engage position hold before commanding motion.
+
+        A released arm answers get_angles perfectly and ACCEPTS send_angles
+        without moving a millimetre, which is the single most misleading
+        failure this driver can hit: the link looks healthy, commands are
+        acknowledged, and the arm sags under gravity. That sag then reads back
+        as joints drifting away from the commanded pose, so the divergence
+        leash reports `not keeping up, is blocked, or that joint is not moving
+        at all` about an arm that was never holding in the first place, and
+        homing times out because nothing ever arrives.
+
+        Diagnosed the long way once: joint5 sat at 6.2deg through a full search
+        sweep commanding it between -5 and +16, while joints 2 and 4 wandered
+        tens of degrees with nothing asking them to. power_on() and
+        focus_all_servos() fixed it outright -- the next commanded move
+        travelled 109deg.
+
+        Best-effort by design. Some firmware answers -1 to these while still
+        acting on them, so a bad return is not worth refusing the connection
+        over; the arm either holds station afterwards or the divergence
+        warnings say it does not.
+        """
+        for name in ('power_on', 'focus_all_servos'):
+            fn = getattr(self._mc, name, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+                time.sleep(0.3)
+            except Exception as e:
+                self.get_logger().warn(
+                    f'{name}() failed: {e}. If the arm accepts commands '
+                    'without moving, its servos are released -- that is this.')
+        self.get_logger().info(
+            'Servos powered and holding position (power_on + '
+            'focus_all_servos).')
 
     def _angles_plausible(self, angles_deg) -> bool:
         """Reject a reading that cannot be a real pose at all.
@@ -730,6 +1090,59 @@ class MyCobotHardwareNode(Node):
 
     # ---- Joint State Publisher ----
 
+    # Fastest any joint moves, with headroom. joint1 measured 51.6 deg/s at
+    # speed=100 (see CLAUDE.md), so 150 is ~3x the real ceiling -- generous
+    # enough never to reject honest motion, tight enough to catch a read that
+    # says the arm jumped most of its range between two polls.
+    MAX_SLEW_DEG_S = 150.0
+    # Absorbs quantisation and the jitter in how long a poll actually took.
+    SLEW_MARGIN_DEG = 20.0
+
+    def _angles_continuous(self, angles_deg) -> bool:
+        """Reject a reading that implies the arm teleported.
+
+        `_angles_plausible` only catches values no joint can hold. It cannot
+        catch a garbled frame that decodes to angles which are each perfectly
+        legal -- and those are the dangerous ones, because the jog profiler
+        seeds its goal from the measured pose and will happily COMMAND the arm
+        to a bogus reading. That is not hypothetical: a run homed correctly,
+        then a read of [41, 93, -64, 55, -29, 61] was accepted while the arm
+        sat at home, and the profiler drove it there. Every value in that
+        frame is individually plausible; only its distance from the previous
+        reading gives it away.
+
+        The link carries the ESP32's own boot text and the internal Feetech
+        servo bus alongside real replies, so partial frames are expected
+        rather than exceptional.
+        """
+        now = time.monotonic()
+        prev, prev_t = self._last_good_deg, self._last_good_time
+
+        if prev is not None:
+            dt = max(now - prev_t, 1e-3)
+            budget = self.MAX_SLEW_DEG_S * dt + self.SLEW_MARGIN_DEG
+            jumps = [(self.JOINT_NAMES[i], p, a)
+                     for i, (p, a) in enumerate(zip(prev, angles_deg))
+                     if abs(a - p) > budget]
+            if jumps:
+                detail = ', '.join(f'{n} {p:.1f}->{a:.1f}' for n, p, a in jumps)
+                self.get_logger().warn(
+                    f'Ignoring discontinuous angle read ({detail}) after '
+                    f'{dt*1000:.0f}ms -- more than {budget:.0f}deg of travel '
+                    'is not physically possible, so this is a garbled frame. '
+                    'If the arm really was moved by hand, this clears itself '
+                    'once the readings agree again.',
+                    throttle_duration_sec=2.0)
+                # Do not update _last_good_*: if the arm genuinely IS somewhere
+                # new (hand-moved, or a jump we mis-called), the next reading
+                # will be near this one and the budget will have grown with
+                # elapsed time, so it recovers on its own rather than latching.
+                return False
+
+        self._last_good_deg = list(angles_deg)
+        self._last_good_time = now
+        return True
+
     def _read_angles_rad(self):
         """Read current joint angles from the robot, returns radians or None."""
         if self._mc is None:
@@ -745,6 +1158,8 @@ class MyCobotHardwareNode(Node):
                     f'Ignoring impossible angle read {angles_deg} -- '
                     'treating as a garbled response.',
                     throttle_duration_sec=2.0)
+                return None
+            if not self._angles_continuous(angles_deg):
                 return None
             self._warn_if_outside_limits(angles_deg)
             return [math.radians(a) for a in angles_deg]
@@ -820,6 +1235,17 @@ class MyCobotHardwareNode(Node):
                         'Resyncing to hardware.',
                         throttle_duration_sec=3.0)
                 self._last_angles_rad = angles
+                # Drop the profile with it. Rebasing the jog chain while the
+                # profiler keeps its own stale _jog_cmd_deg makes the next
+                # tick ramp EVERY joint from where it used to think the arm
+                # was to the freshly rebuilt target -- so joints nobody jogged
+                # get commanded motion out of nowhere. That is the
+                # `jog profile joint2+4.80` seen against a search sweep that
+                # only ever asks for joint5. Clearing it means the next jog
+                # rebuilds both the target and the chain from this reading;
+                # the servo re-commands within one detection, so nothing is
+                # lost but the drift.
+                self._jog_reset_profile()
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -956,6 +1382,9 @@ class MyCobotHardwareNode(Node):
             return
 
         moved = False
+        # Per-joint deltas after clipping and limit-clamping, used to advance
+        # the hold reference by intent rather than by measurement.
+        applied_deltas: dict[int, float] = {}
         for name, delta in zip(names, deltas):
             if name not in self.JOINT_NAMES:
                 continue
@@ -994,6 +1423,7 @@ class MyCobotHardwareNode(Node):
                     f'Tracking will work in one direction only until it comes '
                     f'back off the stop -- home the arm to recentre it.',
                     throttle_duration_sec=5.0)
+            applied_deltas[idx] = delta
             moved = True
 
         if not moved:
@@ -1002,6 +1432,116 @@ class MyCobotHardwareNode(Node):
                 f'(expected any of {self.JOINT_NAMES})',
                 throttle_duration_sec=2.0)
             return
+
+        now_jog = time.monotonic()
+        for idx in applied_deltas:
+            self._last_jog_time_per_joint[idx] = now_jog
+
+        # Pull untouched joints back toward what they are supposed to hold.
+        #
+        # This is the fix for the sag ratchet. target_deg was seeded from the
+        # MEASURED pose, so a joint nobody is steering gets re-commanded to
+        # its own sagged position on every jog; the servo holds the new spot,
+        # gravity takes a little more, and the next command ratifies that.
+        # Measured on hardware: joint4 walked 55 -> 34.6 deg in ~12s of
+        # searching, with nothing ever asking it to move. It looks exactly
+        # like lost torque -- and it is not, which is why re-powering the
+        # servos did not stop it.
+        #
+        # Correct by at most _hold_correction per command so a genuinely
+        # displaced arm eases back instead of snapping.
+        if self._hold_reference_deg is not None and self._hold_correction > 0.0:
+            corrected = []
+            for i in range(len(self.JOINT_NAMES)):
+                if i in applied_deltas:
+                    continue
+                want = self._hold_reference_deg[i]
+                err = want - target_deg[i]
+                # Deadband. Below this the joint is where it was asked to be
+                # as far as this arm can tell, and correcting is noise.
+                #
+                # 1e-3 was far too tight: joint4 sitting 0.8deg off -- inside
+                # the servo's own resolution and backlash -- never closed that
+                # gap, so the no-progress counter ran up and the arm reported
+                # 'joint4 has not moved toward 55.0 in 6 corrections' about a
+                # joint that was holding perfectly well. A false stall report
+                # is worse than none: it is exactly the message that sends
+                # someone looking for a mechanical fault.
+                if abs(err) < self._hold_deadband:
+                    self._hold_no_progress[i] = 0
+                    continue
+                # Give up on a joint that is not responding. Correcting a
+                # joint that cannot move does not recover it -- it holds a
+                # stall, and stall current is heavy. joint3 was pushed toward
+                # its -150 limit every 0.5s for tens of seconds while sitting
+                # at -126, and the controller then browned out mid-frame
+                # (`cmd_len error`, then a panic). Backing off is the safe
+                # failure: the arm stays where it is instead of grinding.
+                prev = self._hold_last_err.get(i)
+                if prev is not None and abs(err) > abs(prev) - 0.25:
+                    self._hold_no_progress[i] = self._hold_no_progress.get(i, 0) + 1
+                else:
+                    self._hold_no_progress[i] = 0
+                self._hold_last_err[i] = err
+                if self._hold_no_progress.get(i, 0) >= self._hold_give_up:
+                    if self._hold_no_progress[i] == self._hold_give_up:
+                        self.get_logger().error(
+                            f'{self.JOINT_NAMES[i]} has not moved toward '
+                            f'{want:.1f} in {self._hold_give_up} corrections '
+                            f'(stuck at {target_deg[i]:.1f}). It is stalled or '
+                            'blocked, so it will not be commanded further -- '
+                            'holding a stall draws heavy current and can brown '
+                            'out the controller. Home the arm to clear this.')
+                    continue
+
+                step = max(-self._hold_correction,
+                           min(self._hold_correction, err))
+                lo, hi = self._joint_limits_deg[i]
+                target_deg[i] = max(lo, min(hi, target_deg[i] + step))
+                if abs(err) > self._droop_tolerance:
+                    corrected.append(f'{self.JOINT_NAMES[i]} {err:+.1f}')
+            if corrected:
+                self.get_logger().warn(
+                    f'Holding untouched joints against drift: '
+                    f'{", ".join(corrected)} off target. Nothing is '
+                    'commanding these, so this is gravity or a released '
+                    'servo, not tracking.',
+                    throttle_duration_sec=5.0)
+        # Last gate before this pose becomes a command. Checked HERE rather
+        # than on the incoming JointJog because the delta has now been
+        # clipped, limit-clamped and leashed -- so this tests the pose the
+        # arm will really be driven to, not the one that was asked for.
+        ok, why = self._guard.check(target_deg)
+        if not ok:
+            self._guard_blocks += 1
+            self.get_logger().error(
+                f'Refusing jog: {why}. Commanded pose '
+                f'{[round(t, 1) for t in target_deg]} '
+                f'(blocked {self._guard_blocks} so far). The servo will keep '
+                'asking, so this is a limit being reached, not a fault -- if '
+                'it is wrong, the keep-out is set badly: '
+                'collision_min_z_m / collision_base_radius_m / '
+                'collision_max_reach_m, or collision_guard:=false.',
+                throttle_duration_sec=3.0)
+            return
+
+        # Record where each jogged joint was actually told to go -- the
+        # leashed target, not an accumulation of every delta ever requested.
+        #
+        # Accumulating raw deltas was tried and runs away. The target is
+        # leashed to the measured pose, so on a joint the arm cannot keep up
+        # with, intent outpaces reality without bound: joint1's reference
+        # reached 168deg while the arm sat at 71deg, and the moment jogging
+        # paused past the grace period the watchdog compared against that
+        # fiction and reported a 97deg droop that did not exist.
+        #
+        # The leashed target stays tied to what the arm can actually do, and
+        # the joints this reference matters for -- the untouched ones handled
+        # above -- are not jogged at all, so their entry stays exactly where
+        # homing or their last real command left it.
+        if self._hold_reference_deg is not None:
+            for idx in applied_deltas:
+                self._hold_reference_deg[idx] = target_deg[idx]
 
         if self._jog_profile:
             # Hand the goal to the profiler and return. Nothing is sent from
@@ -1264,6 +1804,87 @@ class MyCobotHardwareNode(Node):
             self.get_logger().warn(
                 f'jog rejected: {e}', throttle_duration_sec=2.0)
 
+    def _home_in_steps(self, target_deg) -> bool:
+        """Walk to home along interpolated waypoints instead of one big move.
+
+        A single send_angles releases all six joints at once and they travel at
+        their own rates, so the arm passes through whatever configuration that
+        happens to produce. Coming from a stretched-out pose, joint2 reaches
+        90deg while joint3 is still unfolded -- the D405 out at maximum lever
+        arm, which is the worst torque this arm ever sees. That spike is what
+        stalls joint3, and a stalled servo's current draw is a plausible route
+        to the ESP32 browning out: `cmd_len error` is a length field that did
+        not survive the wire, and the LoadProhibited panic follows from parsing
+        the garbage.
+
+        Stepping keeps every intermediate pose close to the straight line
+        between start and finish, so the arm folds as it rises rather than
+        reaching first and folding after.
+
+        Returns True if home was reached. Gives up early -- and says which
+        joint -- rather than grinding a stalled servo, because holding a stall
+        is exactly the condition to avoid.
+        """
+        start = self._read_angles_deg_blocking()
+        if start is None:
+            self.get_logger().warn(
+                'Cannot read a starting pose; falling back to a single move.')
+            with self._lock:
+                self._send_angles(self._mc, list(target_deg), self._home_speed)
+            return self._wait_until_reached(
+                target_deg, tolerance_deg=self._settle_tol,
+                timeout=self._home_timeout)
+
+        span = max(abs(t - s) for s, t in zip(start, target_deg))
+        steps = max(1, min(self._home_steps, int(span / 8.0) + 1))
+        self.get_logger().info(
+            f'Homing in {steps} step(s) from {[round(s, 1) for s in start]} '
+            f'(largest joint move {span:.0f}deg)')
+
+        stalled_for = 0
+        prev_err = None
+        for k in range(1, steps + 1):
+            frac = k / steps
+            way = [s + (t - s) * frac for s, t in zip(start, target_deg)]
+            with self._lock:
+                self._send_angles(self._mc, way, self._home_speed)
+            # Long enough for a step of this size to actually execute; joint1
+            # measured 51.6 deg/s flat out, and home_speed is well below that.
+            time.sleep(max(0.35, span / steps / 25.0))
+
+            now = self._read_angles_deg_blocking(tries=3)
+            if now is None:
+                continue
+            err = max(abs(n - t) for n, t in zip(now, target_deg))
+            if prev_err is not None and err > prev_err - 0.5:
+                stalled_for += 1
+                if stalled_for >= 4:
+                    worst = max(range(6), key=lambda i: abs(now[i] - target_deg[i]))
+                    self.get_logger().error(
+                        f'Homing stopped making progress: '
+                        f'{self.JOINT_NAMES[worst]} is at {now[worst]:.1f} and '
+                        f'{target_deg[worst]:.1f} was asked for, unchanged over '
+                        f'{stalled_for} steps. Not commanding it further -- '
+                        'holding a stalled servo draws heavy current and is a '
+                        'good way to brown out the controller.')
+                    return False
+            else:
+                stalled_for = 0
+            prev_err = err
+
+        return self._wait_until_reached(
+            target_deg, tolerance_deg=self._settle_tol,
+            timeout=min(self._home_timeout, 10.0))
+
+    def _read_angles_deg_blocking(self, tries: int = 6):
+        """One trustworthy pose in degrees, or None. Most reads come back -1."""
+        for _ in range(tries):
+            rad = self._read_angles_rad()
+            if rad is not None:
+                return [math.degrees(r) for r in rad]
+            time.sleep(0.15)
+        return None
+
     def _send_angles(self, mc, angles_deg, speed) -> None:
         """send_angles, without waiting for a reply that never comes.
 
@@ -1326,6 +1947,17 @@ class MyCobotHardwareNode(Node):
 
     def _jog_enable_callback(self, request, response):
         """Deadman for jogging. Servoing does nothing until this is enabled."""
+        if request.data and self._home_on_start and not self._start_home_done:
+            # Refuse rather than queue: the caller retries, and arming mid-home
+            # is what made startup homing time out while every jog bounced off
+            # "a trajectory is executing".
+            response.success = False
+            response.message = 'Startup homing still in progress; retry.'
+            self.get_logger().info(
+                'Refusing to arm jogging: startup homing not finished yet.',
+                throttle_duration_sec=5.0)
+            return response
+
         self._jog_enabled = bool(request.data)
         # Drop any half-finished ramp. Re-arming should start from a
         # standstill against a fresh goal, not resume into whatever the
@@ -1362,19 +1994,28 @@ class MyCobotHardwareNode(Node):
         if self._mc is None:
             return False
         deadline = time.monotonic() + timeout
-        # rclpy.ok() so Ctrl-C is not ignored for up to home_timeout while the
-        # arm crawls toward a pose nobody is waiting for any more. Without it,
-        # shutting down mid-home kept commanding the arm for another 15s,
-        # which reads as the stack refusing to die.
+        # One in-tolerance read is not proof of arrival. Most reads come back
+        # -1 or as a partial frame (the link also carries ESP32 console output
+        # and the internal Feetech bus), and a garbled frame that happens to
+        # decode near the target would end the wait early -- reporting "Homing
+        # complete" for an arm that never left. Two consecutive agreeing reads
+        # is cheap here (0.1s apart) and rules that out.
+        confirmations = 0
         while time.monotonic() < deadline and rclpy.ok():
             try:
                 with self._lock:
                     current = self._mc.get_angles()
-                if isinstance(current, list) and len(current) == 6:
+                if (isinstance(current, list) and len(current) == 6
+                        and self._angles_plausible(current)
+                        and self._angles_continuous(current)):
                     self._cmd_positions = [math.radians(c) for c in current]
                     max_err = max(abs(c - t) for c, t in zip(current, target_deg))
                     if max_err < tolerance_deg:
-                        return True
+                        confirmations += 1
+                        if confirmations >= 2:
+                            return True
+                    else:
+                        confirmations = 0
             except Exception as e:
                 self._handle_link_error(e, 'position poll')
                 return False
@@ -1659,13 +2300,40 @@ class MyCobotHardwareNode(Node):
         # A trajectory owns the arm; a stale jog goal must not survive it.
         self._jog_reset_profile()
         try:
-            with self._lock:
-                self._send_angles(self._mc, target, self._home_speed)
-            reached = self._wait_until_reached(
-                target,
-                tolerance_deg=self._settle_tol,
-                timeout=self._home_timeout,
-            )
+            # Re-power the servos immediately before commanding, not just at
+            # connect. Measured on hardware: an arm reading
+            # [39.9, 91.6, -132.3, ...] refused to home at all, and a bare
+            # power_on + focus_all_servos followed by the SAME send_angles
+            # took it to [0.8, 91.0, -148.6, ...] first try. Torque is lost
+            # somewhere between connecting and homing -- until that is
+            # understood, re-engaging here is what makes homing dependable.
+            self._focus_servos()
+            ok, why = self._guard.check(target)
+            if not ok:
+                # A home pose that collides is a configuration error, not
+                # something to drive into and find out.
+                self.get_logger().error(
+                    f'Refusing to home: {why}. The home pose {target} is '
+                    'inside a keep-out volume -- fix home_angles or the '
+                    'collision_* limits.')
+                response.success = False
+                response.message = f'home pose rejected: {why}'
+                return response
+
+            reached = False
+            for attempt in range(2):
+                # Stepped, so the arm folds as it rises instead of
+                # stretching out first -- see _home_in_steps.
+                reached = self._home_in_steps(target)
+                if reached:
+                    break
+                if attempt == 0:
+                    # A released joint accepts the command and does not move,
+                    # so a second identical send achieves nothing on its own.
+                    self.get_logger().warn(
+                        'Homing did not arrive; re-powering the servos and '
+                        'trying once more before giving up.')
+                    self._focus_servos()
         except OSError as e:
             self._handle_link_error(e, 'homing')
             response.success = False
@@ -1678,6 +2346,8 @@ class MyCobotHardwareNode(Node):
             self.get_logger().error(response.message)
             return response
         finally:
+            if self._home_settle_time > 0:
+                time.sleep(self._home_settle_time)
             self._in_motion.clear()
             self._cmd_positions = None
 
@@ -1685,11 +2355,35 @@ class MyCobotHardwareNode(Node):
         if reached:
             response.message = f'Homed to {target}'
             self.get_logger().info('Homing complete')
+            # From here until something jogs, this is the pose the arm is
+            # meant to be holding. The watchdog measures against it.
+            self._hold_reference_deg = list(target)
+            self._droop_since = None
+            self._hold_last_err.clear()
+            self._hold_no_progress.clear()
         else:
-            response.message = (
-                f'Homing timed out after {self._home_timeout}s; '
-                f'arm did not reach {target} within {self._settle_tol}deg'
-            )
+            # Say what it actually reached and how far off it was. "Timed
+            # out" alone reads as a stuck joint, and this session lost time
+            # to exactly that reading -- the joint under suspicion turned out
+            # to move 8deg in 4s on demand, with a normal temperature. The
+            # settle wait after the stepped walk is min(home_timeout, 10s),
+            # NOT home_timeout, so quoting home_timeout here overstated the
+            # patience by 4x and made a slow-but-fine arm look dead.
+            got = self._read_angles_deg_blocking(tries=4)
+            budget = min(self._home_timeout, 10.0)
+            if got:
+                worst_i = max(range(6), key=lambda i: abs(got[i] - target[i]))
+                response.message = (
+                    f'Homing did not settle within {budget:.0f}s: reached '
+                    f'{[round(g, 1) for g in got]}, wanted {target}. Furthest '
+                    f'off is {self.JOINT_NAMES[worst_i]} by '
+                    f'{abs(got[worst_i] - target[worst_i]):.1f}deg against a '
+                    f'{self._settle_tol}deg tolerance.')
+            else:
+                response.message = (
+                    f'Homing did not settle within {budget:.0f}s and the pose '
+                    'could not be read afterwards, so where the arm actually '
+                    'got to is unknown.')
             self.get_logger().warn(response.message)
         return response
 

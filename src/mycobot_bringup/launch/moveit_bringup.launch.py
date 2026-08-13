@@ -39,6 +39,38 @@ def generate_launch_description():
     robot_ip_arg = DeclareLaunchArgument('robot_ip', default_value=DEFAULT_ROBOT_IP)
     robot_port_arg = DeclareLaunchArgument('robot_port', default_value='9000')
     camera_port_arg = DeclareLaunchArgument('camera_port', default_value='8080')
+
+    # This file had no serial arguments at all, so it could only ever reach
+    # the arm through the Pi's TCP server -- on a Jetson driving the UART
+    # directly it came up permanently disconnected, with MoveIt planning
+    # happily against a robot it could not command.
+    connection_arg = DeclareLaunchArgument(
+        'connection', default_value='serial', choices=['tcp', 'serial'],
+        description="How to reach the arm. 'serial' drives the ESP32 directly "
+                    "over the Jetson's UART; 'tcp' goes via the Pi.")
+    serial_port_arg = DeclareLaunchArgument(
+        'serial_port', default_value='/dev/ttyTHS1',
+        description='Serial device for connection:=serial')
+    serial_baud_arg = DeclareLaunchArgument(
+        'serial_baud', default_value='1000000',
+        description="Baud for connection:=serial -- the arm's firmware rate")
+
+    # Off by default HERE specifically, unlike the other bringups. This file
+    # exists to plan moves by hand in RViz, and homing on startup drives the
+    # arm before the operator has looked at it -- which with a payload the
+    # shoulder is marginal on is exactly the move worth NOT making
+    # automatically. Use the "home" named state in the MotionPlanning panel.
+    home_on_start_arg = DeclareLaunchArgument(
+        'home_on_start', default_value='false',
+        description='Drive to the home pose on startup. Off here so planning '
+                    'sessions begin from wherever the arm actually is')
+
+    source_arg = DeclareLaunchArgument(
+        'source', default_value='realsense',
+        choices=['mjpeg', 'device', 'realsense'],
+        description="'realsense' opens a D405 locally; 'mjpeg' reads the Pi's "
+                    "stream")
+
     robot_ip = LaunchConfiguration('robot_ip')
     robot_port = LaunchConfiguration('robot_port')
     camera_port = LaunchConfiguration('camera_port')
@@ -79,6 +111,12 @@ def generate_launch_description():
         parameters=[{
             'robot_ip': robot_ip,
             'robot_port': robot_port,
+            'connection': LaunchConfiguration('connection'),
+            'serial_port': LaunchConfiguration('serial_port'),
+            'serial_baud': ParameterValue(
+                LaunchConfiguration('serial_baud'), value_type=int),
+            'home_on_start': ParameterValue(
+                LaunchConfiguration('home_on_start'), value_type=bool),
             # See mycobot_hardware_node.py for why this is 10 and not 20:
             # the Pi's TCP server is single-client and blocks ~100ms per
             # read, so fast polling starves the motion commands.
@@ -89,12 +127,14 @@ def generate_launch_description():
             'lookahead': 0.12,
             'trajectory_speed': 60,
             # Scale each streaming step's speed to its size instead of using a
-            # fixed value. speed_at_100_deg_s is a GUESS — measure it with
-            # scripts/measure_arm.py and set the real number here.
+            # fixed value. 52.0 is MEASURED (joint1 over ttyTHS1 with a D405 on
+            # the flange, 2026-08-01); this file still said 120, the old guess,
+            # so it asked for 43% of the speed it intended and the arm trailed
+            # its own commanded goal.
             'adaptive_speed': True,
-            'speed_at_100_deg_s': 120.0,
+            'speed_at_100_deg_s': 52.0,
             'speed_headroom': 1.3,
-            'home_angles_deg': [0.0, 90.0, -90.0, 0.0, 0.0, 0.0],
+            'home_angles_deg': [0.0, 90.0, -150.0, 55.0, 0.0, 0.0],
             'home_speed': 30,
         }],
         output='screen',
@@ -105,12 +145,18 @@ def generate_launch_description():
         executable='camera_node',
         name='camera_node',
         parameters=[{
+            'source': LaunchConfiguration('source'),
+            # Only read when source:=mjpeg, but harmless to pass always.
             'camera_url': PythonExpression([
                 "'http://'", " + '", robot_ip,
                 "' + ':'", " + '", camera_port,
                 "' + '/?action=stream'",
             ]),
             'frame_rate': 15.0,
+            'rs_width': 640,
+            'rs_height': 480,
+            'rs_fps': 30,
+            'rs_depth': True,
         }],
         output='screen',
     )
@@ -166,6 +212,11 @@ def generate_launch_description():
         robot_ip_arg,
         robot_port_arg,
         camera_port_arg,
+        connection_arg,
+        serial_port_arg,
+        serial_baud_arg,
+        home_on_start_arg,
+        source_arg,
         robot_state_publisher,
         hardware_node,
         camera_node,

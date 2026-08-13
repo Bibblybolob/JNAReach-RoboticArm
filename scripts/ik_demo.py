@@ -58,6 +58,19 @@ import sys
 
 import numpy as np
 
+# Route through the arm broker when one is running, so this script does not
+# open /dev/ttyTHS1 itself. Two openers interleave bytes on that tty and the
+# Atom reports the resulting bad length field as `cmd_len error` -- which
+# reads as a firmware fault and has cost whole sessions.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+try:
+    from arm_broker import connect_arm as _connect_arm
+except Exception:  # broker module unavailable; behave exactly as before
+    def _connect_arm(port, factory, **kw):
+        return factory()
+
+
 # (xyz, rpy, lower, upper) per joint, straight out of the URDF.
 CHAIN = [
     ((0.0, 0.0, 0.13956), (0.0, 0.0, 0.0), -2.932, 2.932),
@@ -291,7 +304,8 @@ def main():
     print(f'\nCLEAR THE ARM. Commanding in 3s via {args.serial_port}...')
     import time
     time.sleep(3.0)
-    mc = MyCobot280(args.serial_port, str(args.baud))
+    mc = _connect_arm(args.serial_port,
+                      lambda: MyCobot280(args.serial_port, str(args.baud)))
     time.sleep(0.5)
     # _async: SEND_ANGLES has no reply on the serial path and blocks 1550ms
     # waiting for one. Same reason the driver does this.

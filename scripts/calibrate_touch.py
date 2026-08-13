@@ -282,7 +282,7 @@ def cartesian_jog(target_deg, axis, delta_mm, tool_offset_m=0.0):
     return nxt
 
 
-def wait_for_arrival(target, travel_deg, speed, tol=2.0):
+def wait_for_arrival(target, travel_deg, speed, tol=1.0):
     """Block until the arm reaches `target`, or until it clearly will not.
 
     Replaces a slept guess, which was wrong in the expensive direction. An
@@ -293,6 +293,15 @@ def wait_for_arrival(target, travel_deg, speed, tol=2.0):
 
     Polls the measured pose instead, so a short move costs a short wait and a
     long one is actually waited out. Returns (arrived, worst_error_deg).
+
+    The tolerance is 1.0deg, just above this arm's floor. Measured
+    2026-08-13: commanded a two-joint move and watched it settle -- 0.79deg
+    and 1.60mm of tip error at 4.5s, then completely flat out to 21s. That
+    0.79 is the backlash CLAUDE.md records, so it is the hardware limit and
+    waiting longer buys nothing. The tolerance was 2.0deg, which accepted two
+    and a half times the achievable error, i.e. about 9mm of tip error at
+    250mm of reach -- and that, not the IK, was what made jogging feel
+    inaccurate. The IK itself round-trips to under 0.1mm.
     """
     # Measured 52 deg/s at speed 100, so scale from that and leave headroom
     # for acceleration and the link being slow to answer.
@@ -340,11 +349,13 @@ def jog_to_corner(guard, speed, step, last_joint, tool_offset_m=0.0):
         meas = st.get('angles')
         if meas:
             drift = max(abs(a - b) for a, b in zip(meas, target))
-            # Only meaningful once the arm has stopped -- wait_for_arrival()
-            # has already blocked for that, so a gap here is a joint that did
-            # NOT execute, not one still travelling.
-            note = (f'  <-- {drift:.0f}deg from commanded; a joint did not '
-                    f'execute (try power_on)' if drift > 5 else '')
+            # ~0.8deg is this arm's backlash and is normal; flagging that
+            # would be crying wolf. Past ~2.5deg a joint genuinely did not
+            # execute -- wait_for_arrival has already waited, so it is not
+            # still travelling.
+            note = (f'  <-- {drift:.1f}deg from commanded; a joint did not '
+                    f'execute (try power_on)' if drift > 2.5
+                    else f'  ({drift:.1f}deg out, backlash is ~0.8)')
             print(f'    at {[round(a, 1) for a in meas]}{note}')
         raw = input(f'    jog [step {step}, speed {speed}]> ').strip().lower()
         if raw in ('ok', ''):

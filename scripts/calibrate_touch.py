@@ -183,11 +183,99 @@ def annotate(colour, seen, target_idx, path):
     cv2.imwrite(path, img)
 
 
-JOG_HELP = """    2 +5      move joint2 by +5 deg        p     print the pose
-    -5        repeat on the last joint     ok    record this touch
-    2 =90     drive joint2 TO 90 deg       s     skip this corner
-    step 3    change the default step      q     stop collecting
-    speed 20  change the move speed"""
+JOG_HELP = """    CARTESIAN -- move the TIP, in millimetres, which is what you want here:
+    x +10     tip 10mm along base +x       z -5      tip 5mm down
+    y -20     tip 20mm along base -y       +10/-10   repeat the last axis
+
+    JOINT -- when a wrist needs turning:
+    2 +5      move joint2 by +5 deg        2 =90     drive joint2 TO 90 deg
+
+    p  print the pose      ok  record this touch
+    s  skip this corner    q   stop collecting
+    step 3  default step   speed 20  move speed"""
+
+_IK = None
+
+
+def _ik():
+    """The arm's real IK, from the script that owns it.
+
+    Loaded rather than reimplemented: ik_demo.fk was verified identical to
+    collision_guard.flange_transform to 4e-16 over 200 random poses on
+    2026-08-13, and a third copy of this chain is the way that stops being
+    true.
+    """
+    global _IK
+    if _IK is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'ik_demo.py')
+        spec = importlib.util.spec_from_file_location('_ik_demo', path)
+        _IK = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_IK)
+    return _IK
+
+
+def cartesian_jog(target_deg, axis, delta_mm, tool_offset_m=0.0):
+    """Move the TIP by delta_mm along a base axis. Returns joint degrees.
+
+    Cartesian because the operator is looking at a corner and a camera image,
+    not at a joint-space manifold. "Put the tip 10mm left" is answerable by
+    eye; "which of six joints, and how far" is inverse kinematics done in the
+    head, and doing it by hand is what made the first collection session
+    unusable.
+
+    Solved from the COMMANDED pose, not the measured one, for the same reason
+    the joint jog is: seeding from the measurement re-commands untouched
+    joints to wherever gravity left them.
+
+    Returns None if the target is unreachable, or if IK answers with a
+    different arm configuration -- a 200-degree elbow flip technically reaches
+    the point, and would swing the arm through whatever it was about to touch.
+    """
+    import numpy as np
+
+    ik = _ik()
+    T = np.array(flange_transform(list(target_deg)))
+    tool = T[:3, 2] * tool_offset_m
+    want = T[:3, 3] + tool
+    want = want.copy()
+    want[axis] += delta_mm / 1000.0
+
+    # Solve, then RE-solve against the orientation actually reached. The tool
+    # points along the flange's own z, so it rotates as the wrist does, and
+    # holding that vector fixed over the jog is only right for a tool of zero
+    # length. Measured at a 60mm offset: one shot put the tip 11.9mm out for a
+    # 10mm request, 19% wrong. Two refinements close it.
+    seed = np.array([math.radians(a) for a in target_deg])
+    q = None
+    for _ in range(3):
+        guess_tool = tool if q is None else (
+            np.array(flange_transform([math.degrees(a) for a in q]))[:3, 2]
+            * tool_offset_m)
+        q_new = ik.ik(want - guess_tool, seed=seed)
+        if q_new is None:
+            return None
+        q = q_new
+        if tool_offset_m == 0.0:
+            break
+
+    nxt = [math.degrees(a) for a in q]
+    if max(abs(a - b) for a, b in zip(nxt, target_deg)) > 45.0:
+        return None
+
+    # Verify where the tip ACTUALLY lands rather than trusting the solve.
+    # The refinement above converges cleanly at zero tool length and less well
+    # as the tool grows, because position-only IK leaves the orientation free
+    # and the tool swings with it -- measured 14mm out on a 25mm request at a
+    # 100mm offset. A jog that quietly goes somewhere else is worse than one
+    # that refuses, so this is checked, not assumed.
+    T2 = np.array(flange_transform(nxt))
+    got = (T2[:3, 3] + T2[:3, 2] * tool_offset_m)[axis] - (
+        T[:3, 3] + tool)[axis]
+    if abs(got - delta_mm / 1000.0) > max(0.001, abs(delta_mm) * 0.05 / 1000):
+        return None
+    return nxt
 
 
 def wait_for_arrival(target, travel_deg, speed, tol=2.0):
@@ -217,7 +305,7 @@ def wait_for_arrival(target, travel_deg, speed, tol=2.0):
     return False, worst
 
 
-def jog_to_corner(guard, speed, step, last_joint):
+def jog_to_corner(guard, speed, step, last_joint, tool_offset_m=0.0):
     """Position the arm by COMMANDED moves, never by hand.
 
     Measured 2026-08-13, and it is the reason this mode exists: twelve
@@ -240,6 +328,7 @@ def jog_to_corner(guard, speed, step, last_joint):
         print('    no pose reading; cannot jog safely')
         return 'skip', last_joint
     target = list(st['angles'])
+    last_axis = None
     print(JOG_HELP)
 
     while True:
@@ -275,28 +364,56 @@ def jog_to_corner(guard, speed, step, last_joint):
                 print('    usage: speed 20')
             continue
 
-        # <joint> <delta> | <joint> =<abs> | <delta>
+        # x|y|z <delta_mm> | <joint> <delta> | <joint> =<abs> | <delta>
         parts = raw.split()
+        nxt = None
+        # j stays None on the Cartesian path, which moves several joints at
+        # once and so has no "last joint" to repeat on. Initialised here
+        # because the branches below do not all set it, and reading it
+        # afterwards is how this crashed the first time.
+        j = None
         try:
-            if len(parts) == 1 and parts[0][0] in '+-':
+            if parts[0] in ('x', 'y', 'z') and len(parts) == 2:
+                axis, mm = 'xyz'.index(parts[0]), float(parts[1])
+                nxt = cartesian_jog(target, axis, mm, tool_offset_m)
+                if nxt is None:
+                    print(f'    cannot move the tip {mm:+.0f}mm in '
+                          f'{parts[0]} -- out of reach, or IK answers with a '
+                          'different arm configuration, which would swing it '
+                          'through the target')
+                    continue
+                last_axis, last_joint = axis, None
+            elif (len(parts) == 1 and parts[0][0] in '+-'
+                  and last_axis is not None and last_joint is None):
+                # Bare +N after a Cartesian move repeats on that axis, which
+                # is the common case: nudge, look, nudge again.
+                mm = float(parts[0])
+                nxt = cartesian_jog(target, last_axis, mm, tool_offset_m)
+                if nxt is None:
+                    print(f'    cannot move {mm:+.0f}mm further that way')
+                    continue
+            elif len(parts) == 1 and parts[0][0] in '+-':
                 if last_joint is None:
-                    print('    no previous joint -- say e.g. "2 +5" first')
+                    print('    no previous axis or joint -- try "x +10" or '
+                          '"2 +5" first')
                     continue
                 j, val, absolute = last_joint, float(parts[0]), False
             elif len(parts) == 2:
                 j = int(parts[0])
                 absolute = parts[1].startswith('=')
                 val = float(parts[1].lstrip('='))
+                if not 1 <= j <= 6:
+                    raise ValueError
+                last_axis = None
             else:
-                raise ValueError
-            if not 1 <= j <= 6:
                 raise ValueError
         except Exception:
             print('    did not understand that\n' + JOG_HELP)
             continue
 
-        nxt = list(target)
-        nxt[j - 1] = val if absolute else nxt[j - 1] + val
+        if nxt is None:
+            nxt = list(target)
+            nxt[j - 1] = val if absolute else nxt[j - 1] + val
         ok, why = guard.check(nxt)
         if not ok:
             # Refuse rather than clip: a silently shortened jog leaves the
@@ -308,9 +425,10 @@ def jog_to_corner(guard, speed, step, last_joint):
         if not r or not r.get('ok'):
             print(f'    refused: {(r or {}).get("error", "no reply")}')
             continue
-        travel = abs(nxt[j - 1] - target[j - 1])
+        travel = max(abs(a - b) for a, b in zip(nxt, target))
         target = nxt
-        last_joint = j
+        if j is not None:
+            last_joint = j
         wait_for_arrival(target, travel, speed)
 
 
@@ -474,7 +592,8 @@ def collect(args) -> int:
                 # Servos stay engaged throughout. See jog_to_corner().
                 request({'cmd': 'call', 'method': 'power_on'}, timeout=20)
                 ans, last_joint = jog_to_corner(
-                    guard, args.speed, args.step, last_joint)
+                    guard, args.speed, args.step, last_joint,
+                    args.tool_offset_mm / 1000.0)
             if ans == 'quit':
                 break
             if ans == 'skip':

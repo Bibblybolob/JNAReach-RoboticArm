@@ -106,6 +106,9 @@ class ArmState:
     # a wrong write there takes a joint off the bus entirely. Reading those
     # registers is fine and is how temperature is obtained.
     POLL_WINDOW = POLL_WINDOW_S
+    # Re-apply termios before each poll. See _poll_once.
+    RECONFIGURE_EACH_POLL = True
+    BREAK_BEFORE_POLL = True
 
     ALLOWED_CALLS = {
         # reads
@@ -223,6 +226,41 @@ class ArmState:
         """One GET_ANGLES on the wire. Caller holds self._lock."""
         if self._sp is None:
             self._open()
+        # These two together took the read path from ~10% valid to 60-69%
+        # sustained. They are NOT independent, and the interaction is the
+        # whole point -- measured 2026-08-13, 12 trials per cell on a live
+        # arm, via probe(reconf=, brk=):
+        #
+        #     reconf  break   hits    bytes read
+        #     no      no      3/12    6021
+        #     no      yes     7/12    5733
+        #     yes     no      1/12     152     <- WORSE than doing nothing
+        #     yes     yes     9/12    1415
+        #
+        # So the break is the mechanism that actually elicits a reply, and
+        # reasserting termios only pays off alongside it. Do not "simplify"
+        # this by keeping the reconfigure and dropping the break: that is the
+        # 1/12 cell, the worst of the four.
+        #
+        # The byte counts say why. Without the reconfigure the port takes
+        # ~6KB of junk per cell and the reply is buried in it; with it the
+        # channel is quiet (152 bytes) but nothing answers unless the break
+        # prompts it. Quiet-and-prompted is the combination that parses.
+        #
+        # Caveat on the numbers: 12 trials per cell. The ORDERING is solid --
+        # it reproduced the four-way ranking -- but treat 75% as indicative.
+        # A 3/3 result earlier in the same investigation evaporated when
+        # rerun at 10 trials, which is why the cell size is written down.
+        if self.RECONFIGURE_EACH_POLL:
+            try:
+                self._sp.baudrate = BAUD    # tcsetattr even if unchanged
+            except Exception:
+                pass
+        if self.BREAK_BEFORE_POLL:
+            try:
+                self._sp.send_break(0.01)
+            except Exception:
+                pass
         self._sp.reset_input_buffer()
         self._sp.write(GET_ANGLES)
         self._sp.flush()
@@ -400,14 +438,25 @@ class ArmState:
     }
 
     def probe(self, cmd='get_angles', wait=0.5, flush=True, repeat=1,
-              trials=6, gap=0.15, dtr=None, rts=None) -> dict:
+              trials=6, gap=0.15, dtr=None, rts=None,
+              reconf=None, brk=None) -> dict:
         """One parameterised read attempt, repeated, reporting the hit rate.
 
         Exists so the read strategy can be SWEPT rather than guessed. Every
         knob that could plausibly matter -- how long to wait, whether to flush
         first, how many times to poke, which opcode, the modem lines -- is a
         separate argument, and the caller can walk the space and measure.
+
+        reconf/brk default to whatever _poll_once() is doing, so a bare probe
+        measures the SAME strategy the poll uses. They were once absent here
+        and present there, which made probe report 0/12 while the poll ran at
+        60% -- the probe was measuring a different read path and looked like a
+        dead link.
         """
+        if reconf is None:
+            reconf = self.RECONFIGURE_EACH_POLL
+        if brk is None:
+            brk = self.BREAK_BEFORE_POLL
         hits = 0
         total_bytes = 0
         with self._lock:
@@ -422,6 +471,12 @@ class ArmState:
                 except Exception: pass
             payload = self.PROBE_CMDS.get(cmd, self.PROBE_CMDS['get_angles'])
             for _ in range(trials):
+                if reconf:
+                    try: sp.baudrate = BAUD
+                    except Exception: pass
+                if brk:
+                    try: sp.send_break(0.01)
+                    except Exception: pass
                 if flush:
                     sp.reset_input_buffer()
                 for _ in range(repeat):
@@ -445,6 +500,77 @@ class ArmState:
                 time.sleep(gap)
         return {'ok': True, 'hits': hits, 'trials': trials,
                 'rate': round(hits / trials, 3), 'bytes': total_bytes}
+
+    def probe_rx(self, rx_baud=None, wait=0.8, trials=4, mode='normal',
+                 parity=None, stopbits=None, brk=False, reopen=False) -> dict:
+        """Poke at 1000000, then read under DIFFERENT line settings.
+
+        Motivated by bytes that arrive but do not parse: 738 and 2693 byte
+        bursts with no `fe fe` anywhere. That is what a receive-side rate
+        mismatch looks like, and nothing so far has proven the Atom transmits
+        at the rate it receives -- writes landing only proves the RX side of
+        the ARM is right.
+
+        Writes always go out at 1000000, because that demonstrably works. Only
+        the read settings vary.
+        """
+        import serial
+        hits = 0
+        total = 0
+        best_hex = ''
+        with self._lock:
+            if self._sp is None:
+                self._open()
+            sp = self._sp
+            orig_baud = sp.baudrate
+            orig_par, orig_stop = sp.parity, sp.stopbits
+            try:
+                for _ in range(trials):
+                    sp.baudrate = orig_baud
+                    sp.reset_input_buffer()
+                    if brk:
+                        try:
+                            sp.send_break(0.01)
+                        except Exception:
+                            pass
+                    sp.write(GET_ANGLES)
+                    sp.flush()
+                    if rx_baud and rx_baud != orig_baud:
+                        sp.baudrate = rx_baud
+                    if parity is not None:
+                        sp.parity = parity
+                    if stopbits is not None:
+                        sp.stopbits = stopbits
+                    d = b''
+                    end = time.monotonic() + wait
+                    while time.monotonic() < end:
+                        if mode == 'osread':
+                            try:
+                                import os as _os
+                                c = _os.read(sp.fileno(), 4096)
+                            except Exception:
+                                c = b''
+                        else:
+                            c = sp.read(4096)
+                        if c:
+                            d += c
+                        else:
+                            time.sleep(0.01)
+                    total += len(d)
+                    if d.find(b'\xfe\xfe') >= 0:
+                        hits += 1
+                        if not best_hex:
+                            best_hex = d[:60].hex(' ')
+                    elif d and not best_hex:
+                        best_hex = d[:60].hex(' ')
+            finally:
+                sp.baudrate = orig_baud
+                try:
+                    sp.parity, sp.stopbits = orig_par, orig_stop
+                except Exception:
+                    pass
+        return {'ok': True, 'hits': hits, 'trials': trials, 'bytes': total,
+                'sample': best_hex}
 
     def raw(self, data: bytes) -> dict:
         with self._lock:
@@ -493,6 +619,14 @@ class Handler(socketserver.StreamRequestHandler):
         if cmd == 'call':
             return STATE.call(req.get('method', ''), req.get('args', []),
                               req.get('kwargs', {}))
+        if cmd == 'probe_rx':
+            return STATE.probe_rx(
+                rx_baud=req.get('rx_baud'), wait=float(req.get('wait', 0.8)),
+                trials=int(req.get('trials', 4)),
+                mode=req.get('mode', 'normal'),
+                parity=req.get('parity'), stopbits=req.get('stopbits'),
+                brk=bool(req.get('brk', False)),
+                reopen=bool(req.get('reopen', False)))
         if cmd == 'probe':
             return STATE.probe(
                 cmd=req.get('probe_cmd', 'get_angles'),
@@ -501,7 +635,8 @@ class Handler(socketserver.StreamRequestHandler):
                 repeat=int(req.get('repeat', 1)),
                 trials=int(req.get('trials', 6)),
                 gap=float(req.get('gap', 0.15)),
-                dtr=req.get('dtr'), rts=req.get('rts'))
+                dtr=req.get('dtr'), rts=req.get('rts'),
+                reconf=req.get('reconf'), brk=req.get('brk'))
         if cmd == 'sniff':
             return STATE.sniff(float(req.get('seconds', 3.0)),
                                bool(req.get('poke', True)))

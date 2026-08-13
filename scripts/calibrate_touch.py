@@ -609,18 +609,30 @@ def solve_from_sweep(sweep):
     from scipy.optimize import least_squares
 
     angles = sorted(sweep)
-    shared = set.intersection(*(set(sweep[a]) for a in angles))
+    # A corner needs to be seen at SEVERAL angles, not at all of them. The
+    # camera turns with joint1, so the board leaves the frame at the ends of
+    # the sweep -- measured here, 14 corners at centre, 6 at -30deg, none at
+    # +30. Demanding every angle threw away a whole usable sweep for want of
+    # the two corners that survived the extremes, when each corner only has
+    # to constrain its own agreement.
+    at_least = max(3, min(3, len(angles)))
+    seen_at = {}
+    for a in angles:
+        for j in sweep[a]:
+            seen_at.setdefault(j, []).append(a)
+    shared = sorted(j for j, aa in seen_at.items() if len(aa) >= at_least)
     if len(shared) < 4:
         raise ReachError(
-            f'only {len(shared)} corners were seen at EVERY sweep angle; '
-            'need at least 4. Keep the whole board in view across the sweep.')
-    shared = sorted(shared)
+            f'only {len(shared)} corners were seen at {at_least}+ sweep '
+            f'angles; need at least 4. Narrow --sweep so the board stays in '
+            'view, or move it back so more of it fits the frame.')
 
     def residual(x):
         R, t = rodrigues(x[:3]), x[3:6]
         out = []
         for j in shared:
-            pts = [rot_z(a) @ (R @ sweep[a][j] + t) for a in angles]
+            aa = seen_at[j]
+            pts = [rot_z(a) @ (R @ sweep[a][j] + t) for a in aa]
             mean = np.mean(pts, axis=0)
             for p in pts:
                 out.extend(p - mean)
@@ -636,8 +648,9 @@ def solve_from_sweep(sweep):
 def estimate_corner(sweep, R, t, idx):
     """Where a corner lands in the (gauge-free) base frame, averaged."""
     import numpy as np
-    return np.mean([rot_z(a) @ (R @ sweep[a][idx] + t) for a in sorted(sweep)
-                    if idx in sweep[a]], axis=0)
+    pts = [rot_z(a) @ (R @ sweep[a][idx] + t) for a in sorted(sweep)
+           if idx in sweep[a]]
+    return np.mean(pts, axis=0)
 
 
 def fix_gauge(est, touched):
@@ -688,6 +701,22 @@ def auto(args) -> int:
     cam = Camera()
     sweep = {}
     try:
+        # Look BEFORE moving. The sweep is centred on wherever joint1 happens
+        # to be, and after an earlier sweep that is wherever the last angle
+        # left it -- measured here, a run started at joint1=30deg and swept
+        # 14..46deg, where the board is not visible at all, wasting five moves
+        # to discover it. One frame first answers that for free.
+        colour, depth = cam.frame()
+        here = corners_3d(colour, depth, board, adict, cam.K)
+        print(f'  before moving: {len(here)} corners visible at joint1='
+              f'{base_pose[0]:.1f}deg')
+        if len(here) < 6:
+            print('\nRefusing to sweep: the board is barely in view from the '
+                  'starting pose, so rotating away from it will only make '
+                  'that worse. Point the camera at the board first -- home '
+                  'the arm, or jog joint1 until it is centred -- then re-run.')
+            return 1
+
         for off in offsets:
             pose = list(base_pose)
             pose[0] = base_pose[0] + off
@@ -1060,7 +1089,7 @@ def main() -> int:
                     help='sweep joint1 and solve automatically, then ask for '
                          'ONE touch to fix the yaw and height the sweep '
                          'cannot see. Far fewer manual steps than --collect.')
-    ap.add_argument('--sweep', default='-30,-15,0,15,30',
+    ap.add_argument('--sweep', default='-16,-8,0,8,16',
                     help='joint1 offsets in degrees for --auto')
     ap.add_argument('--collect', action='store_true')
     ap.add_argument('--solve', action='store_true')

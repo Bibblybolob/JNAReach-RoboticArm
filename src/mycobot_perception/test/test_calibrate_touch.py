@@ -198,6 +198,25 @@ print(f'      (true offset 7mm -> estimated {s:+.1f}mm)')
 check('a real 7mm tool offset is recovered from the touches',
       abs(s - 7.0) < 3.0)
 
+# --- waiting for the arm, sized to the ACTUAL travel -----------------------
+# The bug this pins: an absolute jog ("4 =-80" from 153deg = 234deg of travel)
+# was given a sleep sized for 5deg. It returned mid-move, reported a 234deg
+# divergence, and the operator re-issued commands that were already running.
+
+def wait_budget(travel, speed):
+    return min(travel / 52.0 * (100.0 / max(speed, 1)) * 2.5 + 3.0, 30.0)
+
+
+small, large = wait_budget(5.0, 25), wait_budget(234.0, 25)
+print(f'      (5deg -> {small:.1f}s budget, 234deg -> {large:.1f}s)')
+check('a long move is given far more time than a short one', large > 5 * small)
+check('and the budget is capped so a dead joint cannot hang it', large <= 30.0)
+
+# At speed 25 the arm does ~13deg/s, so 234deg needs ~18s -- inside the cap.
+check('the cap still covers the largest realistic jog',
+      234.0 / (52.0 * 0.25) < 30.0)
+
+
 # --- the CALL SITE, not just the function ---------------------------------
 # collect() shipped with a NameError: it called jog_to_corner(guard, ...) and
 # never created a guard. The unit tests above passed one in explicitly, so

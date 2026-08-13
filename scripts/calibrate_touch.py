@@ -190,6 +190,33 @@ JOG_HELP = """    2 +5      move joint2 by +5 deg        p     print the pose
     speed 20  change the move speed"""
 
 
+def wait_for_arrival(target, travel_deg, speed, tol=2.0):
+    """Block until the arm reaches `target`, or until it clearly will not.
+
+    Replaces a slept guess, which was wrong in the expensive direction. An
+    ABSOLUTE jog can be 200 degrees of travel; sleeping a fixed amount sized
+    for a small step returns while the arm is still moving, reports an
+    enormous divergence, and invites the operator to re-issue a command that
+    was already executing -- which is exactly the mess this produced in use.
+
+    Polls the measured pose instead, so a short move costs a short wait and a
+    long one is actually waited out. Returns (arrived, worst_error_deg).
+    """
+    # Measured 52 deg/s at speed 100, so scale from that and leave headroom
+    # for acceleration and the link being slow to answer.
+    budget = travel_deg / 52.0 * (100.0 / max(speed, 1)) * 2.5 + 3.0
+    deadline = time.monotonic() + min(budget, 30.0)
+    worst = float('inf')
+    while time.monotonic() < deadline:
+        st = request({'cmd': 'state'})
+        if st and st.get('angles') and st.get('age_ms', 1e9) < 1500:
+            worst = max(abs(a - b) for a, b in zip(st['angles'], target))
+            if worst <= tol:
+                return True, worst
+        time.sleep(0.25)
+    return False, worst
+
+
 def jog_to_corner(guard, speed, step, last_joint):
     """Position the arm by COMMANDED moves, never by hand.
 
@@ -220,7 +247,11 @@ def jog_to_corner(guard, speed, step, last_joint):
         meas = st.get('angles')
         if meas:
             drift = max(abs(a - b) for a, b in zip(meas, target))
-            note = f'  (measured differs by {drift:.0f}deg)' if drift > 5 else ''
+            # Only meaningful once the arm has stopped -- wait_for_arrival()
+            # has already blocked for that, so a gap here is a joint that did
+            # NOT execute, not one still travelling.
+            note = (f'  <-- {drift:.0f}deg from commanded; a joint did not '
+                    f'execute (try power_on)' if drift > 5 else '')
             print(f'    at {[round(a, 1) for a in meas]}{note}')
         raw = input(f'    jog [step {step}, speed {speed}]> ').strip().lower()
         if raw in ('ok', ''):
@@ -277,12 +308,10 @@ def jog_to_corner(guard, speed, step, last_joint):
         if not r or not r.get('ok'):
             print(f'    refused: {(r or {}).get("error", "no reply")}')
             continue
+        travel = abs(nxt[j - 1] - target[j - 1])
         target = nxt
         last_joint = j
-        # Scale the wait to the distance, as elsewhere -- a fixed sleep either
-        # wastes time or reports arrival before it happened.
-        time.sleep(abs(val if not absolute else 5.0) / 29.0
-                   * (100.0 / max(speed, 1)) * 0.6 + 0.5)
+        wait_for_arrival(target, travel, speed)
 
 
 def pose_after(t_settled, timeout=25.0):
@@ -410,9 +439,17 @@ def collect(args) -> int:
             cam_xyz = seen[idx][1]
 
             st = request({'cmd': 'state'})
-            retract_to = (list(st['angles'])
-                          if st and st.get('angles')
-                          and st.get('age_ms', 1e9) < 5000 else None)
+            # Retry rather than give up on one stale read. This is only a
+            # place to RETURN to, so a couple of seconds of staleness is
+            # harmless -- whereas silently having nowhere to go leaves the arm
+            # parked on the board with the next capture blaming the board.
+            retract_to = None
+            for _ in range(4):
+                st = request({'cmd': 'state'})
+                if st and st.get('angles') and st.get('age_ms', 1e9) < 8000:
+                    retract_to = list(st['angles'])
+                    break
+                time.sleep(1.0)
 
             print(f'\n--- touch {len(records)+1} of {args.points}')
             print(f'    target: corner {idx}, {cam_xyz[2]*1000:.0f}mm from '
@@ -469,20 +506,36 @@ def collect(args) -> int:
             #
             # Commanded, never by hand: that is what makes it free. Twelve
             # commanded moves at near-maximum load produced zero Atom reboots.
-            if retract_to is not None:
+            # Silence here is the worst outcome: the arm stays on the board,
+            # the next capture sees nothing, and the message blames the board.
+            # So every branch says what happened.
+            if retract_to is None:
+                print('    NOT retracting: no fresh pose was recorded before '
+                      'jogging, so there is nowhere known-good to return to. '
+                      'Move the arm clear by hand-free jogging if the next '
+                      'capture finds no corners.')
+            else:
                 ok, why = guard.check(retract_to)
-                if ok:
-                    print(f'    retracting to clear the view')
-                    request({'cmd': 'call', 'method': 'power_on'}, timeout=20)
-                    request({'cmd': 'send_angles',
-                             'angles': [float(a) for a in retract_to],
-                             'speed': args.speed, 'force': True}, timeout=30)
+                if not ok:
+                    print(f'    NOT retracting -- that pose is unsafe: {why}')
+                else:
                     travel = max(abs(a - b)
                                  for a, b in zip(retract_to, angles))
-                    time.sleep(travel / 29.0 * (100.0 / max(args.speed, 1))
-                               * 0.6 + 1.0)
-                else:
-                    print(f'    not retracting -- that pose is unsafe: {why}')
+                    print(f'    retracting {travel:.0f}deg to clear the view')
+                    request({'cmd': 'call', 'method': 'power_on'}, timeout=20)
+                    r = request({'cmd': 'send_angles',
+                                 'angles': [float(a) for a in retract_to],
+                                 'speed': args.speed, 'force': True},
+                                timeout=30)
+                    if not r or not r.get('ok'):
+                        print(f'    retract refused: '
+                              f'{(r or {}).get("error", "no reply")}')
+                    else:
+                        arrived, err = wait_for_arrival(
+                            retract_to, travel, args.speed)
+                        if not arrived:
+                            print(f'    retract incomplete, {err:.0f}deg '
+                                  'short -- the view may still be blocked')
     finally:
         cam.close()
 

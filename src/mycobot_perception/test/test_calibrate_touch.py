@@ -198,5 +198,63 @@ print(f'      (true offset 7mm -> estimated {s:+.1f}mm)')
 check('a real 7mm tool offset is recovered from the touches',
       abs(s - 7.0) < 3.0)
 
+# --- the CALL SITE, not just the function ---------------------------------
+# collect() shipped with a NameError: it called jog_to_corner(guard, ...) and
+# never created a guard. The unit tests above passed one in explicitly, so
+# they proved the function worked while the caller was broken. Stub the camera
+# and the broker and drive collect() far enough to reach the jog.
+
+def test_collect_reaches_the_jog():
+    import tempfile
+    import cv2
+    import types
+
+    class FakeCam:
+        K = np.array([[393.8, 0, 318.1], [0, 393.4, 236.5], [0, 0, 1.0]])
+
+        def frame(self):
+            board, _ = ct.board_for(38.9)
+            img = board.draw((640, 480))
+            return (cv2.cvtColor(img, cv2.COLOR_GRAY2BGR),
+                    np.full((480, 640), 250.0))
+
+        def close(self):
+            pass
+
+    real_cam, real_req, real_jog, real_out = (
+        ct.Camera, ct.request, ct.jog_to_corner, ct.OUT_DIR)
+    seen = []
+    try:
+        ct.Camera = FakeCam
+        ct.request = lambda r, timeout=5.0: (
+            {'link': {'fraction': 0.95, 'valid': 38, 'window': 40}}
+            if r['cmd'] == 'health' else
+            {'angles': [0.0] * 6, 'age_ms': 50} if r['cmd'] == 'state'
+            else {'ok': True})
+        ct.jog_to_corner = lambda guard, speed, step, lj: (
+            seen.append((type(guard).__name__, speed, step)) or ('quit', lj))
+        ct.OUT_DIR = tempfile.mkdtemp()
+
+        class Args:
+            points, square_mm, tool_offset_mm = 8, 38.9, 0.0
+            free_drive, speed, step = False, 25, 3.0
+            restart, timeout = True, 25.0
+
+        import io
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = ct.collect(Args())
+        return rc == 0 and seen and seen[0][0] == 'CollisionGuard'
+    finally:
+        ct.Camera, ct.request = real_cam, real_req
+        ct.jog_to_corner, ct.OUT_DIR = real_jog, real_out
+
+
+try:
+    check('collect() reaches the jog with a real collision guard',
+          test_collect_reaches_the_jog())
+except Exception as e:
+    check(f'collect() reaches the jog with a real collision guard ({e})', False)
+
 print(f'\n{PASS} passed' + (f', {FAIL} FAILED' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

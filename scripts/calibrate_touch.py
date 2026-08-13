@@ -84,7 +84,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 import cv2  # noqa: E402
 
 from arm_broker import request  # noqa: E402
-from mycobot_driver.collision_guard import flange_transform  # noqa: E402
+from mycobot_driver.collision_guard import (  # noqa: E402
+    CollisionGuard, flange_transform,
+)
 
 OUT_DIR = os.path.expanduser('~/hand_eye')
 TOUCHES = 'touches.json'
@@ -360,6 +362,11 @@ def collect(args) -> int:
         print('Refusing below 60%. Every touch depends on a joint reading '
               'taken after the arm stopped, and this link cannot supply them.')
         return 1
+
+    # Every jog is checked against this before it is sent. The tool offset is
+    # whatever actually contacts the board, so the guard protects the part
+    # that sticks out furthest rather than the flange origin.
+    guard = CollisionGuard(tool_offset_m=args.tool_offset_mm / 1000.0)
 
     board, adict = board_for(args.square_mm)
     cam = Camera()

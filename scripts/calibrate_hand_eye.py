@@ -128,18 +128,42 @@ def capture_poses(args) -> int:
             time.sleep(0.4)
         return None
 
-    # Rotation-rich, translation-poor. joint5 and joint6 turn the camera
-    # while barely moving the arm, which is exactly the motion hand-eye
-    # needs and the motion a naive "wave it around" pose set lacks.
-    poses = []
-    for pan in (-20, 0, 20):
-        for tilt in (-25, -10, 5, 20):
-            for roll in (-40, 0, 40):
-                q = list(HOME)
-                q[0] += pan
-                q[4] += tilt
-                q[5] += roll
-                poses.append(q)
+    if args.eye_to_hand:
+        # The camera rides on the first arm piece, so joint1 -- and ONLY
+        # joint1 -- moves it. Hold joint1 still and the camera is a static
+        # observer, which is the eye-to-hand case: the BOARD moves, on the
+        # flange, and the arm's own FK says where it is.
+        #
+        # So the pose set has to do the opposite of the eye-in-hand one. There
+        # the arm barely moved and the camera turned; here the camera cannot
+        # turn at all, so the flange must sweep rotation in front of it while
+        # staying in view. joint4/5/6 supply the rotation, joint2/3 move the
+        # board around the frame and change its range.
+        poses = []
+        for lift in (-15, 0, 15):
+            for reach in (-15, 5):
+                for wrist in (-35, 0, 35):
+                    for roll in (-40, 0, 40):
+                        q = list(HOME)
+                        q[0] = args.fixed_joint1   # never varies. See above.
+                        q[1] += lift
+                        q[2] += reach
+                        q[3] += wrist
+                        q[5] += roll
+                        poses.append(q)
+    else:
+        # Rotation-rich, translation-poor. joint5 and joint6 turn the camera
+        # while barely moving the arm, which is exactly the motion hand-eye
+        # needs and the motion a naive "wave it around" pose set lacks.
+        poses = []
+        for pan in (-20, 0, 20):
+            for tilt in (-25, -10, 5, 20):
+                for roll in (-40, 0, 40):
+                    q = list(HOME)
+                    q[0] += pan
+                    q[4] += tilt
+                    q[5] += roll
+                    poses.append(q)
 
     safe = [q for q in poses if guard.check(q)[0]]
     print(f'{len(safe)} of {len(poses)} candidate poses pass the collision '
@@ -285,6 +309,7 @@ def solve(args) -> int:
     board, adict = make_board(args.square_mm)
 
     R_g2b, t_g2b, R_t2c, t_t2c = [], [], [], []
+    j1 = []
     used = 0
     for r in records:
         img = cv2.imread(r['image'])
@@ -303,10 +328,19 @@ def solve(args) -> int:
         if not ok:
             continue
         T = np.array(flange_transform(r['angles']))
+        if args.eye_to_hand:
+            # Same solver, transforms inverted. cv2.calibrateHandEye solves
+            # AX=XB for the camera's pose relative to whatever frame the
+            # "gripper" transforms describe. Feed it BASE->FLANGE instead of
+            # flange->base and the X it returns is the camera's pose in the
+            # BASE frame -- which is the static-camera case, no separate
+            # algorithm needed.
+            T = np.linalg.inv(T)
         R_g2b.append(T[:3, :3])
         t_g2b.append(T[:3, 3])
         R_t2c.append(cv2.Rodrigues(rvec)[0])
         t_t2c.append(tvec.reshape(3))
+        j1.append(r['angles'][0])
         used += 1
 
     print(f'{used} of {len(records)} captures had a usable board view')
@@ -314,6 +348,21 @@ def solve(args) -> int:
         print('Not enough. The board must be visible and reasonably large in '
               'the frame -- move it closer, light it better, or print bigger.')
         return 1
+
+    if args.eye_to_hand:
+        # The failure mode unique to this mode, and it is silent. Eye-to-hand
+        # assumes the camera did not move. Here the camera rides on the first
+        # arm piece, so joint1 moving IS the camera moving -- and the solve
+        # would absorb that into the transform and return something confident
+        # and wrong, with every other check still passing.
+        j1_spread = float(np.max(j1) - np.min(j1)) if j1 else 0.0
+        print(f'joint1 varied by {j1_spread:.2f}deg across the captures')
+        if j1_spread > 1.0:
+            print('Refusing: joint1 moved, and joint1 is the one joint that '
+                  'carries the camera. The static-camera assumption this mode '
+                  'rests on is broken, and nothing downstream would notice. '
+                  'Recapture with joint1 held still (--fixed-joint1).')
+            return 1
 
     # Rotational spread. Hand-eye is constrained by RELATIVE rotation between
     # poses; a set that only translates is degenerate and the solvers will
@@ -349,7 +398,8 @@ def solve(args) -> int:
         return 1
 
     print()
-    print('solver      camera offset from flange (mm)')
+    print(f'solver      camera position in the '
+          f'{"BASE" if args.eye_to_hand else "flange"} frame (mm)')
     ts = []
     for name, (Rc, tc) in results.items():
         print(f'  {name:<11} x={tc[0]*1000:+7.1f}  y={tc[1]*1000:+7.1f}  '
@@ -372,9 +422,25 @@ def solve(args) -> int:
     X = np.eye(4)
     X[:3, :3] = Rc
     X[:3, 3] = tc
-    out = os.path.join(OUT_DIR, 'hand_eye.json')
+    out = os.path.join(OUT_DIR,
+                       'eye_to_hand.json' if args.eye_to_hand
+                       else 'hand_eye.json')
+    key = 'camera_to_base' if args.eye_to_hand else 'camera_to_flange'
+    extra = {}
+    if args.eye_to_hand:
+        # Solved at ONE joint1 angle, and joint1 rotates the camera. Record it,
+        # because base->camera at any other pan is this transform composed with
+        # Rz(q1 - joint1_deg) -- and a consumer that does not know the angle it
+        # was solved at cannot do that composition.
+        extra = {'joint1_deg': float(np.mean(j1)),
+                 'joint1_spread_deg': j1_spread,
+                 'mount': 'first arm piece (link1); only joint1 moves it',
+                 'compose_note': (
+                     'base->camera at pan q1 = Rz(q1 - joint1_deg) @ '
+                     'camera_to_base. See docs/camera_mount.md.')}
     with open(out, 'w') as f:
-        json.dump({'camera_to_flange': X.tolist(),
+        json.dump({key: X.tolist(),
+                   **extra,
                    'solver': 'PARK',
                    'captures_used': used,
                    'rotation_spread_deg': spread,
@@ -406,6 +472,14 @@ def main() -> int:
     ap.add_argument('--square-mm', type=float, default=DEFAULT_SQUARE_MM,
                     help='MEASURED square size of the printed board')
     ap.add_argument('--settle', type=float, default=2.5)
+    ap.add_argument('--eye-to-hand', action='store_true',
+                    help='camera is STATIC and the board rides on the flange, '
+                         'which is the case once the camera leaves the flange. '
+                         'Solves camera->base instead of camera->flange.')
+    ap.add_argument('--fixed-joint1', type=float, default=0.0,
+                    help='joint1 angle to hold throughout an eye-to-hand '
+                         'capture. joint1 is the only joint that moves the '
+                         'camera, so it must not vary (default 0)')
     ap.add_argument('--commanded-angles', action='store_true',
                     help='record commanded instead of measured joint angles. '
                          'For when writes land but reads do not. Costs ~4mm '

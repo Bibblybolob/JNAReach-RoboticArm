@@ -772,12 +772,24 @@ hardware as of this writing; the port may be power-only.
       would be mandatory.
     - **The lens is much wider, and that invalidates the servo gains.** Error
       is normalised per axis, so 1.0 means "at the edge" on any camera — but
-      the edge is ~25° away on the current webcam and ~43° on a D405. The same
-      normalised error therefore commands nearly twice the rotation, and the
-      loop will over-command and ring. `camera_node` computes the real FOV from
-      the intrinsics and warns when it is this much wider, naming
-      `skip_probe:=false` as the fix. **Re-measure before trusting any tuning
-      in this file.**
+      the edge is ~25° away on the current webcam and **39.1° on this D405 at
+      640x480** (31.4° vertically) — read off the factory intrinsics
+      2026-08-13, `fx=393.8 fy=393.4`, correcting the ~43° estimate this line
+      used to carry. The same normalised error therefore commands nearly twice
+      the rotation, and the loop will over-command and ring. `camera_node`
+      computes the real FOV from the intrinsics and warns when it is this much
+      wider, naming `skip_probe:=false` as the fix. **Re-measure before
+      trusting any tuning in this file.**
+
+    **The camera is now on the FIRST ARM PIECE, not the flange**, so only
+    joint1 moves it and the servo's 2x2 image Jacobian is singular by
+    construction — measured, joints 2-6 shift the image by under 0.08 px/deg
+    while joint1 gives 10.49. Keep `skip_probe:=false`: it refuses for exactly
+    this reason, and the usual runaway guard does NOT fire here because joint5
+    moves fine, it just does nothing to the image. Hand-eye calibration is
+    degenerate rather than merely stale. See
+    [docs/camera_mount.md](docs/camera_mount.md) and
+    `scripts/measure_jacobian.py`.
 
     `pyrealsense2` is left optional in `requirements.txt` because the mjpeg
     and device sources do not need it; the node reports it missing and keeps

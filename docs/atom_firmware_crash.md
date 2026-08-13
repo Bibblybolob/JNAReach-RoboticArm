@@ -237,11 +237,44 @@ than a read, but it drives only the Atom's own LED, so it separates "longer
 frame" from "does something mechanical". The arm moved 0.1deg over 180
 commands, so no frame was corrupted into a pose change either.
 
-**So frame length is not a cause, and load stands.** The caveat worth keeping:
-this was run with the arm already unloaded, so it establishes that length
-alone provokes nothing — not that length is irrelevant at every load. The
-complementary run is the same ladder with the arm extended, which
-deliberately reintroduces the fault.
+### The loaded run — and load does not reproduce it either
+
+The same ladder, repeated at two higher loads by moving the arm out. Peak
+joint load through the driver's FK, against the morning's fault condition
+(extended with the camera on the flange) as the reference:
+
+| pose | peak load | vs morning | reboots / 180 cmds | link |
+|---|---|---|---|---|
+| near-zeros | 0.021 | 0.4× | 0 | 98–100% |
+| camera-forward | 0.065 | **1.25×** | 0 | 92–100% |
+| arm out horizontal | 0.094 | **1.8×** | **1** | 95–100% |
+
+**Neither variable reproduces the fault.** At 1.8× the static load that was
+crashing the controller every few seconds that morning, ten minutes of holding
+produced one reboot in 180 commands — and that one landed in the **5-byte**
+cell, the shortest frame, which is the opposite of what frame length predicts.
+
+The important deduction is about the camera. That morning changed pose *and*
+camera position together and they were confounded. Pose alone has now been
+swept across a 4.5× range with the camera off, and it barely moves the result
+— while **exceeding the morning's total load by 1.8× without reproducing the
+fault**. So whatever the camera contributed, **it was not its weight**: the
+mass equivalent has been beaten comfortably by pose alone.
+
+That leaves two candidates, and the earlier "load-driven" reading of
+2026-08-12 should be treated as unconfirmed rather than established:
+
+- **The camera as a system rather than as a mass** — it is a powered USB3
+  device whose cable runs the length of the arm. Its weight is now excluded;
+  its presence is not.
+- **Accumulated heat, over hours rather than minutes.** Ten minutes at load is
+  not a soak. The morning's condition followed a long run; this did not, and
+  the 8.5h idle that preceded the recovery is equally consistent with cooling.
+
+The decisive next test is to remount the camera on the flange and repeat this
+same pose ladder. If the fault returns at a load *lower* than 0.094, the
+camera is implicated and mass is excluded as its mechanism. If it does not
+return until the arm has been driven for an hour, it is the soak.
 
 ## Related
 

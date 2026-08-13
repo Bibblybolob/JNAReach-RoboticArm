@@ -214,13 +214,34 @@ earlier "the UART is failing" reading was measuring the arm's pose. Reads and
 writes were never the variable — the counters above had already shown the
 port itself to be clean.
 
-One hypothesis this does NOT settle, worth running before assuming heat is
-the mechanism: `send_angles` is a 16-byte frame against `get_angles`'s 5. If
-the host→arm path drops bytes at some per-byte rate, long frames mangle far
-more often, `cmd_len error` follows, and the panic after it. Test it without
-moving anything by sending `send_angles` to the pose the arm is already in
-and comparing reboot counts against `get_angles`. That separates frame length
-from load, which nothing so far has done.
+### Frame length ruled out — `scripts/probe_frame_length.py`
+
+`cmd_len error` is a length field not matching its payload, which is what
+losing a byte on the way in would produce. If the host→arm path dropped bytes
+at some rate per BYTE, long frames would mangle proportionally more often —
+and this arm's commands differ by three and a half times. That would predict
+reads mostly working while motion commands crash it, which is what the link
+had done all along.
+
+It does not. Holding the arm still and commanding the pose it is already in,
+so the long frame goes out with no motion and no change in load:
+
+| cell | bytes | commands | reboots | link |
+|---|---|---|---|---|
+| `get_angles` | 5 | 60 | **0** | 98–100% |
+| `set_color` | 8 | 60 | **0** | 100% |
+| `send_angles` | 18 | 60 | **0** | 98–100% |
+
+`set_color` is the control that makes it a ladder rather than a pair: longer
+than a read, but it drives only the Atom's own LED, so it separates "longer
+frame" from "does something mechanical". The arm moved 0.1deg over 180
+commands, so no frame was corrupted into a pose change either.
+
+**So frame length is not a cause, and load stands.** The caveat worth keeping:
+this was run with the arm already unloaded, so it establishes that length
+alone provokes nothing — not that length is irrelevant at every load. The
+complementary run is the same ladder with the arm extended, which
+deliberately reintroduces the fault.
 
 ## Related
 

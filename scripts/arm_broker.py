@@ -805,6 +805,17 @@ class Handler(socketserver.StreamRequestHandler):
         if cmd == 'sniff':
             return STATE.sniff(float(req.get('seconds', 3.0)),
                                bool(req.get('poke', True)))
+        if cmd == 'icount':
+            # Raw kernel tally, for bracketing work the broker does by some
+            # other route. counters() can only bracket its own poke; this lets
+            # a caller wrap ANY sequence of calls -- which is what comparing
+            # command FRAME LENGTHS needs, since those frames have to be built
+            # by pymycobot rather than hand-assembled. A hand-built frame with
+            # a wrong length field is precisely the fault under test.
+            with STATE._lock:
+                if STATE._sp is None:
+                    STATE._open()
+                return {'ok': True, 'icount': STATE._icount()}
         if cmd == 'counters':
             return STATE.counters(
                 poke=bool(req.get('poke', True)),

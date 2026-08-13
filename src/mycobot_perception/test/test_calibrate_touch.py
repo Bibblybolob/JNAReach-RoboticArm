@@ -198,6 +198,65 @@ print(f'      (true offset 7mm -> estimated {s:+.1f}mm)')
 check('a real 7mm tool offset is recovered from the touches',
       abs(s - 7.0) < 3.0)
 
+# --- the joint1 sweep: automatic except for one touch ----------------------
+# Rotating joint1 moves the camera in a way the arm already knows, so watching
+# a stationary board through a sweep constrains the transform without touching
+# anything. What it CANNOT see is yaw about the base z axis and height along
+# it -- spinning about an axis says nothing about your angle around it or your
+# height along it -- and one touched point settles both.
+
+def sweep_case(seed, noise_mm, angles_deg):
+    rng = np.random.default_rng(seed)
+    R = ct.rodrigues(rng.uniform(-2, 2, 3))
+    t = np.array([0.02, -0.05, 0.16])
+    P = np.column_stack([rng.uniform(-.05, .05, 22) + 0.22,
+                         rng.uniform(-.06, .06, 22),
+                         rng.uniform(-.04, .04, 22) + 0.15])
+    sweep = {}
+    for d in angles_deg:
+        a = math.radians(d)
+        Rb, tb = ct.rot_z(a) @ R, ct.rot_z(a) @ t
+        sweep[a] = {j: Rb.T @ (p - tb) + rng.normal(0, noise_mm / 1000, 3)
+                    for j, p in enumerate(P)}
+    return P, sweep, rng
+
+
+# The gauge freedoms are REAL, not an implementation artefact: rotating the
+# answer about base z and rotating the board with it predicts identical
+# observations.
+P, sweep, _ = sweep_case(1, 0.0, [-30, -15, 0, 15, 30])
+R0, t0, shared, _ = ct.solve_from_sweep(sweep)
+phi = 0.6
+a0 = ct.estimate_corner(sweep, R0, t0, shared[0])
+rotated = ct.rot_z(phi) @ a0
+check('yaw about base z is a genuine gauge freedom',
+      abs(np.linalg.norm(rotated[:2]) - np.linalg.norm(a0[:2])) < 1e-12)
+
+# One touch, and the whole board lands where it should.
+errs = []
+for seed in range(6):
+    P, sweep, rng = sweep_case(seed, 1.5, [-30, -15, 0, 15, 30])
+    R, t, shared, spread = ct.solve_from_sweep(sweep)
+    est = {j: ct.estimate_corner(sweep, R, t, j) for j in shared}
+    j = max(est, key=lambda k: math.hypot(*est[k][:2]))
+    touched = P[j] + rng.normal(0, 0.002, 3)     # a 2mm-sloppy touch
+    ph, dz, radial = ct.fix_gauge(est[j], touched)
+    Rz = ct.rot_z(ph)
+    errs.append(np.mean([
+        np.linalg.norm(Rz @ est[k] + np.array([0, 0, dz]) - P[k]) * 1000
+        for k in shared]))
+m = float(np.mean(errs))
+print(f'      (sweep + ONE 2mm touch -> {m:.2f}mm mean placement error)')
+check('a sweep plus one touch meets the 5mm bar', m < 5.0)
+
+# It must refuse a sweep too short to constrain anything.
+try:
+    ct.solve_from_sweep({0.0: {0: np.zeros(3), 1: np.ones(3)}})
+    check('a sweep with too few shared corners is refused', False)
+except ct.ReachError:
+    check('a sweep with too few shared corners is refused', True)
+
+
 # --- waiting for the arm, sized to the ACTUAL travel -----------------------
 # The bug this pins: an absolute jog ("4 =-80" from 153deg = 234deg of travel)
 # was given a sleep sized for 5deg. It returned mid-move, reported a 234deg

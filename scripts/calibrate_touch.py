@@ -97,6 +97,10 @@ MARKER_RATIO = 0.72
 MIN_DEPTH_MM, MAX_DEPTH_MM = 70.0, 500.0
 
 
+class ReachError(ValueError):
+    """Input that must not be turned into a transform."""
+
+
 def board_for(square_mm):
     d = cv2.aruco.Dictionary_get(cv2.aruco.DICT_5X5_100)
     return cv2.aruco.CharucoBoard_create(
@@ -495,6 +499,248 @@ def geometry_note(P):
     return True, f'point spread {sv[0]*1000:.0f}/{sv[1]*1000:.0f}/{sv[2]*1000:.0f}mm'
 
 
+def finish_with_touch(args, guard, R, t, sweep, shared, base_pose) -> int:
+    """One touch, to settle the yaw and height the sweep cannot see."""
+    import numpy as np
+
+    # Pick the corner furthest from the base axis: the yaw is recovered from
+    # an azimuth, and an azimuth is least sensitive to a sloppy touch when the
+    # point is far out.
+    est = {j: estimate_corner(sweep, R, t, j) for j in shared}
+    idx = max(est, key=lambda j: math.hypot(*est[j][:2]))
+
+    print(f'\nOne touch left. Everything else is already solved.')
+    print(f'  put the tip on corner {idx}, then "ok".')
+    print(f'  (it is the one the sweep places furthest from the base axis, '
+          f'which makes the answer least sensitive to a sloppy touch)\n')
+
+    request({'cmd': 'call', 'method': 'power_on'}, timeout=20)
+    ans, _ = jog_to_corner(guard, args.speed, args.step, None,
+                           args.tool_offset_mm / 1000.0)
+    if ans != 'ok':
+        print('stopped without a touch, so the yaw and height stay unknown; '
+              'nothing written.')
+        return 1
+
+    settled = time.monotonic()
+    angles = pose_after(settled, timeout=args.timeout)
+    if angles is None:
+        print('no joint reading after the touch; nothing written.')
+        return 1
+    touched = tip_in_base(angles, args.tool_offset_mm / 1000.0)
+
+    phi, dz, radial = fix_gauge(est[idx], touched)
+    print(f'\n  yaw {math.degrees(phi):+.1f}deg, height {dz*1000:+.0f}mm')
+    print(f'  consistency: the touch and the sweep put that corner '
+          f'{radial:.1f}mm apart from the base axis')
+    if radial > args.max_residual_mm:
+        print(f'  Refusing: that should agree to within a touch\'s accuracy. '
+              f'Rotation about z cannot change distance from the axis, so a '
+              f'{radial:.0f}mm disagreement means the touch was not on that '
+              'corner, or the board moved during the sweep.')
+        return 1
+
+    Rz = rot_z(phi)
+    X = np.eye(4)
+    X[:3, :3], X[:3, 3] = Rz @ R, Rz @ t + np.array([0.0, 0.0, dz])
+
+    out = os.path.join(OUT_DIR, 'eye_to_hand.json')
+    os.makedirs(OUT_DIR, exist_ok=True)
+    json.dump({
+        'camera_to_base': X.tolist(),
+        # The sweep is expressed relative to the joint1 angle it started from,
+        # so that is the angle this transform is valid at.
+        'joint1_deg': float(base_pose[0]),
+        'method': 'joint1 sweep + 1 touch (gauge fixed)',
+        'sweep_angles': len(sweep),
+        'shared_corners': len(shared),
+        'touched_corner': int(idx),
+        'radial_consistency_mm': radial,
+        'mount': 'first arm piece (link1); only joint1 moves the camera',
+        'compose_note': ('base->camera at pan q1 = Rz(q1 - joint1_deg) @ '
+                         'camera_to_base. See docs/camera_mount.md.'),
+    }, open(out, 'w'), indent=2)
+    print(f'\nwrote {out}')
+    print(f'camera at ({X[0,3]*1000:+.0f}, {X[1,3]*1000:+.0f}, '
+          f'{X[2,3]*1000:+.0f})mm in the base frame')
+    return 0
+
+
+def rodrigues(v):
+    import numpy as np
+    th = float(np.linalg.norm(v))
+    if th < 1e-12:
+        return np.eye(3)
+    k = np.asarray(v) / th
+    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * K @ K
+
+
+def rot_z(theta):
+    import numpy as np
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def solve_from_sweep(sweep):
+    """camera->base from joint1 rotation alone, up to two gauge freedoms.
+
+    `sweep` is {joint1_radians: {corner index: xyz in camera metres}}.
+
+    The idea, and why it is worth the machinery: joint1 is the ONLY joint that
+    moves this camera, and it moves it in a way the arm already knows exactly.
+    So rotating joint1 and watching a stationary board says a great deal about
+    where the camera sits -- with no touching, no marker, and nothing that
+    needs the camera to see the arm.
+
+    A board corner is at a fixed unknown point p in the base frame, so for
+    every angle it must satisfy  Rz(theta) (R c + t) = p. Fitting R and t is
+    therefore just asking that all the angles AGREE about where each corner
+    is; the corner's actual position never has to be known.
+
+    What it cannot see, measured from the rank of the residual Jacobian rather
+    than assumed: 4 of 6 degrees of freedom are determined, and the two that
+    are not are **yaw about the base z axis** and **translation along it** --
+    which is exactly right, since spinning about an axis tells you nothing
+    about your angle around it or your height along it. Those are left for one
+    touched point to fix; see fix_gauge().
+    """
+    import numpy as np
+    from scipy.optimize import least_squares
+
+    angles = sorted(sweep)
+    shared = set.intersection(*(set(sweep[a]) for a in angles))
+    if len(shared) < 4:
+        raise ReachError(
+            f'only {len(shared)} corners were seen at EVERY sweep angle; '
+            'need at least 4. Keep the whole board in view across the sweep.')
+    shared = sorted(shared)
+
+    def residual(x):
+        R, t = rodrigues(x[:3]), x[3:6]
+        out = []
+        for j in shared:
+            pts = [rot_z(a) @ (R @ sweep[a][j] + t) for a in angles]
+            mean = np.mean(pts, axis=0)
+            for p in pts:
+                out.extend(p - mean)
+        return np.array(out)
+
+    sol = least_squares(residual, np.zeros(6), method='lm',
+                        xtol=1e-14, ftol=1e-14)
+    R, t = rodrigues(sol.x[:3]), sol.x[3:6]
+    spread = float(np.abs(residual(sol.x)).max()) * 1000
+    return R, t, shared, spread
+
+
+def estimate_corner(sweep, R, t, idx):
+    """Where a corner lands in the (gauge-free) base frame, averaged."""
+    import numpy as np
+    return np.mean([rot_z(a) @ (R @ sweep[a][idx] + t) for a in sorted(sweep)
+                    if idx in sweep[a]], axis=0)
+
+
+def fix_gauge(est, touched):
+    """Resolve the two unobservable freedoms from one touched point.
+
+    The sweep leaves yaw about base z and height along it undetermined, so a
+    single point whose base position is known settles both -- three equations
+    for two unknowns, and the leftover one is a free consistency check worth
+    reporting rather than discarding.
+    """
+    import numpy as np
+    phi = math.atan2(touched[1], touched[0]) - math.atan2(est[1], est[0])
+    dz = float(touched[2] - est[2])
+    # The check: rotation about z preserves distance from the axis, so if the
+    # touch and the estimate disagree about that, they are not the same point
+    # -- a mis-touched corner, or a board that moved during the sweep.
+    radial = abs(math.hypot(*touched[:2]) - math.hypot(*est[:2])) * 1000
+    return phi, dz, radial
+
+
+def auto(args) -> int:
+    """Sweep joint1, solve, then ask for ONE touch. See solve_from_sweep()."""
+    import numpy as np
+
+    h = request({'cmd': 'health'}, timeout=15)
+    if h is None:
+        print('No broker running. Start ./scripts/arm_broker.py first.')
+        return 1
+    frac = h.get('link', {}).get('fraction', 0)
+    print(f'link {frac:.0%} valid')
+    if frac < 0.6:
+        print('Refusing below 60%: every sweep angle needs a joint reading '
+              'taken after the arm stopped.')
+        return 1
+
+    st = request({'cmd': 'state'})
+    if not st or not st.get('angles'):
+        print('no pose reading')
+        return 1
+    base_pose = list(st['angles'])
+    guard = CollisionGuard(tool_offset_m=args.tool_offset_mm / 1000.0)
+
+    offsets = [float(v) for v in args.sweep.split(',')]
+    print(f'sweeping joint1 through {offsets} degrees about '
+          f'{base_pose[0]:.1f}, capturing the board at each\n')
+
+    board, adict = board_for(args.square_mm)
+    cam = Camera()
+    sweep = {}
+    try:
+        for off in offsets:
+            pose = list(base_pose)
+            pose[0] = base_pose[0] + off
+            ok, why = guard.check(pose)
+            if not ok:
+                print(f'  joint1{off:+.0f}: skipped, unsafe -- {why}')
+                continue
+            request({'cmd': 'call', 'method': 'power_on'}, timeout=20)
+            r = request({'cmd': 'send_angles', 'angles': pose,
+                         'speed': args.speed, 'force': True}, timeout=30)
+            if not r or not r.get('ok'):
+                print(f'  joint1{off:+.0f}: refused')
+                continue
+            arrived, err = wait_for_arrival(pose, abs(off), args.speed)
+            meas = request({'cmd': 'state'})
+            if not arrived or not meas or not meas.get('angles'):
+                print(f'  joint1{off:+.0f}: did not arrive ({err:.0f}deg out)')
+                continue
+            # The MEASURED angle, not the commanded one. The arm settles about
+            # a degree short, and at 250mm that degree is 4mm of error fed
+            # straight into the solve.
+            theta = math.radians(meas['angles'][0] - base_pose[0])
+            time.sleep(0.4)
+            colour, depth = cam.frame()
+            seen = corners_3d(colour, depth, board, adict, cam.K)
+            if len(seen) < 4:
+                print(f'  joint1{off:+.0f}: only {len(seen)} corners visible')
+                continue
+            sweep[theta] = {k: v[1] for k, v in seen.items()}
+            print(f'  joint1{off:+.0f}: measured {math.degrees(theta):+.1f}deg,'
+                  f' {len(seen)} corners')
+    finally:
+        cam.close()
+
+    if len(sweep) < 3:
+        print(f'\nonly {len(sweep)} usable sweep angles; need at least 3.')
+        return 1
+
+    try:
+        R, t, shared, spread = solve_from_sweep(sweep)
+    except ReachError as e:
+        print(f'\n{e}')
+        return 1
+    print(f'\nsolved from {len(sweep)} angles and {len(shared)} shared '
+          f'corners')
+    print(f'  angles agree on each corner to {spread:.1f}mm')
+    if spread > 8.0:
+        print('  That is poor. The board moved during the sweep, or the depth '
+              'is noisy at this range. Both invalidate the solve.')
+        return 1
+    return finish_with_touch(args, guard, R, t, sweep, shared, base_pose)
+
+
 def collect(args) -> int:
     os.makedirs(OUT_DIR, exist_ok=True)
     h = request({'cmd': 'health'}, timeout=15)
@@ -810,6 +1056,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--auto', action='store_true',
+                    help='sweep joint1 and solve automatically, then ask for '
+                         'ONE touch to fix the yaw and height the sweep '
+                         'cannot see. Far fewer manual steps than --collect.')
+    ap.add_argument('--sweep', default='-30,-15,0,15,30',
+                    help='joint1 offsets in degrees for --auto')
     ap.add_argument('--collect', action='store_true')
     ap.add_argument('--solve', action='store_true')
     ap.add_argument('--points', type=int, default=8,
@@ -837,6 +1089,8 @@ def main() -> int:
     ap.add_argument('--max-residual-mm', type=float, default=8.0)
     args = ap.parse_args()
 
+    if args.auto:
+        return auto(args)
     if args.collect:
         return collect(args)
     if args.solve:

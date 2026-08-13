@@ -181,6 +181,108 @@ def annotate(colour, seen, target_idx, path):
     cv2.imwrite(path, img)
 
 
+JOG_HELP = """    2 +5      move joint2 by +5 deg        p     print the pose
+    -5        repeat on the last joint     ok    record this touch
+    2 =90     drive joint2 TO 90 deg       s     skip this corner
+    step 3    change the default step      q     stop collecting
+    speed 20  change the move speed"""
+
+
+def jog_to_corner(guard, speed, step, last_joint):
+    """Position the arm by COMMANDED moves, never by hand.
+
+    Measured 2026-08-13, and it is the reason this mode exists: twelve
+    commanded moves out to near the guard's maximum load produced ZERO Atom
+    reboots, while moving the arm by hand reliably makes it panic and reset.
+    Commanded motion drives the load; a hand back-drives the motors, and the
+    arm being limp is a precondition for neither.
+
+    So the servos stay engaged for the whole session -- no release, no
+    re-engage, and none of the free-drive cycle that preceded every link
+    collapse today.
+
+    Returns (action, last_joint) where action is 'ok', 'skip' or 'quit'.
+    """
+    # Seeded ONCE from the measurement, then tracked as a commanded target.
+    # Re-seeding from the measured pose every jog is the sag ratchet: an
+    # untouched joint gets re-commanded to wherever gravity left it.
+    st = request({'cmd': 'state'})
+    if not st or not st.get('angles'):
+        print('    no pose reading; cannot jog safely')
+        return 'skip', last_joint
+    target = list(st['angles'])
+    print(JOG_HELP)
+
+    while True:
+        st = request({'cmd': 'state'}) or {}
+        meas = st.get('angles')
+        if meas:
+            drift = max(abs(a - b) for a, b in zip(meas, target))
+            note = f'  (measured differs by {drift:.0f}deg)' if drift > 5 else ''
+            print(f'    at {[round(a, 1) for a in meas]}{note}')
+        raw = input(f'    jog [step {step}, speed {speed}]> ').strip().lower()
+        if raw in ('ok', ''):
+            return 'ok', last_joint
+        if raw == 's':
+            return 'skip', last_joint
+        if raw == 'q':
+            return 'quit', last_joint
+        if raw == 'p':
+            continue
+        if raw.startswith('step'):
+            try:
+                step = float(raw.split()[1])
+            except Exception:
+                print('    usage: step 3')
+            continue
+        if raw.startswith('speed'):
+            try:
+                speed = int(raw.split()[1])
+            except Exception:
+                print('    usage: speed 20')
+            continue
+
+        # <joint> <delta> | <joint> =<abs> | <delta>
+        parts = raw.split()
+        try:
+            if len(parts) == 1 and parts[0][0] in '+-':
+                if last_joint is None:
+                    print('    no previous joint -- say e.g. "2 +5" first')
+                    continue
+                j, val, absolute = last_joint, float(parts[0]), False
+            elif len(parts) == 2:
+                j = int(parts[0])
+                absolute = parts[1].startswith('=')
+                val = float(parts[1].lstrip('='))
+            else:
+                raise ValueError
+            if not 1 <= j <= 6:
+                raise ValueError
+        except Exception:
+            print('    did not understand that\n' + JOG_HELP)
+            continue
+
+        nxt = list(target)
+        nxt[j - 1] = val if absolute else nxt[j - 1] + val
+        ok, why = guard.check(nxt)
+        if not ok:
+            # Refuse rather than clip: a silently shortened jog leaves the
+            # operator believing the arm is somewhere it is not.
+            print(f'    refused, that pose is unsafe: {why}')
+            continue
+        r = request({'cmd': 'send_angles', 'angles': nxt, 'speed': speed,
+                     'force': True}, timeout=30)
+        if not r or not r.get('ok'):
+            print(f'    refused: {(r or {}).get("error", "no reply")}')
+            continue
+        target = nxt
+        last_joint = j
+        # Scale the wait to the distance, as elsewhere -- a fixed sleep either
+        # wastes time or reports arrival before it happened.
+        time.sleep(abs(val if not absolute else 5.0) / 29.0
+                   * (100.0 / max(speed, 1)) * 0.6 + 0.5)
+
+
 def pose_after(t_settled, timeout=25.0):
     """Joint angles genuinely SAMPLED after the arm stopped moving.
 
@@ -264,6 +366,7 @@ def collect(args) -> int:
     print(f'camera intrinsics fx={cam.K[0,0]:.1f} fy={cam.K[1,1]:.1f}')
 
     records = []
+    last_joint = None
     path = os.path.join(OUT_DIR, TOUCHES)
     if os.path.isfile(path) and not args.restart:
         records = json.load(open(path))
@@ -301,17 +404,25 @@ def collect(args) -> int:
             if args.free_drive:
                 print('    releasing the servos -- SUPPORT THE ARM, it will '
                       'go limp')
+                print('    NOTE: hand-moving this arm reliably reboots the '
+                      'Atom. --jog drives it by command instead, which '
+                      'measured zero reboots.')
                 request({'cmd': 'call', 'method': 'release_all_servos'},
                         timeout=15)
-            ans = input('    put the tip on that corner, then Enter '
-                        '(s to skip, q to stop): ').strip().lower()
-            if args.free_drive:
+                ans = input('    put the tip on that corner, then Enter '
+                            '(s to skip, q to stop): ').strip().lower()
                 request({'cmd': 'call', 'method': 'focus_all_servos'},
                         timeout=15)
                 time.sleep(1.0)
-            if ans == 'q':
+                ans = {'q': 'quit', 's': 'skip'}.get(ans, 'ok')
+            else:
+                # Servos stay engaged throughout. See jog_to_corner().
+                request({'cmd': 'call', 'method': 'power_on'}, timeout=20)
+                ans, last_joint = jog_to_corner(
+                    guard, args.speed, args.step, last_joint)
+            if ans == 'quit':
                 break
-            if ans == 's':
+            if ans == 'skip':
                 continue
 
             settled = time.monotonic()
@@ -498,8 +609,15 @@ def main() -> int:
                     help='distance from the flange origin to the contact '
                          'point, along the flange z (default 0)')
     ap.add_argument('--free-drive', action='store_true',
-                    help='release the servos at each point so the arm can be '
-                         'positioned by hand. IT WILL GO LIMP -- support it.')
+                    help='release the servos and position the arm BY HAND. '
+                         'Not the default, and not recommended: hand-moving '
+                         'this arm reliably reboots the Atom, while commanded '
+                         'motion measured zero reboots over 12 moves at near '
+                         'maximum load. Use the default jog mode instead.')
+    ap.add_argument('--speed', type=int, default=25,
+                    help='speed for jog moves (default 25)')
+    ap.add_argument('--step', type=float, default=3.0,
+                    help='default jog step in degrees (default 3)')
     ap.add_argument('--restart', action='store_true',
                     help='discard any touches already recorded')
     ap.add_argument('--timeout', type=float, default=25.0)

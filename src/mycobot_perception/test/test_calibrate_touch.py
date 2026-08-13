@@ -161,5 +161,42 @@ check('and a zero offset is the flange itself',
           __import__('mycobot_driver.collision_guard', fromlist=['x'])
           .flange_transform(HOME))[:3, 3]))
 
+# --- the tool offset is recoverable from the data -------------------------
+# "The flange is flat so the offset is zero" is a claim about where the URDF
+# puts the flange FRAME, not about the hardware. A constant offset in the
+# flange frame maps to a different base displacement at every touch
+# orientation, so it cannot hide inside a rigid transform -- which is exactly
+# what makes it estimable.
+
+def implied_offset(true_off_m, n=12, noise_mm=1.5):
+    R = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]], float)
+    t = np.array([0.05, -0.1, 0.30])
+    cams, tips = [], []
+    for _ in range(n):
+        ang = [rng.uniform(-30, 30), 90 + rng.uniform(-20, 20),
+               -149 + rng.uniform(-10, 10), 55 + rng.uniform(-40, 40),
+               rng.uniform(-50, 50), rng.uniform(-60, 60)]
+        tip = ct.tip_in_base(ang, true_off_m)
+        cams.append(R.T @ (tip - t) + rng.normal(0, noise_mm / 1000.0, 3))
+        tips.append(ang)
+    best, lo = None, 1e9
+    for off in np.linspace(-0.03, 0.03, 121):
+        pts = np.array([ct.tip_in_base(a, off) for a in tips])
+        Ro, to = ct.kabsch(np.array(cams), pts)
+        r = np.linalg.norm((np.array(cams) @ Ro.T + to) - pts, axis=1).mean()
+        if r < lo:
+            lo, best = r, off
+    return best * 1000.0
+
+
+z = implied_offset(0.0)
+print(f'      (true offset 0mm -> estimated {z:+.1f}mm)')
+check('a genuinely zero tool offset is estimated near zero', abs(z) < 3.0)
+
+s = implied_offset(0.007)
+print(f'      (true offset 7mm -> estimated {s:+.1f}mm)')
+check('a real 7mm tool offset is recovered from the touches',
+      abs(s - 7.0) < 3.0)
+
 print(f'\n{PASS} passed' + (f', {FAIL} FAILED' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

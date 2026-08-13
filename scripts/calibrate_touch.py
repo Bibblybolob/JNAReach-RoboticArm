@@ -383,6 +383,41 @@ def solve(args) -> int:
               'wrong --tool-offset-mm.')
         return 1
 
+    # Is the contact point really the flange ORIGIN? "The flange is flat and
+    # nothing is mounted" says the offset is zero, but that is a claim about
+    # where the URDF puts the flange frame, not about the hardware -- a frame
+    # sitting a few mm inside the wrist makes zero wrong with nothing visibly
+    # amiss.
+    #
+    # The data can answer it. A constant offset in the FLANGE frame maps to a
+    # different base-frame displacement at every touch orientation, so it
+    # cannot be absorbed into a single rigid transform: it shows up as
+    # residual, and the offset that minimises residual is an estimate of the
+    # real one. Diagnostic only -- it never silently changes the answer.
+    if all('angles' in r for r in recs) and len(recs) >= 5:
+        offsets = np.linspace(-0.03, 0.03, 121)
+        curve = []
+        for off in offsets:
+            tips = np.array([tip_in_base(r['angles'], off) for r in recs])
+            Ro, to = kabsch(P, tips)
+            curve.append(np.linalg.norm((P @ Ro.T + to) - tips, axis=1).mean())
+        curve = np.array(curve)
+        best = float(offsets[int(np.argmin(curve))]) * 1000.0
+        at_zero = float(curve[int(np.argmin(np.abs(offsets)))]) * 1000.0
+        improvement = at_zero - float(curve.min()) * 1000.0
+        print(f'\ntool offset implied by the data: {best:+.1f}mm '
+              f'(assumed {args.tool_offset_mm:+.1f}mm)')
+        if abs(best - args.tool_offset_mm) > 3.0 and improvement > 0.5:
+            print(f'  Using it would cut the mean residual by '
+                  f'{improvement:.1f}mm. That is the gap between the flange '
+                  'FRAME and whatever actually touched the board. Re-run '
+                  f'--solve with --tool-offset-mm {best:.1f} if it is real; '
+                  'a systematic offset biases every point the arm is later '
+                  'sent to.')
+        else:
+            print('  consistent with what was assumed -- no evidence of an '
+                  'unmodelled offset')
+
     # Jackknife: refit with each point left out and see how far the answer
     # moves. Residuals say how well the fit describes the points it was given;
     # this says how much the ANSWER depends on which points those were, which

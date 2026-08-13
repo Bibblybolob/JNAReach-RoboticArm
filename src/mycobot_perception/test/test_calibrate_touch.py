@@ -250,8 +250,10 @@ def test_collect_reaches_the_jog():
             if r['cmd'] == 'health' else
             {'angles': [0.0] * 6, 'age_ms': 50} if r['cmd'] == 'state'
             else {'ok': True})
-        ct.jog_to_corner = lambda guard, speed, step, lj: (
-            seen.append((type(guard).__name__, speed, step)) or ('quit', lj))
+        # *args, so adding a parameter to jog_to_corner does not silently
+        # break this stub the way a fixed signature just did.
+        ct.jog_to_corner = lambda guard, *a: (
+            seen.append((type(guard).__name__,) + a) or ('quit', None))
         ct.OUT_DIR = tempfile.mkdtemp()
 
         class Args:

@@ -134,6 +134,12 @@ class ArmState:
         self.angles_time = 0.0
         self.recent = []           # bools, most recent last
         self.rebinds = 0
+        # Rebinds since the last time a poll actually succeeded. Used to back
+        # off: hammering the controller every few seconds forever is not
+        # recovery, it is churn -- 194 rebinds at 0% valid, each one closing
+        # the port and reopening it 4s later, possibly on top of whatever
+        # recovery was in progress.
+        self.rebinds_since_good = 0
         self.started = time.time()
         self.last_error = None
 
@@ -195,11 +201,19 @@ class ArmState:
         self._mc = None
         self._mc280 = None
         self.rebinds += 1
+        self.rebinds_since_good += 1
         if self._verbose:
             print(f'  link silent; rebinding UART (#{self.rebinds})',
                   flush=True)
         rebind_uart(verbose=False)
-        time.sleep(4.0)
+        # Back off once rebinding is clearly not working. Doubling from 4s to
+        # a 60s ceiling means a genuinely wedged controller is still retried,
+        # without the port being torn down every few seconds indefinitely.
+        settle = min(4.0 * (2 ** min(self.rebinds_since_good, 4)), 60.0)
+        if self._verbose and self.rebinds_since_good:
+            print(f'  rebind #{self.rebinds_since_good} since last good read; '
+                  f'waiting {settle:.0f}s', flush=True)
+        time.sleep(settle)
         try:
             self._open()
         except Exception as e:  # noqa: BLE001
@@ -281,6 +295,7 @@ class ArmState:
             'fraction': round(good / n, 3),
             'healthy': (good / n) >= HEALTHY_FRACTION,
             'rebinds': self.rebinds,
+            'rebinds_since_good': self.rebinds_since_good,
             'uptime_s': round(time.time() - self.started, 1),
             'last_error': self.last_error,
         }

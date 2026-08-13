@@ -179,6 +179,49 @@ correct, the DMA→PIO overlay is live in the running device tree, and the port
 has a single owner. What is left is the Atom, doing what this document
 already describes.
 
+## Resolved the same day, by unloading — 0% to 100%
+
+No reflash, no power cycle. Two changes to the arm's mechanical load, made
+together, took the link from collapsed to perfect:
+
+- the D405 moved off the flange onto the first arm part
+- the arm ended up near all-zeros rather than extended
+
+| state | valid | reboots | framing errors |
+|---|---|---|---|
+| extended, camera on flange, after an hour of use | 57% → 0% | 1–3 per run | bursts |
+| after ~8.5h idle, same pose and camera | 78% | 0 in 24 | 0 |
+| near-zeros, camera off the flange | **100% (40/40)** | 0 | 0 |
+
+**The two changes are confounded and contributed comparably**, so this does
+not isolate the camera. Peak joint load through the driver's FK, as a
+fraction of the starting case:
+
+| | peak load | measured |
+|---|---|---|
+| extended pose, camera on flange | 100% | 78% valid |
+| same pose, camera removed | 66% | — |
+| near-zeros, camera on flange | 57% | — |
+| near-zeros, camera removed | **37%** | **100% valid** |
+
+What it does establish is the direction, and that it is large: cut peak load
+to a third and the crash stops completely. That reproduces the 2026-08-12
+result (18% → 96% from unloading alone) at a different pose with a different
+payload, which is what makes it a finding rather than a coincidence.
+
+It also means **the link's health is a proxy for mechanical load**, and every
+earlier "the UART is failing" reading was measuring the arm's pose. Reads and
+writes were never the variable — the counters above had already shown the
+port itself to be clean.
+
+One hypothesis this does NOT settle, worth running before assuming heat is
+the mechanism: `send_angles` is a 16-byte frame against `get_angles`'s 5. If
+the host→arm path drops bytes at some per-byte rate, long frames mangle far
+more often, `cmd_len error` follows, and the panic after it. Test it without
+moving anything by sending `send_angles` to the pose the arm is already in
+and comparing reboot counts against `get_angles`. That separates frame length
+from load, which nothing so far has done.
+
 ## Related
 
 `elephantrobotics/myCobot` issue #48 reports motors unresponsive after a power

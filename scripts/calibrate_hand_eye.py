@@ -83,6 +83,49 @@ def make_board(square_mm: float):
         square_mm / 1000.0 * MARKER_RATIO, d), d
 
 
+def make_tag_grid(args):
+    """A 2x2 grid of small markers -- the target that fits a flange face.
+
+    Measured 2026-08-13 with 0.2px of corner noise, 12 trials, against the
+    hand-eye solve itself:
+
+        one 27mm tag              17.2mm mean,  56.0mm worst
+        one 40mm tag               5.5mm mean,  39.0mm worst
+        one 60mm tag               4.6mm mean,  39.3mm worst
+        FOUR 20mm tags in 43mm     2.1mm mean,   4.1mm worst
+
+    So four small markers in the same footprint beat one large one twice over
+    on the mean and ten times on the worst case. The worst column is the point:
+    a single square has a two-fold pose ambiguity that occasionally resolves
+    the wrong way and throws the answer 40mm out, and neighbouring markers
+    disambiguate each other. That is why this exists rather than "print it
+    bigger" -- bigger does not fit on a flange, and would not fix the outliers
+    anyway.
+
+    Ids start at 20 so they can never collide with the 5x7 board's 0-16.
+    """
+    d = cv2.aruco.Dictionary_get(cv2.aruco.DICT_5X5_100)
+    return cv2.aruco.GridBoard_create(
+        2, 2, args.tag_mm / 1000.0, args.tag_gap_mm / 1000.0, d,
+        args.tag_first_id), d
+
+
+def cmd_make_tag(args) -> int:
+    board, _ = make_tag_grid(args)
+    span = 2 * args.tag_mm + args.tag_gap_mm
+    px = int(span * 12)
+    img = board.draw((px, px))
+    cv2.imwrite(args.make_tag, img)
+    print(f'wrote {args.make_tag}')
+    print(f'  2x2 markers, ids {args.tag_first_id}-{args.tag_first_id + 3}, '
+          f'{args.tag_mm:.0f}mm each with {args.tag_gap_mm:.0f}mm gaps')
+    print(f'  print so the WHOLE PATTERN spans {span:.0f}mm, then measure one '
+          f'black square and pass --tag-mm with what you measured')
+    print(f'  ids start at {args.tag_first_id}, so they cannot be confused '
+          'with the 5x7 board (which uses 0-16)')
+    return 0
+
+
 def cmd_measure_square(args) -> int:
     """Measure the PRINTED square with depth, instead of trusting the print.
 
@@ -451,7 +494,30 @@ def solve(args) -> int:
         if ids is None:
             continue
 
-        if args.tag_id is not None:
+        if args.tag_grid:
+            # Pose from ALL visible markers of the grid at once, which is what
+            # makes a grid better than its biggest marker: neighbours resolve
+            # each other's pose ambiguity.
+            tb, _ = make_tag_grid(args)
+            keep = [k for k, m in enumerate(ids.ravel())
+                    if args.tag_first_id <= int(m) <= args.tag_first_id + 3]
+            if len(keep) < 2:
+                continue
+            # OpenCV returns (count, rvec, tvec) here in 4.x, and writes in
+            # place in some builds. Handle both rather than assume.
+            out = cv2.aruco.estimatePoseBoard(
+                [corners[k] for k in keep],
+                np.array([[int(ids.ravel()[k])] for k in keep]),
+                tb, K, dist, np.zeros(3), np.zeros(3))
+            if isinstance(out, tuple):
+                n, rvec, tvec = out
+            else:
+                n = out
+            if n < 2:
+                continue
+            rvec = np.asarray(rvec).reshape(3)
+            tvec = np.asarray(tvec).reshape(3)
+        elif args.tag_id is not None:
             # A SINGLE marker as the target, which is what fits on a flange
             # face -- a whole ChArUco board does not. Less accurate than a
             # board (four corners rather than dozens, and its pose is more
@@ -500,7 +566,8 @@ def solve(args) -> int:
         j1.append(r['angles'][0])
         used += 1
 
-    what = f'marker {args.tag_id}' if args.tag_id is not None else 'board'
+    what = ('tag grid' if args.tag_grid else
+            f'marker {args.tag_id}' if args.tag_id is not None else 'board')
     print(f'{used} of {len(records)} captures had a usable {what} view')
     if used < 6:
         print('Not enough. The board must be visible and reasonably large in '
@@ -650,6 +717,19 @@ def main() -> int:
                     help='camera is STATIC and the board rides on the flange, '
                          'which is the case once the camera leaves the flange. '
                          'Solves camera->base instead of camera->flange.')
+    ap.add_argument('--tag-grid', action='store_true',
+                    help='target is a 2x2 GRID of small markers on the flange. '
+                         'Beats one large tag: 2.1mm mean error against 4.6mm '
+                         'for a single 60mm tag, and 4mm worst case against '
+                         '39mm, because neighbours resolve each other\'s pose '
+                         'ambiguity. Fits where a big tag does not.')
+    ap.add_argument('--make-tag', metavar='PNG', default=None,
+                    help='write the printable 2x2 tag grid and stop')
+    ap.add_argument('--tag-gap-mm', type=float, default=3.0,
+                    help='gap between markers in the grid (default 3)')
+    ap.add_argument('--tag-first-id', type=int, default=20,
+                    help='first marker id in the grid; 20+ never collides '
+                         'with the 5x7 board (default 20)')
     ap.add_argument('--tag-id', type=int, default=None,
                     help='use a SINGLE aruco marker of this id as the target '
                          'instead of the ChArUco board -- what fits on a '
@@ -679,6 +759,8 @@ def main() -> int:
                     help='camera matrix, row-major; defaults to D405 factory')
     args = ap.parse_args()
 
+    if args.make_tag:
+        return cmd_make_tag(args)
     if args.measure_square:
         return cmd_measure_square(args)
     if args.make_board:

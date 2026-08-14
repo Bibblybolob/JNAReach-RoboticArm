@@ -79,14 +79,21 @@ def _apply(T, p):
         sum(T[r][k] * p[k] for k in range(3)) + T[r][3] for r in range(3))
 
 
-def camera_to_base(p_cam, cam_to_base, joint1_deg, solved_joint1_deg=0.0):
+def camera_to_base(p_cam, cam_to_base, joint1_deg, solved_joint1_deg=0.0,
+                   moves_with_joint1=True):
     """A point in camera coords -> the arm's base frame.
 
-    `cam_to_base` is the 4x4 from `calibrate_hand_eye.py --eye-to-hand`, valid
-    at `solved_joint1_deg`. joint1 rotates the camera about the base z axis,
-    so any other pan composes as Rz(delta) in front of it.
+    `moves_with_joint1` is the mount, and getting it wrong is silent. On the
+    first arm piece, joint1 carries the camera, so a reading taken at a
+    different pan has to be rotated by Rz(delta) to compare with one taken at
+    the angle the calibration was solved at. On a FIXED STAND the camera does
+    not move at all, and applying that rotation would corrupt every reading
+    the moment the arm pans -- correct only at the one angle where delta
+    happens to be zero.
     """
     p = _apply(cam_to_base, p_cam)
+    if not moves_with_joint1:
+        return p
     d = math.radians(joint1_deg - solved_joint1_deg)
     if d == 0.0:
         return p
@@ -122,6 +129,14 @@ def target_in_base(u, v, depth_mm, intrinsics, calibration, joint1_deg):
             'solve (calibrate_hand_eye.py --eye-to-hand); a camera_to_flange '
             'transform describes a camera that is no longer on the flange.')
 
+    # The mount is recorded by the calibration that produced the transform,
+    # so a stand-mounted calibration cannot be used as if it were arm-mounted
+    # or the reverse. Default to the arm mount only when the file predates the
+    # distinction; a stand calibration always says so explicitly.
+    mount = str(calibration.get('mount', 'link1')).lower()
+    moves = 'stand' not in mount and 'static' not in mount and 'fixed' not in mount
+
     p_cam = pixel_to_camera(u, v, depth_mm, fx, fy, cx, cy)
     return camera_to_base(p_cam, T, joint1_deg,
-                          calibration.get('joint1_deg', 0.0))
+                          calibration.get('joint1_deg', 0.0),
+                          moves_with_joint1=moves)

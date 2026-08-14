@@ -242,7 +242,24 @@ def capture_poses(args) -> int:
             time.sleep(0.4)
         return None
 
-    if args.eye_to_hand:
+    if args.eye_to_hand and args.stand:
+        # A stand-mounted camera does not move with the arm at all, so
+        # nothing has to be held still and EVERY joint can vary. That matters:
+        # hand-eye is constrained by relative rotation, and freeing joint1
+        # roughly doubles the rotational spread available compared with the
+        # arm-mounted case that has to pin it.
+        poses = []
+        for pan in (-25, 0, 25):
+            for lift in (-15, 10):
+                for wrist in (-35, 0, 35):
+                    for roll in (-40, 0, 40):
+                        q = list(HOME)
+                        q[0] += pan
+                        q[1] += lift
+                        q[3] += wrist
+                        q[5] += roll
+                        poses.append(q)
+    elif args.eye_to_hand:
         # The camera rides on the first arm piece, so joint1 -- and ONLY
         # joint1 -- moves it. Hold joint1 still and the camera is a static
         # observer, which is the eye-to-hand case: the BOARD moves, on the
@@ -463,7 +480,10 @@ def solve(args) -> int:
               'the frame -- move it closer, light it better, or print bigger.')
         return 1
 
-    if args.eye_to_hand:
+    if args.eye_to_hand and args.stand:
+        print('camera is stand-mounted, so joint1 is free to vary and no '
+              'fixed-joint1 check applies')
+    elif args.eye_to_hand:
         # The failure mode unique to this mode, and it is silent. Eye-to-hand
         # assumes the camera did not move. Here the camera rides on the first
         # arm piece, so joint1 moving IS the camera moving -- and the solve
@@ -546,12 +566,19 @@ def solve(args) -> int:
         # because base->camera at any other pan is this transform composed with
         # Rz(q1 - joint1_deg) -- and a consumer that does not know the angle it
         # was solved at cannot do that composition.
-        extra = {'joint1_deg': float(np.mean(j1)),
-                 'joint1_spread_deg': j1_spread,
-                 'mount': 'first arm piece (link1); only joint1 moves it',
-                 'compose_note': (
-                     'base->camera at pan q1 = Rz(q1 - joint1_deg) @ '
-                     'camera_to_base. See docs/camera_mount.md.')}
+        if args.stand:
+            extra = {'mount': 'fixed stand; the camera does not move with '
+                              'the arm',
+                     'compose_note': ('camera_to_base is absolute -- do NOT '
+                                      'compose it with joint1. See '
+                                      'docs/camera_mount.md.')}
+        else:
+            extra = {'joint1_deg': float(np.mean(j1)),
+                     'joint1_spread_deg': j1_spread,
+                     'mount': 'first arm piece (link1); only joint1 moves it',
+                     'compose_note': (
+                         'base->camera at pan q1 = Rz(q1 - joint1_deg) @ '
+                         'camera_to_base. See docs/camera_mount.md.')}
     with open(out, 'w') as f:
         json.dump({key: X.tolist(),
                    **extra,
@@ -596,6 +623,11 @@ def main() -> int:
                     help='camera is STATIC and the board rides on the flange, '
                          'which is the case once the camera leaves the flange. '
                          'Solves camera->base instead of camera->flange.')
+    ap.add_argument('--stand', action='store_true',
+                    help='the camera is on a FIXED STAND rather than the arm. '
+                         'Frees joint1 in the pose set, drops the fixed-joint1 '
+                         'check, and records the transform as absolute so '
+                         'nothing composes it with joint1 later.')
     ap.add_argument('--fixed-joint1', type=float, default=0.0,
                     help='joint1 angle to hold throughout an eye-to-hand '
                          'capture. joint1 is the only joint that moves the '

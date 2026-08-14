@@ -135,5 +135,36 @@ p = target_in_base(K['ppx'], K['ppy'], 100.0, K,
 check('a translation-only calibration offsets the point exactly',
       near(p[0], 0.1) and near(p[1], -0.05) and near(p[2], 0.3))
 
+# --- the mount decides whether joint1 rotates the reading -----------------
+# Getting this backwards is silent and correct at exactly one pan angle. A
+# stand-mounted camera does not move with the arm, so applying the joint1
+# composition to it corrupts every reading the moment the arm turns.
+
+arm_calib = {'camera_to_base': identity(), 'joint1_deg': 0.0,
+             'mount': 'first arm piece (link1); only joint1 moves it'}
+stand_calib = {'camera_to_base': identity(), 'joint1_deg': 0.0,
+               'mount': 'fixed stand; the camera does not move with the arm'}
+
+a = target_in_base(K['ppx'] + 100, K['ppy'], 250.0, K, arm_calib, 90.0)
+s = target_in_base(K['ppx'] + 100, K['ppy'], 250.0, K, stand_calib, 90.0)
+check('an arm-mounted calibration rotates the reading with joint1',
+      abs(a[1]) > 0.01 and abs(a[0]) < 1e-9)
+check('a stand-mounted calibration does NOT', abs(s[0]) > 0.01)
+check('and the two genuinely differ at a non-zero pan',
+      any(abs(x - y) > 0.01 for x, y in zip(a, s)))
+
+# At zero pan there is nothing to rotate, so both must agree -- which is
+# exactly why a wrong mount passes an inattentive test.
+a0 = target_in_base(K['ppx'] + 100, K['ppy'], 250.0, K, arm_calib, 0.0)
+s0 = target_in_base(K['ppx'] + 100, K['ppy'], 250.0, K, stand_calib, 0.0)
+check('at zero pan the mount cannot be told apart (the trap)',
+      all(abs(x - y) < 1e-12 for x, y in zip(a0, s0)))
+
+# A file with no mount recorded predates the distinction and is arm-mounted.
+legacy = {'camera_to_base': identity(), 'joint1_deg': 0.0}
+lg = target_in_base(K['ppx'] + 100, K['ppy'], 250.0, K, legacy, 90.0)
+check('a calibration with no mount recorded is treated as arm-mounted',
+      all(abs(x - y) < 1e-12 for x, y in zip(lg, a)))
+
 print(f'\n{PASS} passed' + (f', {FAIL} FAILED' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

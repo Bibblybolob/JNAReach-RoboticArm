@@ -44,6 +44,21 @@ degrees  [0.0, 90.0, -90.0, 0.0, 0.0, 0.0]
 radians  [0.0, 1.5708, -1.5708, 0.0, 0.0, 0.0]
 ```
 
+## The FK chain checked against a ruler, 2026-08-13
+
+At all-zeros the chain in `collision_guard.py` predicts the flange frame
+**418mm above the mounting face**, 78mm out from the base axis. Measured with
+a ruler: **418mm**.
+
+Small check, load-bearing conclusion. Inverse kinematics, the collision guard
+and the touch calibration all reason from that chain, and nothing had ever
+compared it to the physical arm — a systematic error in it would have been
+invisible in every test, because the tests check the chain against itself.
+
+It also settles `--tool-offset-mm` for `calibrate_touch.py`: the flange FRAME
+sits on the flange FACE, so touching with a bare flange is an offset of
+**0**, and that is the default.
+
 ## all-zeros
 
 Every joint on its notch. This is the calibration reference pose — use it to

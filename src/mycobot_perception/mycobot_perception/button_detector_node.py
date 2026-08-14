@@ -66,7 +66,22 @@ class ButtonDetectorNode(Node):
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('show_window', True)
         self.declare_parameter('window_name', 'Button Detection')
-        self.declare_parameter('device', 'cuda:0')
+        # CPU, because the GPU path does not work on this board -- measured
+        # 2026-08-14, not assumed:
+        #
+        #   RuntimeError: cuDNN error: CUDNN_STATUS_EXECUTION_FAILED_CUDART
+        #
+        # The trap is that every check short of running inference says the GPU
+        # is fine. torch.cuda.is_available() returns True, the device reports
+        # as Orin, torch.version.cuda is 12.6 and cuDNN reports 9.2.4. It
+        # fails on the first conv, at kernel execution. So do NOT re-enable
+        # this on the strength of is_available() -- run a real forward pass.
+        #
+        # CPU measures ~2450ms/frame here, which is far too slow for the servo
+        # loop and fine for single-shot use. Restoring the GPU is worth real
+        # effort; TensorRT via elevator_buttons.engine is the other route, and
+        # that engine already exists.
+        self.declare_parameter('device', 'cpu')
 
         image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         model_path = self.get_parameter('model_path').get_parameter_value().string_value

@@ -73,6 +73,36 @@ enough to ignore for a pan-only loop; it is not ignorable if a second axis is
 ever added, since roll cross-couples the axes and no per-axis scalar corrects
 for it.
 
+## The board is printed at 39mm, not 30mm — and depth is what found it
+
+Measured 2026-08-13, and it invalidates the existing `~/hand_eye/hand_eye.json`.
+
+Two independent ways of locating the same 22 ChArUco corners disagreed by
+**30%**: colour geometry put the board at 215mm, depth at 280mm. Depth was
+right. Measuring adjacent corner spacings directly gives **38.99mm against the
+30mm the script assumed** — 34 spacings, 0.57mm spread. A printer "fit to
+page", almost certainly.
+
+Depth is believable here for reasons that do not depend on the board:
+
+- `depth_scale` reads 0.1mm/unit, exactly as documented for a D405
+- it reconstructs a known-flat board flat to **1.31mm rms** at that range
+- 34 independent spacings agree to 0.57mm
+
+**Nothing in the colour-only path can catch this**, and that is the lesson
+worth keeping. The board's pose is solved *from* the assumed square size, so a
+wrong size produces a wrong range that is perfectly self-consistent. All four
+solvers agreed to 1mm — because all four were handed the same wrong number.
+Solver agreement measures agreement, not accuracy, and the previous
+calibration's "±8mm between runs" was measuring run-to-run noise sitting on
+top of a 30% scale error nobody was looking for.
+
+The colour geometry's own flatness figure, 0.00mm rms, is tautological: those
+corners are coplanar by construction. It is not evidence of anything.
+
+`--measure-square` now does this measurement in one command. Run it once per
+printed board and pass the result to `--square-mm`.
+
 ## Consequences
 
 - **Hand-eye calibration is degenerate, not merely stale.** `AX=XB` needs

@@ -448,16 +448,42 @@ def solve(args) -> int:
             continue
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = cv2.aruco.detectMarkers(gray, adict)
-        if ids is None or len(ids) < 4:
+        if ids is None:
             continue
-        n, ch_c, ch_i = cv2.aruco.interpolateCornersCharuco(
-            corners, ids, gray, board)
-        if n is None or n < 6:
-            continue
-        ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-            ch_c, ch_i, board, K, dist, None, None)
-        if not ok:
-            continue
+
+        if args.tag_id is not None:
+            # A SINGLE marker as the target, which is what fits on a flange
+            # face -- a whole ChArUco board does not. Less accurate than a
+            # board (four corners rather than dozens, and its pose is more
+            # sensitive to corner noise the more square-on it is), but it is
+            # what can physically be mounted, and the solver disagreement
+            # check will say if that accuracy is not enough.
+            hit = [k for k, m in enumerate(ids.ravel())
+                   if int(m) == args.tag_id]
+            if not hit:
+                continue
+            if len(hit) > 1:
+                # The same id twice means the tag shares an id with something
+                # else in view, and there is no way to tell which is the
+                # flange. Refusing beats picking one.
+                print(f'  {os.path.basename(r["image"])}: marker '
+                      f'{args.tag_id} appears {len(hit)} times -- ambiguous, '
+                      'skipped')
+                continue
+            rv, tv, _ = cv2.aruco.estimatePoseSingleMarkers(
+                [corners[hit[0]]], args.tag_mm / 1000.0, K, dist)
+            rvec, tvec = rv[0][0], tv[0][0]
+        else:
+            if len(ids) < 4:
+                continue
+            n, ch_c, ch_i = cv2.aruco.interpolateCornersCharuco(
+                corners, ids, gray, board)
+            if n is None or n < 6:
+                continue
+            ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
+                ch_c, ch_i, board, K, dist, None, None)
+            if not ok:
+                continue
         T = np.array(flange_transform(r['angles']))
         if args.eye_to_hand:
             # Same solver, transforms inverted. cv2.calibrateHandEye solves
@@ -474,7 +500,8 @@ def solve(args) -> int:
         j1.append(r['angles'][0])
         used += 1
 
-    print(f'{used} of {len(records)} captures had a usable board view')
+    what = f'marker {args.tag_id}' if args.tag_id is not None else 'board'
+    print(f'{used} of {len(records)} captures had a usable {what} view')
     if used < 6:
         print('Not enough. The board must be visible and reasonably large in '
               'the frame -- move it closer, light it better, or print bigger.')
@@ -623,6 +650,14 @@ def main() -> int:
                     help='camera is STATIC and the board rides on the flange, '
                          'which is the case once the camera leaves the flange. '
                          'Solves camera->base instead of camera->flange.')
+    ap.add_argument('--tag-id', type=int, default=None,
+                    help='use a SINGLE aruco marker of this id as the target '
+                         'instead of the ChArUco board -- what fits on a '
+                         'flange face. Give --tag-mm as well.')
+    ap.add_argument('--tag-mm', type=float, default=27.0,
+                    help='the printed side of that marker, measured across '
+                         'the BLACK SQUARE only, not the white surround. '
+                         'Scale here is scale in the answer.')
     ap.add_argument('--stand', action='store_true',
                     help='the camera is on a FIXED STAND rather than the arm. '
                          'Frees joint1 in the pose set, drops the fixed-joint1 '

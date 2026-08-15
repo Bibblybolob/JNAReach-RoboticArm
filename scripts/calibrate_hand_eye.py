@@ -110,6 +110,29 @@ def make_tag_grid(args):
         args.tag_first_id), d
 
 
+def detect_target(img, args):
+    """Is the configured target in this frame? Returns (found, how many).
+
+    Deliberately looser than the solve's own test -- it answers "is the thing
+    there at all", not "is this capture good enough to fit". Used to check
+    before a sweep starts rather than discovering it 12 minutes later.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, ids, _ = cv2.aruco.detectMarkers(gray, cv2.aruco.Dictionary_get(
+        cv2.aruco.DICT_5X5_100))
+    if ids is None:
+        return False, 0
+    seen = [int(m) for m in ids.ravel()]
+    if args.tag_grid:
+        n = sum(1 for m in seen
+                if args.tag_first_id <= m <= args.tag_first_id + 3)
+        return n >= 2, n
+    if args.tag_id is not None:
+        n = seen.count(args.tag_id)
+        return n == 1, n
+    return len(seen) >= 4, len(seen)
+
+
 def cmd_make_tag(args) -> int:
     board, _ = make_tag_grid(args)
     span = 2 * args.tag_mm + args.tag_gap_mm
@@ -258,7 +281,7 @@ def capture_poses(args) -> int:
     """Move through the pose set, recording image + joint angles at each."""
     import time
     import pyrealsense2 as rs
-    from arm_broker import request
+    from arm_broker import blank_flange_led, request
 
     guard = CollisionGuard()
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -391,10 +414,42 @@ def capture_poses(args) -> int:
              'force': True}, timeout=25)
     time.sleep(6.0)
 
+    if not args.keep_led:
+        # The LED is a light source aimed at the camera, and auto-exposure
+        # answers it by darkening everything else -- including a paper target.
+        if blank_flange_led():
+            print('flange LED blanked for the sweep')
+        else:
+            print('could not blank the flange LED (broker refused the write)')
+        print('  set_color cannot draw a pattern, only a solid colour, so '
+              'this does NOT restore itself -- redraw the marker with '
+              'whatever renders it. --keep-led skips this.')
+
     pipe = rs.pipeline()
     cfg = rs.config()
     cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     pipe.start(cfg)
+
+    # Look before moving. A sweep costs ~12 minutes of arm time and reports
+    # nothing until the solve, so a target that is not there at pose 0 is
+    # worth catching now. It is the specific risk of blanking the LED: if the
+    # marker was being DISPLAYED on the flange panel, turning it off removed
+    # the very thing being calibrated against.
+    for _ in range(30):
+        frames = pipe.wait_for_frames()
+    probe = np.asanyarray(frames.get_color_frame().get_data())
+    seen, _ = detect_target(probe, args)
+    if not seen:
+        pipe.stop()
+        print('\nThe target is not visible from the home pose, so the sweep '
+              'would collect nothing.')
+        if not args.keep_led:
+            print('The LED was just blanked. If the marker is DISPLAYED on '
+                  'the flange panel rather than printed, that is what removed '
+                  'it -- rerun with --keep-led, or mount the printed target.')
+        else:
+            print('Check the target is in view and lit well enough to detect.')
+        return 1
     records = []
     consecutive_failures = 0
     last_cmd = list(HOME)
@@ -751,6 +806,14 @@ def main() -> int:
                     help='record commanded instead of measured joint angles. '
                          'For when writes land but reads do not. Costs ~4mm '
                          'of accuracy; redo properly when reads recover')
+    ap.add_argument('--keep-led', action='store_true',
+                    help='leave the flange LED alone. Needed when the marker '
+                         'is DISPLAYED on the flange panel rather than '
+                         'printed, since blanking it removes the target. '
+                         'Otherwise the LED is turned off for the sweep: it '
+                         'is a light source facing the camera, and '
+                         'auto-exposure answering it darkens a printed '
+                         'target.')
     ap.add_argument('--min-link', type=float, default=0.6,
                     help='refuse to collect below this link reliability; '
                          'calibrating on unreliable readings produces a '

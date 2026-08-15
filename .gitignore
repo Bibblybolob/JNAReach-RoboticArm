@@ -64,3 +64,6 @@ runs_panel/
 yolo11*.pt
 yolo26*.pt
 yolov8*.pt
+
+# CLIP weights, fetched on demand by YOLO-World (338MB)
+weights/

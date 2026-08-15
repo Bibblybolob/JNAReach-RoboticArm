@@ -859,6 +859,34 @@ def request(obj, timeout: float = 5.0, sock_path: str = SOCK_PATH):
         s.close()
 
 
+def blank_flange_led(timeout: float = 10.0, sock_path: str = SOCK_PATH):
+    """Turn the Atom's LED off, and say whether the write landed.
+
+    Wanted during calibration because the panel on the flange is a light
+    SOURCE pointed at the camera. It drags auto-exposure down, and on this
+    rig auto-exposure is a bigger lever than it looks -- measured elsewhere as
+    10.2 vs 30.2 fps on the same camera. A printed target photographed next to
+    a lit panel is the darker for it.
+
+    NOT claimed: that the glow biases the detected corners. When the marker is
+    displayed on the LED matrix, the outer boundary the detector corners on is
+    the BEZEL against the white flange -- a physical, non-emissive edge. Bloom
+    costs data-cell legibility, not corner position.
+
+    ONE WAY, and callers must say so. `set_color` sets a single solid colour,
+    so this can blank a pattern but cannot restore one. Whatever draws the
+    marker has to redraw it.
+
+    Returns True if the broker accepted the write. That is not proof the LED
+    changed -- pymycobot returns -1 for things that worked -- so the honest
+    check is to look at the camera, which is what the calibration scripts do
+    before committing to a sweep.
+    """
+    r = request({'cmd': 'call', 'method': 'set_color',
+                 'args': [0, 0, 0]}, timeout=timeout, sock_path=sock_path)
+    return bool(r and r.get('ok'))
+
+
 class BrokerMyCobot:
     """Quacks like a pymycobot MyCobot, but goes through the broker.
 

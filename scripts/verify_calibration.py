@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 import cv2  # noqa: E402
 
-from arm_broker import request  # noqa: E402
+from arm_broker import blank_flange_led, request  # noqa: E402
 from mycobot_driver.collision_guard import (  # noqa: E402
     CollisionGuard, flange_transform,
 )
@@ -80,6 +80,12 @@ def main() -> int:
     ap.add_argument('--tag-id', type=int, default=2)
     ap.add_argument('--tag-mm', type=float, default=27.0)
     ap.add_argument('--speed', type=int, default=30)
+    ap.add_argument('--keep-led', action='store_true',
+                    help='leave the flange LED alone. Needed when the marker '
+                         'is DISPLAYED on the flange panel, since blanking it '
+                         'removes the tag this check measures. Otherwise the '
+                         'LED is turned off, to match the conditions the '
+                         'calibration was collected under.')
     ap.add_argument('--contact-sheet',
                     default=os.path.join(OUT_DIR, 'verify_sheet.png'),
                     help='one tiled image of every pose the arm visited, with '
@@ -113,6 +119,17 @@ def main() -> int:
         if guard.check(q)[0]:
             poses.append(q)
 
+    if not args.keep_led:
+        # Verify under the same lighting the calibration was collected under.
+        # A transform fitted with the LED dark and checked with it lit is
+        # being asked a slightly different question.
+        if blank_flange_led():
+            print('flange LED blanked for the check')
+        else:
+            print('could not blank the flange LED (broker refused the write)')
+        print('  set_color draws only a solid colour, so this does not '
+              'restore itself. --keep-led skips it.\n')
+
     pipe = rs.pipeline()
     cfg = rs.config()
     cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
@@ -129,6 +146,24 @@ def main() -> int:
     try:
         for _ in range(40):
             pipe.wait_for_frames(10000)
+
+        # Look before moving. Every pose here is a move plus a 6s settle, so
+        # a tag that is not there at all is worth catching before spending
+        # them. It is the specific risk of blanking the LED: a marker that
+        # was DISPLAYED on the flange panel is gone the moment it goes dark.
+        probe = np.asanyarray(
+            pipe.wait_for_frames(10000).get_color_frame().get_data())
+        _, pids, _ = cv2.aruco.detectMarkers(
+            cv2.cvtColor(probe, cv2.COLOR_BGR2GRAY), adict)
+        if pids is None or args.tag_id not in [int(x) for x in pids.ravel()]:
+            print(f'tag {args.tag_id} is not visible from the starting pose, '
+                  'so this check would measure nothing.')
+            if not args.keep_led:
+                print('The LED was just blanked. If the marker is DISPLAYED '
+                      'on the flange panel rather than printed, that removed '
+                      'it -- rerun with --keep-led.')
+            return 1
+
         print(f"{'pose':>5s} {'tag in flange frame (mm), from image':>38s}"
               f" {'from depth':>22s}")
         for k, q in enumerate(poses):

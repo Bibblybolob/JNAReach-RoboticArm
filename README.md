@@ -70,6 +70,94 @@ gain will.
 
 ---
 
+## Move the arm from a terminal
+
+These go through `scripts/arm_broker.py`, not ROS, so they work with the stack
+down. **The broker must be running** — it owns `/dev/ttyTHS1`, and two writers
+on one tty produce a length field that does not match its payload, which the
+Atom reports as a firmware crash:
+
+```bash
+python3 scripts/arm_broker.py
+```
+
+```bash
+./scripts/jog_joints.py
+```
+
+One joint at a time: `2 +5` moves joint2 by 5°, `2 =90` drives it to 90°, `p`
+prints the pose, `r` releases the servos — **the arm will sag, hold it.**
+
+```bash
+./scripts/park_arm.py
+```
+
+Parks at the least-loaded pose. This is a real diagnostic step rather than
+tidying up: unloading the arm alone took valid replies from 18% to 96% on
+2026-08-12, with no reflash and no power cycle.
+
+---
+
+## Press a button
+
+```bash
+./scripts/press_button.py --look        # detect only, no motion
+./scripts/press_button.py 5 --dry-run   # plan and print, command nothing
+./scripts/press_button.py 5             # standoff, touch, retract, park
+```
+
+The whole chain in one command:
+
+```
+keypad_finder -> depth -> target_in_base -> plan_press -> send_angles
+```
+
+Every stage **refuses rather than guessing**, because each can produce a
+confident wrong answer that ends with the arm driving somewhere real. The
+finder rejects a frame whose row count does not match the panel layout, since
+a missed row shifts every number and presses the wrong floor; `target_in_base`
+rejects a depth outside the D405's usable band; `plan_press` rejects a
+standoff/touch pair that changes arm configuration, which would swing the arm
+through the panel on the way. A refusal costs a retry, never a wrong button.
+
+**Detection is geometric — no model.** `elevator_buttons.pt` cannot see this
+panel at all: measured 2026-08-14, zero detections at the 0.5 threshold and
+nothing above 0.12 even at 0.05, and it has no class above `button-3` against
+a 12-floor keypad. YOLO-World zero-shot found nothing either. So
+`keypad_finder.py` uses the geometry instead — equal-sized ellipses on a
+lattice — and gets all twelve at **10/12 frames, ~400ms, 0.26px jitter**.
+
+**Resolution is load-bearing.** 1280×720 is the default because at 640×480 the
+buttons are r≈12px and rows drop out: **10/12 frames against 2/6.**
+
+### Two limits, both printed rather than hidden
+
+- **`--tool-mm` defaults to 0**, so the *flange origin* is driven onto the
+  button and anything protruding past it contacts off by that much — measured
+  ~13mm on the first presses. Pass the real number once measured.
+- **The tool cannot generally be held square to the panel.** Exact aim costs
+  ~25mm of position at most placements, with no joint at a limit — it is
+  dexterity, not limits. The planner aims as squarely as the arm allows while
+  still hitting the button, and prints what it got (~21° is typical, against
+  70° when orientation was left unconstrained).
+
+**Where a square press is actually possible**, position error while holding
+the tool exactly on the panel normal:
+
+| button height | 120mm | 150mm | 180mm | 210mm | 240mm |
+|---|---|---|---|---|---|
+| 150mm | **0.0** | **0.0** | 24.9 | 53.1 | 72.4 |
+| 200mm | **0.0** | 21.4 | 46.7 | 72.8 | 99.5 |
+
+So put the panel **120–150mm away with the buttons 150–200mm up**. Further out
+the script will plan a standoff the arm cannot reach and refuse — which is
+what it should do.
+
+Needs a verified calibration at `~/hand_eye/eye_to_hand.json`; see
+`calibrate_hand_eye.py` and `verify_calibration.py`.
+
+---
+
 ## Check the link if the arm misbehaves
 
 The protocol has **no checksum** — a flipped bit in a joint angle is not a
@@ -338,8 +426,9 @@ boards float and the arm reads nothing.
 
 ## Known-unfinished
 
-- `speed_at_100_deg_s: 120.0` in the driver is an unmeasured guess.
-  `scripts/measure_arm.py` exists to measure it and has never been run.
+- ~~`speed_at_100_deg_s` is an unmeasured guess~~ — measured 2026-08-01 and
+  now 52.0. Re-measure after any payload change with `scripts/measure_arm.py`.
+- The up/down call buttons are not detected yet; only the 12 numbered ones are.
 - The home pose is defined in five places that must agree.
 - `obstacles.yaml` is empty; `src/mycobot_bringup/config/network.yaml` is read
   by nothing and disagrees with the defaults.

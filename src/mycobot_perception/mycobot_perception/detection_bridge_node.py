@@ -82,8 +82,14 @@ class DetectionBridgeNode(Node):
         # confident wrong point that something downstream would drive to.
         self.declare_parameter('base_output_topic', '/button/point_base')
         self.declare_parameter('camera_info_topic', '/camera/camera_info')
+        # Where the calibration scripts actually WRITE. This used to default to
+        # ~/mycobot_project/calibration/, a directory nothing creates and
+        # nothing writes to, so a perfectly good calibration would still leave
+        # this topic silent -- and the message says "no calibration", which
+        # reads as "it was never run" rather than "it is not here".
+        # calibrate_hand_eye.py and verify_calibration.py both use ~/hand_eye.
         self.declare_parameter('calibration_path',
-                               '~/mycobot_project/calibration/eye_to_hand.json')
+                               '~/hand_eye/eye_to_hand.json')
         self.declare_parameter('base_frame', 'base_link')
         # Which joint pans the camera. joint1 for the first-arm-piece mount;
         # a parameter rather than a constant so remounting is a config change.

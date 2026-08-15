@@ -62,26 +62,37 @@ class ButtonDetectorNode(Node):
         super().__init__('button_detector_node')
 
         self.declare_parameter('image_topic', '/camera/image_raw')
-        self.declare_parameter('model_path', 'elevator_buttons.pt')
+        # TensorRT, because it is the only GPU path that runs on this board.
+        # Measured back to back 2026-08-14 on one frame, median of 6:
+        #
+        #   elevator_buttons.pt  on cpu    535.9ms   works
+        #   elevator_buttons.pt  on cuda        -    cuDNN error:
+        #                                            CUDNN_STATUS_EXECUTION_FAILED_CUDART
+        #   elevator_buttons.engine (TRT)   18.7ms   works
+        #
+        # So the PyTorch CUDA path is genuinely broken and the earlier note
+        # about it was right -- but TensorRT does not go through cuDNN, and it
+        # is 28x faster than the CPU fallback. The engine had been sitting in
+        # the repo unused since 2026-08-11.
+        #
+        # The trap that note recorded still stands: every check short of a real
+        # forward pass says the GPU is fine. torch.cuda.is_available() returns
+        # True, the device reports as Orin, torch.version.cuda is 12.6, cuDNN
+        # reports 9.2.4, and a bare torch conv on CUDA now succeeds. It is
+        # Ultralytics' .pt path that fails, at kernel execution. So do NOT
+        # switch model_path back to .pt on device=0 without RUNNING it.
+        #
+        # Falls back to the .pt on CPU if the engine is missing, since the
+        # engine is built for this specific board and does not travel.
+        self.declare_parameter('model_path', 'elevator_buttons.engine')
+        self.declare_parameter('fallback_model_path', 'elevator_buttons.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('show_window', True)
         self.declare_parameter('window_name', 'Button Detection')
-        # CPU, because the GPU path does not work on this board -- measured
-        # 2026-08-14, not assumed:
-        #
-        #   RuntimeError: cuDNN error: CUDNN_STATUS_EXECUTION_FAILED_CUDART
-        #
-        # The trap is that every check short of running inference says the GPU
-        # is fine. torch.cuda.is_available() returns True, the device reports
-        # as Orin, torch.version.cuda is 12.6 and cuDNN reports 9.2.4. It
-        # fails on the first conv, at kernel execution. So do NOT re-enable
-        # this on the strength of is_available() -- run a real forward pass.
-        #
-        # CPU measures ~2450ms/frame here, which is far too slow for the servo
-        # loop and fine for single-shot use. Restoring the GPU is worth real
-        # effort; TensorRT via elevator_buttons.engine is the other route, and
-        # that engine already exists.
-        self.declare_parameter('device', 'cpu')
+        # A STRING, because it is read with .string_value below and because
+        # ultralytics accepts '0' and 'cpu' alike. Declaring it as an int here
+        # makes that read return '' and the device silently wrong.
+        self.declare_parameter('device', '0')
 
         image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
@@ -92,8 +103,24 @@ class ButtonDetectorNode(Node):
 
         self._bridge = CvBridge()
 
-        self.get_logger().info(f'Loading model: {model_path} (device={self._device})')
-        self._model = YOLO(model_path)
+        # A TensorRT engine is built for the board it was built on, so a
+        # missing or unloadable one is an expected case rather than a crash --
+        # fall back to the portable .pt on CPU and SAY which is running, since
+        # a 29x speed difference that is not announced gets diagnosed as
+        # something else entirely.
+        fallback = self.get_parameter(
+            'fallback_model_path').get_parameter_value().string_value
+        try:
+            self.get_logger().info(
+                f'Loading model: {model_path} (device={self._device})')
+            self._model = YOLO(model_path, task='detect')
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warning(
+                f'{model_path} would not load ({e}); falling back to '
+                f'{fallback} on CPU. Expect ~536ms/frame against ~19ms -- '
+                'rebuild the engine for this board to get it back.')
+            self._model = YOLO(fallback, task='detect')
+            self._device = 'cpu'
         self._class_names = self._model.names
 
         # BEST_EFFORT + depth 1 = latest-frame-wins, drop stale frames.

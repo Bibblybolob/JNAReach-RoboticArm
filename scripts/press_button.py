@@ -116,6 +116,14 @@ def main() -> int:
                     help='flange origin to the contact face, in mm. 0 drives '
                          'the ORIGIN onto the button, which lands short or '
                          'long by whatever sticks out past it')
+    ap.add_argument('--no-aim', action='store_true',
+                    help='do not constrain the tool direction. With no tool '
+                         'fitted this is usually what you want: aiming points '
+                         'the (empty) tool axis at the panel and leaves no '
+                         'metal at the button, which looks like the arm '
+                         'stopping short. Unconstrained, the wrist falls where '
+                         'the body can actually reach and contact happens -- '
+                         'off-centre, but it happens.')
     ap.add_argument('--standoff-mm', type=float, default=40.0)
     ap.add_argument('--speed', type=int, default=20)
     ap.add_argument('--width', type=int, default=1280)
@@ -213,7 +221,8 @@ def main() -> int:
         plan = reach_planner.plan_press(
             p, tool_length_m=args.tool_mm / 1000.0,
             standoff_m=args.standoff_mm / 1000.0, guard=guard,
-            approach_dir=approach, panel=panel)
+            approach_dir=approach, panel=panel,
+            orientation=False if args.no_aim else 'auto')
     except reach_planner.ReachError as e:
         print(f'refused: {e}')
         return 1

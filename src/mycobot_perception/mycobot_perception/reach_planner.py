@@ -136,7 +136,7 @@ def approach_rotation(approach_dir, seed_R=None, tool_axis=TOOL_AXIS):
     return np.eye(3) + Kx + Kx @ Kx * ((1 - c) / (sv ** 2))
 
 
-def panel_clearance(angles_deg, panel_point, panel_normal, ignore_m=0.06):
+def panel_clearance(angles_deg, panel_point, panel_normal, ignore_m=0.09):
     """How far the ARM BODY stays off the panel, in metres. Negative = through.
 
     The missing constraint, and the one that produced the actual failure: the
@@ -153,6 +153,16 @@ def panel_clearance(angles_deg, panel_point, panel_normal, ignore_m=0.06):
 
     Points within `ignore_m` of the flange are skipped: that is the part MEANT
     to touch the panel, and including it would reject every press.
+
+    `ignore_m` is 90mm because that is how far the flange head's own material
+    reaches -- measured 2026-08-15, the arm's surface around the origin sits
+    41-75mm from it. At 60mm the contact surface itself was being counted as a
+    collision, so the planner held the whole arm 57mm off the panel and
+    NOTHING touched: the flange origin landed on the button while the metal
+    stopped short. That presented as "way too far from the button".
+
+    It still catches what it is for. The forearm intrusion this was written
+    against was 152mm from the flange origin, well outside 90mm.
     """
     from mycobot_driver.collision_guard import joint_points, _sampled
     import numpy as np

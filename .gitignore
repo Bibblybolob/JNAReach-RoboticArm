@@ -67,3 +67,8 @@ yolov8*.pt
 
 # CLIP weights, fetched on demand by YOLO-World (338MB)
 weights/
+
+# Training runs and exported engines: gigabytes, and an engine is built
+# for one board and does not travel (see scripts/export_button_engine.py).
+runs_buttons/
+*.engine

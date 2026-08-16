@@ -2,7 +2,8 @@
 ROS 2 elevator-button-detection node for myCobot 280.
 
 Subscribes to a sensor_msgs/Image stream (default: /camera/image_raw), runs
-inference with a trained YOLOv11n model, and publishes:
+TWO-STAGE inference -- find the buttons, then read their legends -- and
+publishes:
 
   1. A CV2 window with bboxes + labels (for humans).
   2. The annotated frame on /perception/button_detections/image
@@ -11,8 +12,38 @@ inference with a trained YOLOv11n model, and publishes:
      vision_msgs/Detection2DArray (for downstream targeting/pressing logic).
 
 No class filtering is applied -- every detection the model produces is
-published. The model's own class names (e.g. "3", "lobby", "open") go into
-`hypothesis.hypothesis.class_id`.
+published, including the ones the arm must never press, because "there is a
+key switch here" is information the caller needs rather than noise.
+
+Two stages, and why
+-------------------
+  Stage A  a 9-class detector: up, down, floor, open, close, help, stop,
+           keyhole, other. Every class has hundreds to thousands of training
+           examples.
+  Stage B  a classifier over the crop of each `floor` box, which says WHICH
+           floor: 0-36, B, B1, B2, B3, G, L, LG, M, CH, -1, or `unreadable`.
+
+The single-stage version this replaces gave the detector one class per floor
+and stopped at button-10, which fails against a real elevator in both
+directions -- a building with a 14th floor had it called background, and the
+top of the range never had the examples to be learned. It also had no `up` and
+no `down` class at all, which are the two highest-priority buttons in the
+project. See button_classes.py for the measured counts behind all of that.
+
+What lands in `hypothesis.hypothesis.class_id` is what a caller would
+naturally ask for: `up`, `down`, `help`, or a bare legend like `7` / `B1` /
+`G`. detection_bridge_node matches `target_label` against exactly that string,
+so `target_label:=up` and `target_label:=7` both work.
+
+**A floor whose legend was not read confidently publishes as `floor`.** That
+is a deliberate refusal, not a fallback: the button stays visible, but
+`target_label:=7` will not match it, so the arm cannot press it believing it
+is 7. Pressing the wrong floor is the failure this pipeline is built to avoid,
+and an unread button costs a retry while a misread one costs a trip to the
+wrong storey with nothing in the logs to say it happened.
+
+The reader is optional. If it will not load, floor buttons are still detected
+and published as `floor` -- the arm loses the number, not the panel.
 
 Design notes
 ------------
@@ -55,6 +86,9 @@ from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithP
 
 from ultralytics import YOLO
 
+from mycobot_perception.button_classes import (
+    FORBIDDEN, PRESSABLE, UNREADABLE)
+
 
 class ButtonDetectorNode(Node):
 
@@ -84,9 +118,38 @@ class ButtonDetectorNode(Node):
         #
         # Falls back to the .pt on CPU if the engine is missing, since the
         # engine is built for this specific board and does not travel.
-        self.declare_parameter('model_path', 'elevator_buttons.engine')
-        self.declare_parameter('fallback_model_path', 'elevator_buttons.pt')
+        self.declare_parameter('model_path', 'button_detect.engine')
+        self.declare_parameter('fallback_model_path', 'button_detect.pt')
         self.declare_parameter('confidence_threshold', 0.5)
+
+        # --- stage B: reading the floor legend off the crop ----------------
+        #
+        # Stage A says `floor`; this says WHICH floor. Split in two because
+        # the detector's per-class support collapses down the floor range
+        # (1200 examples of floor 2, 55 of floor 33) while a classifier on an
+        # already-centred 128px crop sees the numeral an order of magnitude
+        # larger. See scripts/train_button_reader.py.
+        #
+        # Optional by construction: if the reader will not load, every floor
+        # button still DETECTS, it just publishes as the generic `floor`
+        # instead of `7`. Losing the number degrades the arm to "I can see a
+        # button", which is recoverable; a node that refuses to start is not.
+        self.declare_parameter('reader_model_path', 'button_read.engine')
+        self.declare_parameter('reader_fallback_path', 'button_read.pt')
+        self.declare_parameter('read_legends', True)
+        # Below this the legend is NOT published, and the button reports as
+        # `floor` rather than a guess. Set high on purpose: the failure this
+        # project cares about is pressing the WRONG floor, and an unread
+        # button costs a retry while a misread one costs a trip to the wrong
+        # storey with nothing in the logs to say so. 6/9 is the confusion
+        # that actually happens -- they are a 180-degree rotation apart.
+        self.declare_parameter('reader_min_confidence', 0.75)
+        # Fraction of box size added around each crop before reading, so the
+        # reader sees the button rim rather than a tight numeral. MUST match
+        # --crop-pad in scripts/build_button_dataset.py (0.12): a classifier
+        # fed a tighter or looser crop than it trained on loses accuracy for
+        # no visible reason.
+        self.declare_parameter('reader_crop_pad', 0.12)
         self.declare_parameter('show_window', True)
         self.declare_parameter('window_name', 'Button Detection')
         # A STRING, because it is read with .string_value below and because
@@ -123,6 +186,15 @@ class ButtonDetectorNode(Node):
             self._device = 'cpu'
         self._class_names = self._model.names
 
+        self._reader = None
+        self._reader_names: dict[int, str] = {}
+        self._read_min = self.get_parameter(
+            'reader_min_confidence').get_parameter_value().double_value
+        self._crop_pad = self.get_parameter(
+            'reader_crop_pad').get_parameter_value().double_value
+        if self.get_parameter('read_legends').get_parameter_value().bool_value:
+            self._load_reader()
+
         # BEST_EFFORT + depth 1 = latest-frame-wins, drop stale frames.
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -141,6 +213,86 @@ class ButtonDetectorNode(Node):
         )
 
         self.get_logger().info(f'Subscribed to {image_topic}, ready for inference')
+
+    def _load_reader(self) -> None:
+        """Load the legend classifier. Never fatal -- see the parameter note."""
+        path = self.get_parameter(
+            'reader_model_path').get_parameter_value().string_value
+        fallback = self.get_parameter(
+            'reader_fallback_path').get_parameter_value().string_value
+        for cand in (path, fallback):
+            if not cand:
+                continue
+            try:
+                self._reader = YOLO(cand, task='classify')
+                self._reader_names = self._reader.names
+                self.get_logger().info(
+                    f'Legend reader: {cand} ({len(self._reader_names)} '
+                    f'legends, min confidence {self._read_min:.2f})')
+                return
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warning(f'reader {cand} would not load ({e})')
+        self.get_logger().warning(
+            'No legend reader loaded. Floor buttons will still be DETECTED '
+            'and published as the generic class `floor`, but not numbered -- '
+            'so target_label:=7 will match nothing while target_label:=up '
+            'still works. Train one with scripts/train_button_reader.py.')
+
+    def _read_legends(self, frame: np.ndarray, boxes: list) -> list:
+        """Classify each floor crop. Returns a legend (or None) per box.
+
+        Batched in one call: a panel has a dozen floor buttons and running
+        them one at a time would pay the per-inference overhead a dozen
+        times over for crops that are 128px each.
+        """
+        out: list = [None] * len(boxes)
+        if self._reader is None or not boxes:
+            return out
+
+        H, W = frame.shape[:2]
+        crops, idx = [], []
+        for i, (x1, y1, x2, y2, kind) in enumerate(boxes):
+            if kind != 'floor':
+                continue
+            pw = (x2 - x1) * self._crop_pad
+            ph = (y2 - y1) * self._crop_pad
+            cx1 = int(max(0, x1 - pw))
+            cy1 = int(max(0, y1 - ph))
+            cx2 = int(min(W, x2 + pw))
+            cy2 = int(min(H, y2 + ph))
+            if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+                continue
+            crop = frame[cy1:cy2, cx1:cx2]
+            if crop.size:
+                crops.append(crop)
+                idx.append(i)
+
+        if not crops:
+            return out
+
+        try:
+            results = self._reader.predict(crops, device=self._device,
+                                           verbose=False)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f'legend reader failed: {e}')
+            return out
+
+        for i, res in zip(idx, results):
+            probs = getattr(res, 'probs', None)
+            if probs is None:
+                continue
+            conf = float(probs.top1conf)
+            name = self._reader_names.get(int(probs.top1), '')
+            # Two separate refusals, and they mean different things. Below
+            # threshold: the model is not sure enough to be trusted with a
+            # floor. UNREADABLE: it IS sure, and what it is sure of is that
+            # the legend cannot be made out -- a blank, blurred or unknown
+            # button. Both publish as `floor`; only the second is a
+            # confident answer.
+            if conf < self._read_min or name == UNREADABLE:
+                continue
+            out[i] = (name, conf)
+        return out
 
     def _image_cb(self, msg: Image) -> None:
         try:
@@ -188,11 +340,31 @@ class ButtonDetectorNode(Node):
         confs = boxes.conf.cpu().numpy()
         clses = boxes.cls.cpu().numpy().astype(int)
 
-        for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clses):
-            label = self._class_names.get(int(cls_id), str(cls_id))
-            self._draw_box(annotated, x1, y1, x2, y2, label, conf)
+        kinds = [self._class_names.get(int(c), str(c)) for c in clses]
+        packed = [(x1, y1, x2, y2, k)
+                  for (x1, y1, x2, y2), k in zip(xyxy, kinds)]
+        legends = self._read_legends(frame, packed)
+
+        for (x1, y1, x2, y2), conf, kind, legend in zip(
+                xyxy, confs, kinds, legends):
+            # What goes out as class_id is what `target_label` is matched
+            # against in detection_bridge_node, so it is chosen to be the
+            # thing a caller would naturally ask for: `up`, `down`, `help`,
+            # or a bare floor legend like `7` / `B1` / `G`.
+            #
+            # A floor whose legend was not read confidently publishes as
+            # `floor`. That is deliberate rather than a fallback: it stays
+            # visible and pressable-in-principle, but `target_label:=7` will
+            # not match it, so the arm cannot press it BELIEVING it is 7.
+            if kind == 'floor' and legend is not None:
+                label = legend[0]
+                score = float(conf) * float(legend[1])
+            else:
+                label = kind
+                score = float(conf)
+            self._draw_box(annotated, x1, y1, x2, y2, label, score, kind)
             det_array.detections.append(
-                self._make_detection(x1, y1, x2, y2, label, conf, header),
+                self._make_detection(x1, y1, x2, y2, label, score, header),
             )
 
         return annotated, det_array
@@ -201,14 +373,27 @@ class ButtonDetectorNode(Node):
     def _draw_box(
         img: np.ndarray,
         x1: float, y1: float, x2: float, y2: float,
-        label: str, conf: float,
+        label: str, conf: float, kind: str = '',
     ) -> None:
+        # Colour by whether the arm may press it, because the overlay is what
+        # a human checks before letting it move. Red is not "low confidence",
+        # it is "never press this": an emergency stop, a key switch, or a
+        # button whose legend could not be read.
+        if kind in FORBIDDEN:
+            colour = (0, 0, 255)
+        elif kind in ('up', 'down'):
+            colour = (0, 200, 255)      # top priority, called out on sight
+        elif kind in PRESSABLE:
+            colour = (0, 255, 0)
+        else:
+            colour = (200, 200, 200)
+
         p1 = (int(x1), int(y1))
         p2 = (int(x2), int(y2))
-        cv2.rectangle(img, p1, p2, (0, 255, 0), 2)
+        cv2.rectangle(img, p1, p2, colour, 2)
         text = f'{label} {conf:.2f}'
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(img, (p1[0], p1[1] - th - 6), (p1[0] + tw + 4, p1[1]), (0, 255, 0), -1)
+        cv2.rectangle(img, (p1[0], p1[1] - th - 6), (p1[0] + tw + 4, p1[1]), colour, -1)
         cv2.putText(
             img, text, (p1[0] + 2, p1[1] - 4),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA,

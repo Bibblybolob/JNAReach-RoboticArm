@@ -570,6 +570,62 @@ has been able to reduce, and it is the topology comparable arms use.
 the UART, and two masters on one bus behaves erratically. Untested against
 hardware as of this writing; the port may be power-only.
 
+## Button recognition -- two stages, and the class list is owned by code
+
+Full reasoning and every measured count:
+[docs/button_datasets.md](docs/button_datasets.md). The short version:
+
+**The vocabulary lives in
+`src/mycobot_perception/mycobot_perception/button_classes.py` and nowhere
+else.** Every `data.yaml` is GENERATED from it by
+`scripts/build_button_dataset.py`. It used to be hand-copied into three files
+that had to agree, which is failure #11 above waiting to happen -- ids are
+integers, so a reordering silently relabels every box with no error anywhere.
+`src/mycobot_perception/test/test_button_classes.py` pins the order; if it
+fails, the datasets must be rebuilt and both models retrained.
+
+**Stage A detects 9 classes** (`up`, `down`, `floor`, `open`, `close`, `help`,
+`stop`, `keyhole`, `other`); **stage B reads the floor legend off the crop**
+(0-36, B, B1, B2, B3, G, L, LG, M, CH, -1, `unreadable`). The single-stage
+14-class version it replaces had **no `up` and no `down` class at all** --
+773 instances of the two highest-priority buttons were being dropped at remap
+time -- and stopped at `button-10`, which calls a real building's 14th floor
+background.
+
+```bash
+./scripts/build_button_dataset.py --src ~/datasets/sunmoon-buttons --dry-run
+./scripts/train_buttons_all.sh          # both stages, then TensorRT export
+```
+
+Four things that will be got wrong otherwise:
+
+- **`fliplr` must be 0.0, and not because of the digits.** `open` and `close`
+  are mirror images of each other, so a horizontal flip does not corrupt them,
+  it SWAPS them -- a consistent wrong label on 2074 instances. `flipud` must
+  be 0.0 for the matching reason one level up: it turns `up` into `down`.
+  Rotation is capped at 12-15 degrees because `6` and `9` are 180 degrees
+  apart.
+- **An unread legend publishes as `floor`, deliberately.** The button stays
+  visible but `target_label:=7` will not match it, so the arm cannot press it
+  BELIEVING it is 7. An unread button costs a retry; a misread one costs a
+  trip to the wrong storey with nothing in the logs. Same reason `other`
+  (blank/blurred/unknown buttons) is a real class rather than dropped -- a
+  dropped class cannot express "I see a button and cannot read it", it just
+  produces no detection, which reads identically to no button.
+- **GPU TRAINING works on this board; GPU inference through `.pt` does not.**
+  Verified 2026-08-16 with a full epoch before committing to the long run.
+  Training with `cudnn.enabled = False` is fine at ~223s/epoch for yolo11s.
+  Do not generalise the inference-path `CUDNN_STATUS_EXECUTION_FAILED_CUDART`
+  failure into "the GPU is broken" -- that is why the node runs TensorRT and
+  the trainers do not have to.
+- **The source images are 416x416.** Training above 640 is upscaling an image
+  with no detail to recover. More images beat a bigger backbone here, which is
+  what `--src` being repeatable is for.
+
+**None of this supersedes `keypad_finder.py`.** That solves the lab's inkjet
+panel geometrically because no model can see it; this pipeline targets real
+elevators, which is a different problem.
+
 ## Gotchas
 
 - **The home pose `[0, 90, -150, 55, 0, 0]` is defined in five places** and

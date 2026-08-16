@@ -1,0 +1,24 @@
+detector: /tmp/mid_best.pt
+  9 model classes -> 9 of ours
+no reader at /nonexistent -- detection only
+  50/202...
+  100/202...
+  150/202...
+  200/202...
+
+==========================================================
+DETECTION  (202 images, conf>=0.5, IoU>=0.5)
+==========================================================
+class          n  precision   recall
+------------------------------------
+up            46      0.886    0.674  <--
+down          39      0.906    0.744  <--
+floor       1368      0.904    0.952
+open         116      0.900    0.776
+close        111      0.883    0.748
+help         112      0.923    0.750
+stop           7      1.000    0.286
+keyhole      101      0.747    0.644
+other        196      0.705    0.342
+
+wrote eval_results/mid_sunmoon.json

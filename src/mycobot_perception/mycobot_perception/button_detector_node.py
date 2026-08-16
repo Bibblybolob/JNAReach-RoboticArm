@@ -109,12 +109,28 @@ class ButtonDetectorNode(Node):
         # is 28x faster than the CPU fallback. The engine had been sitting in
         # the repo unused since 2026-08-11.
         #
-        # The trap that note recorded still stands: every check short of a real
-        # forward pass says the GPU is fine. torch.cuda.is_available() returns
-        # True, the device reports as Orin, torch.version.cuda is 12.6, cuDNN
-        # reports 9.2.4, and a bare torch conv on CUDA now succeeds. It is
-        # Ultralytics' .pt path that fails, at kernel execution. So do NOT
-        # switch model_path back to .pt on device=0 without RUNNING it.
+        # UPDATE 2026-08-16: the .pt CUDA path WORKS now, measured, and the
+        # note above is kept only because it was true when written.
+        #
+        #   yolo11s @640 .pt on device=0   51.5ms median, 72.2ms p90
+        #   yolo11n @640 .pt on device=0   34.7ms median  (the old model)
+        #   yolo11s @640 .pt on cpu      1515.0ms median
+        #
+        # 0.16GB reserved, measured while a second training job held the GPU.
+        # What was not re-tested is which change fixed it, so this is an
+        # observation and not an explanation -- `torch.backends.cudnn.enabled
+        # = False` above was already in place when it failed.
+        #
+        # The practical consequence is that TensorRT is now an OPTIMISATION
+        # rather than the only working GPU path, which matters because an
+        # engine is built for one board and does not travel while a .pt does.
+        # The engine is still the default: 51.5ms is 1% of the 5-second press
+        # budget either way, so this is not a reason to stop exporting one.
+        #
+        # The trap the original note recorded still stands and is why the
+        # numbers above were measured rather than assumed: every check short
+        # of a real forward pass says the GPU is fine. So do not change
+        # model_path in either direction without RUNNING it.
         #
         # Falls back to the .pt on CPU if the engine is missing, since the
         # engine is built for this specific board and does not travel.

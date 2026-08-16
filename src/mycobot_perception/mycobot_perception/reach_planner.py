@@ -225,8 +225,23 @@ def _aim(ik_mod, xyz, R, seed, pos_tol_m=0.002, continuity=0.3,
             e = W @ ik_mod.pose_error(T, xyz, R)
             J = W @ ik_mod.jacobian(q)
             JT = J.T
-            q = q + JT @ np.linalg.solve(J @ JT + 0.0025 * np.eye(6), e)
-            q = np.clip(q, lo, hi)
+            dq = JT @ np.linalg.solve(J @ JT + 0.0025 * np.eye(6), e)
+            q = np.clip(q + dq, lo, hi)
+            # STOP WHEN IT HAS CONVERGED. 300 was a fixed budget with no exit,
+            # so every one of the six weights paid for 300 iterations whether
+            # it needed 12 or all of them -- and this runs once per waypoint.
+            #
+            # Measured 2026-08-16 (under training load, so pessimistic in
+            # absolute terms, but the ratio holds): one plan_press took 5.3s
+            # at approach_steps=1 and 13.2s at 4, against a 5-SECOND BUDGET
+            # for the entire press. Planning was the single largest cost in
+            # the cycle and none of it was moving the arm.
+            #
+            # 1e-7 rad is 6e-6 degrees, four orders of magnitude below the
+            # arm's 0.79deg backlash floor, so this cannot change the pose
+            # that comes out -- it only stops re-deriving one already found.
+            if float(np.max(np.abs(dq))) < 1e-7:
+                break
         T = ik_mod.fk(q)
         perr = float(np.linalg.norm(T[:3, 3] - xyz))
         align = float((T[:3, :3] @ tool) @ tgt_axis)
@@ -255,7 +270,7 @@ def _aim(ik_mod, xyz, R, seed, pos_tol_m=0.002, continuity=0.3,
 
 def plan_press(target_xyz, tool_length_m=0.0, standoff_m=0.04,
                approach_dir=None, seed_deg=None, guard=None,
-               orientation='auto', panel=None):
+               orientation='auto', panel=None, approach_steps=4):
     """Standoff and touch joint angles for putting the tool on target_xyz.
 
     Returns a dict with 'standoff_deg', 'touch_deg' (both six-element lists in
@@ -315,7 +330,46 @@ def plan_press(target_xyz, tool_length_m=0.0, standoff_m=0.04,
 
     out = {}
     used_full = True
-    for name, xyz in (('standoff', flange_pre), ('touch', flange_touch)):
+
+    # A STRAIGHT LINE from the standoff to the button, not one joint-space
+    # move.
+    #
+    # Commanding standoff and touch as two poses interpolates between them in
+    # JOINT space, so the tool tip travels an arc through those 40mm rather
+    # than going straight in along the panel normal. The endpoints are right
+    # and the path between them bows -- which is how the tip arrives off-axis
+    # and scrapes, on a plan whose endpoints both verify perfectly.
+    #
+    # Subdividing bounds that. A chord deviates from its arc by roughly the
+    # square of its length, so four segments cut the bow by about sixteen --
+    # measured 2026-08-16 by interpolating each pair in JOINT space (which is
+    # what the servos do) and running FK along it:
+    #
+    #     approach_steps      1        2        4        8
+    #     head-on         1.27mm   0.37mm   0.12mm   0.06mm
+    #     off to a side   2.88mm   0.96mm   0.31mm   0.11mm
+    #
+    # The off-axis case is the one that matters: 2.88mm of sideways travel
+    # against a ~20mm button, arriving on a plan whose endpoints both verify
+    # to 0.03mm.
+    #
+    # 4 is the default because 0.31mm is already well under the arm's own
+    # 0.79deg backlash floor (a few mm of tip error). 8 halves a number that
+    # is no longer the limiting one, and every extra waypoint is another
+    # send_angles round trip.
+    #
+    # Each waypoint is solved seeded from the previous one, which is the same
+    # trick that already keeps standoff and touch in one arm configuration --
+    # and it matters more here, because a configuration flip midway through an
+    # approach happens with the tool already inside the standoff distance.
+    steps = [('standoff', flange_pre)]
+    n_steps = max(1, int(approach_steps))
+    for i in range(1, n_steps):
+        steps.append((f'approach{i}',
+                      flange_pre + d * (standoff_m * i / n_steps)))
+    steps.append(('touch', flange_touch))
+
+    for name, xyz in steps:
         # Aim as squarely as the arm allows without missing the button.
         if want_R is not None:
             qa, align, perr = _aim(ik_mod, xyz, want_R, seed, panel=panel)
@@ -402,6 +456,11 @@ def plan_press(target_xyz, tool_length_m=0.0, standoff_m=0.04,
             'changed arm configuration between them. Executing that would '
             'swing the arm through the target.')
     out['max_joint_step_deg'] = jump
+    # The whole motion in order, for a caller that streams it. Kept alongside
+    # standoff_deg/touch_deg rather than replacing them so existing callers
+    # and the adjacency check above are unaffected.
+    out['path_deg'] = [out[f'{nm}_deg'] for nm, _ in steps]
+    out['path_names'] = [nm for nm, _ in steps]
     out['approach_dir'] = [float(v) for v in d]
     out['orientation_constrained'] = bool(want_R is not None)
     if 'touch_alignment' in out:

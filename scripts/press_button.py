@@ -51,7 +51,18 @@ sys.path.insert(0, _HERE)
 
 import cv2  # noqa: E402
 
+import arm_motion  # noqa: E402
 from arm_broker import request  # noqa: E402
+
+# How far short of the touch pose still counts as "the button stopped me".
+#
+# Above arm_motion.ARRIVE_TOL_DEG (1.0), because inside that is ordinary
+# arrival. The upper end is a judgement rather than a measurement: a button
+# has a few millimetres of travel, which at this arm's reach is a couple of
+# degrees at the driven joints. Beyond that the arm was stopped by something
+# that is not a button, and calling that a successful press would be the worst
+# possible lie -- it reports a floor as selected that was never pressed.
+CONTACT_MAX_DEG = 4.0
 from mycobot_driver.collision_guard import (  # noqa: E402
     CollisionGuard, flange_transform)
 from mycobot_perception import keypad_finder as kf  # noqa: E402
@@ -252,29 +263,68 @@ def main() -> int:
         print(f'link is {frac*100:.0f}% valid -- too poor to move safely')
         return 1
 
-    def go(name, q):
-        ok, why = guard.check(list(q))
-        if not ok:
-            print(f'{name}: guard refused -- {why}')
-            return False
-        request({'cmd': 'send_angles', 'angles': [float(a) for a in q],
-                 'speed': args.speed, 'force': True}, timeout=30)
-        time.sleep(7.5)
+    def report(name):
         st = request({'cmd': 'state'}, timeout=20)
         if st and st.get('angles'):
             T = np.array(flange_transform(list(st['angles'])))
-            print(f'{name}: flange {np.linalg.norm(T[:3, 3] - np.array(p))*1000:.1f}mm '
-                  f'from the button')
-        return True
+            print(f'  {name}: flange '
+                  f'{np.linalg.norm(T[:3, 3] - np.array(p))*1000:.1f}mm '
+                  'from the button')
 
-    if go('standoff', plan['standoff_deg']):
-        if go('touch', plan['touch_deg']):
-            time.sleep(0.6)
-        go('retract', plan['standoff_deg'])
+    t0 = time.monotonic()
+
+    # Move to the standoff and WAIT for it, rather than sleeping a guess.
+    # Every move below is closed-loop; see scripts/arm_motion.py for why the
+    # fixed 7.5s sleeps this replaces were wrong in both directions.
+    arrived, _err = arm_motion.move_to(plan['standoff_deg'], args.speed,
+                                       guard=guard, name='standoff')
+    if not arrived:
+        print('did not reach the standoff pose; not approaching the panel')
+        return 1
+    report('standoff')
+
+    # The approach itself: standoff -> button as ONE streamed straight line.
+    path = plan.get('path_deg') or [plan['standoff_deg'], plan['touch_deg']]
+    touched, err = arm_motion.stream_path(
+        path[1:], args.speed, guard=guard, name='approach')
+    report('touch')
+
+    # CONTACT, inferred from the arm failing to finish the last millimetres.
+    #
+    # Nothing here senses force, so "did it actually press" has to come from
+    # somewhere else. A button that is being pressed resists: the servos stall
+    # a fraction short of the commanded pose and the wait times out just
+    # outside tolerance. So a small shortfall at the TOUCH pose specifically
+    # is evidence of contact, not a failure -- while arriving exactly means
+    # the tool met nothing, which on a plan that put it on the button means
+    # the button was not where the depth said it was.
+    #
+    # The window matters. Below ARRIVE_TOL_DEG is ordinary arrival. Far
+    # outside it is the arm being blocked by something that is not a button,
+    # or not moving at all, and that must not be read as a successful press.
+    if touched:
+        print(f'  contact: NONE detected -- the tool reached the touch pose '
+              f'exactly ({err:.2f}deg), so it met no resistance. Either the '
+              'button is further away than the depth reading, or the tool is '
+              'shorter than --tool-mm says.')
+    elif err <= CONTACT_MAX_DEG:
+        print(f'  contact: pressed -- stalled {err:.2f}deg short of the touch '
+              'pose, which is the button resisting')
+    else:
+        print(f'  contact: BLOCKED -- stopped {err:.2f}deg short, far outside '
+              'the press window. Something other than the button stopped the '
+              'arm; check the panel clearance figures above.')
+
+    time.sleep(0.4)
+
+    # Retract back along the same line, so the tool leaves the way it came in
+    # rather than sweeping sideways across the neighbouring buttons.
+    arm_motion.stream_path(list(reversed(path[:-1])), args.speed, guard=guard,
+                           name='retract')
+
+    print(f'press cycle: {time.monotonic() - t0:.1f}s')
     print('parking clear of the camera')
-    request({'cmd': 'send_angles', 'angles': PARK, 'speed': args.speed,
-             'force': True}, timeout=30)
-    time.sleep(8.0)
+    arm_motion.move_to(PARK, args.speed, name='park', tol=3.0)
     return 0
 
 

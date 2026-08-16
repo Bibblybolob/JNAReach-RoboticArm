@@ -153,5 +153,56 @@ for x in (0.14, 0.18, 0.22):
 print(f'      ({ok} of {tried} sampled targets planned and verified)')
 check('most of a reachable workspace plans correctly', ok >= tried * 0.6)
 
+# --- the approach is a straight line, not an arc ----------------------------
+#
+# The endpoints were always right; it was the path BETWEEN them that bowed.
+# The servos interpolate in JOINT space, so the only way to see this is to
+# interpolate that way and run FK along it -- checking the waypoints alone
+# proves nothing, because they sit on the line by construction.
+
+
+def path_bow_mm(plan):
+    """Worst deviation of the joint-interpolated tip path from the straight line."""
+    path = [np.array(q) for q in plan['path_deg']]
+    a = flange_xyz(path[0])
+    b = flange_xyz(path[-1])
+    d = (b - a) / np.linalg.norm(b - a)
+    worst = 0.0
+    for q0, q1 in zip(path[:-1], path[1:]):
+        for f in np.linspace(0.0, 1.0, 21):
+            p = flange_xyz(q0 + (q1 - q0) * f)
+            worst = max(worst, float(np.linalg.norm((p - a) - d * ((p - a) @ d))))
+    return worst * 1000.0
+
+
+# Off to one side is the case that bows worst -- head-on is nearly straight
+# already, so a test that only covered it would pass on a broken planner.
+TGT = (0.16, 0.10, 0.24)
+NRM = [0.85, 0.53, 0.0]
+one = plan_press(TGT, tool_length_m=0.07, standoff_m=0.04,
+                 approach_dir=NRM, approach_steps=1)
+four = plan_press(TGT, tool_length_m=0.07, standoff_m=0.04,
+                  approach_dir=NRM, approach_steps=4)
+
+check('a subdivided approach emits one waypoint per segment',
+      len(four['path_deg']) == 5 and len(one['path_deg']) == 2)
+check('the path starts at the standoff and ends at the touch pose',
+      four['path_deg'][0] == four['standoff_deg']
+      and four['path_deg'][-1] == four['touch_deg'])
+
+b1, b4 = path_bow_mm(one), path_bow_mm(four)
+print(f'      (tip bows {b1:.2f}mm undivided, {b4:.2f}mm over 4 segments)')
+# Measured 2026-08-16: 2.88mm against 0.31mm. Asserted loosely because the
+# absolute figure depends on the target, but the RATIO is the property --
+# subdividing must actually straighten the path, not merely add waypoints.
+check('subdividing straightens the approach', b4 < b1 / 3.0)
+check('a subdivided approach stays well inside the backlash floor', b4 < 1.0)
+
+# Every waypoint must be safe, not just the endpoints: discovering the fourth
+# is refused with the tool already at the third is the worst place to find out.
+g2 = CollisionGuard(tool_offset_m=0.07)
+check('every waypoint on the path passes the collision guard',
+      all(g2.check(q)[0] for q in four['path_deg']))
+
 print(f'\n{PASS} passed' + (f', {FAIL} FAILED' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

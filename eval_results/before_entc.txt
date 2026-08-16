@@ -1,0 +1,20 @@
+detector: elevator_buttons.pt
+  17 model classes -> 7 of ours; ignoring ['closed-door']
+no reader at /nonexistent -- detection only
+
+==========================================================
+DETECTION  (19 images, conf>=0.5, IoU>=0.5)
+==========================================================
+class          n  precision   recall
+------------------------------------
+up            12      0.923    1.000  <--
+down          10      1.000    0.800  <--
+floor         65      0.970    0.985
+open          13      1.000    1.000
+close         12      1.000    1.000
+help          12      0.750    0.750
+stop           0        nan      nan
+keyhole       12      0.889    0.667
+other          0        nan      nan
+
+wrote eval_results/before_entc.json

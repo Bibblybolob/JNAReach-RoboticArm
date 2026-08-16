@@ -1,0 +1,24 @@
+detector: elevator_buttons.pt
+  17 model classes -> 7 of ours; ignoring ['closed-door']
+no reader at /nonexistent -- detection only
+  50/202...
+  100/202...
+  150/202...
+  200/202...
+
+==========================================================
+DETECTION  (202 images, conf>=0.5, IoU>=0.5)
+==========================================================
+class          n  precision   recall
+------------------------------------
+up            46      0.125    0.065  <--
+down          39        nan    0.000  <--
+floor       1368      0.308    0.006
+open         116      0.000    0.000
+close        111        nan    0.000
+help         112        nan    0.000
+stop           7        nan    0.000
+keyhole      101        nan    0.000
+other        196        nan    0.000
+
+wrote eval_results/before_sunmoon.json

@@ -1,0 +1,85 @@
+{
+  "label": "BEFORE: elevator_buttons.pt (old 17-class, out of domain)",
+  "weights": "elevator_buttons.pt",
+  "reader": null,
+  "src": "/home/jonathan/datasets/sunmoon-buttons",
+  "split": "test",
+  "images": 202,
+  "conf": 0.5,
+  "iou": 0.5,
+  "classes": {
+    "up": {
+      "n": 46,
+      "tp": 3,
+      "fp": 21,
+      "fn": 43,
+      "precision": 0.125,
+      "recall": 0.06521739130434782
+    },
+    "down": {
+      "n": 39,
+      "tp": 0,
+      "fp": 0,
+      "fn": 39,
+      "precision": null,
+      "recall": 0.0
+    },
+    "floor": {
+      "n": 1368,
+      "tp": 8,
+      "fp": 18,
+      "fn": 1360,
+      "precision": 0.3076923076923077,
+      "recall": 0.005847953216374269
+    },
+    "open": {
+      "n": 116,
+      "tp": 0,
+      "fp": 1,
+      "fn": 116,
+      "precision": 0.0,
+      "recall": 0.0
+    },
+    "close": {
+      "n": 111,
+      "tp": 0,
+      "fp": 0,
+      "fn": 111,
+      "precision": null,
+      "recall": 0.0
+    },
+    "help": {
+      "n": 112,
+      "tp": 0,
+      "fp": 0,
+      "fn": 112,
+      "precision": null,
+      "recall": 0.0
+    },
+    "stop": {
+      "n": 7,
+      "tp": 0,
+      "fp": 0,
+      "fn": 7,
+      "precision": null,
+      "recall": 0.0
+    },
+    "keyhole": {
+      "n": 101,
+      "tp": 0,
+      "fp": 0,
+      "fn": 101,
+      "precision": null,
+      "recall": 0.0
+    },
+    "other": {
+      "n": 196,
+      "tp": 0,
+      "fp": 0,
+      "fn": 196,
+      "precision": null,
+      "recall": 0.0
+    }
+  },
+  "legend": null
+}

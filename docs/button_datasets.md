@@ -51,6 +51,36 @@ be learned. Measured over 22,843 instances in 368 classes, support collapses
 down the range -- floor 2 has 1200 examples, floor 33 has 55, and there is a
 long tail of `B4`, `LG2`, `P4A` in single digits.
 
+## The baseline: the old model is narrow, not bad
+
+Measured 2026-08-16 with `scripts/eval_buttons.py`, which maps the old
+17-class model's predictions through the same taxonomy as the ground truth so
+the two are scored on identical terms. Both are held-out test splits.
+
+| | `up` recall | `down` recall | `floor` recall |
+|---|---|---|---|
+| on **ENTC test** (its own training domain, 19 imgs) | **1.000** | 0.800 | 0.985 |
+| on **Sun Moon test** (202 imgs) | **0.065** | **0.000** | **0.006** |
+
+Precision on ENTC is 0.92-1.00 across `up`, `down`, `floor`, `open` and
+`close`. On Sun Moon it predicts most classes not at all.
+
+**So `elevator_buttons.pt` was never broken.** It is an excellent detector of
+the panels in its own 393-image training set and effectively blind to any
+other, which is a far more precise diagnosis than "the detector does not
+work" and matches the 2026-08-14 finding that it scored zero on the lab's
+printed panel. The same failure, twice, from the same cause.
+
+Two consequences for how the retrain is judged:
+
+- **The gain to look for is breadth and vocabulary, not accuracy.** On ENTC
+  there is no headroom left on `up` -- 1.000 recall cannot be beaten. A new
+  model that comes in slightly lower there while transforming the Sun Moon
+  column is a better model, and reporting only the split that flatters it
+  would be the mistake `compare_buttons.py` refuses to make silently.
+- **Beware the small split.** ENTC test is 19 images with n=12 for `up`, so
+  those figures are noisy, and `stop` and `other` do not occur in it at all.
+
 ## The design: find, then read
 
     Stage A  detect   WHERE is a button, and WHAT KIND   9 classes

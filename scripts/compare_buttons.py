@@ -85,7 +85,10 @@ def main() -> int:
           f'{A["split"]}, conf>={A["conf"]}, IoU>={A["iou"]}')
     print('=' * 72)
 
-    print(f'\n{"":<9}{"n":>5}{"precision":>19}{"recall":>19}')
+    # 22 = the three sub-columns below (7 + 7 + 8), not 19. Getting this
+    # wrong puts `precision` over the recall block and silently invites the
+    # table to be read a column out.
+    print(f'\n{"":<9}{"n":>5}{"precision":^22}{"recall":^22}')
     print(f'{"class":<9}{"":>5}{"before":>7}{"after":>7}{"delta":>8}'
           f'{"before":>7}{"after":>7}{"delta":>8}')
     print('-' * 72)

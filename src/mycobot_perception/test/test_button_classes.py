@@ -63,6 +63,21 @@ for name in ('1', '12', 'button-7', 'floor-3', 'B', 'B1', 'G', 'LG', '-1'):
 check(to_reader_label('button-7') == '7', 'the button- prefix must be stripped')
 check(to_reader_label('b1') == 'B1', 'reader labels are upper-cased')
 
+# Spelled-out storeys canonicalise onto the abbreviation. ENTC writes
+# `floor-ground` where Sun Moon writes `G`; if these produced a separate
+# `GROUND` legend, one storey's examples would be split across two labels and
+# the reader would be permanently unsure between them.
+check(to_detect_class('floor-ground') == 'floor', 'floor-ground is a floor')
+check(to_reader_label('floor-ground') == 'G', 'ground must canonicalise to G')
+check(to_reader_label('lobby') == 'L', 'lobby must canonicalise to L')
+check(to_reader_label('button-g') == 'G', 'button-g is the same storey as G')
+
+# ENTC spells the hall call both ways; both must reach the same class.
+check(to_detect_class('button-up') == 'up', 'button-up should map to up')
+check(to_detect_class('button-down') == 'down', 'button-down should map to down')
+# The door STATE, which is not a button at all.
+check(to_detect_class('closed-door') is None, 'closed-door is not a button')
+
 # `B` is a basement, never a bell -- the alias table lists `bell` explicitly
 # so that this stays true.
 check(to_detect_class('B') == 'floor', 'B must be the basement, not a bell')

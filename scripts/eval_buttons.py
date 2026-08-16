@@ -74,6 +74,10 @@ def main() -> int:
     ap.add_argument('--iou', type=float, default=0.5)
     ap.add_argument('--device', default='0')
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--json', default='',
+                    help='also write the numbers here, for compare_buttons.py')
+    ap.add_argument('--label', default='',
+                    help='name for this run in the comparison table')
     args = ap.parse_args()
 
     src = os.path.expanduser(args.src)
@@ -91,6 +95,22 @@ def main() -> int:
         names = [names[k] for k in sorted(names)]
 
     det = YOLO(args.detect_weights)
+
+    # Build the model's own id -> our taxonomy table, once. A model whose
+    # names already match is the identity; the old ENTC-trained
+    # elevator_buttons.pt is folded onto the same 9 classes here.
+    det_name_map: dict[int, str] = {}
+    raw = det.names
+    raw = raw if isinstance(raw, dict) else dict(enumerate(raw))
+    for i, nm in raw.items():
+        det_name_map[int(i)] = nm if nm in DETECT_CLASSES else to_detect_class(nm)
+    unmapped = sorted({nm for i, nm in raw.items()
+                       if det_name_map.get(int(i)) is None})
+    print(f'detector: {args.detect_weights}')
+    print(f'  {len(raw)} model classes -> '
+          f'{len({v for v in det_name_map.values() if v})} of ours'
+          + (f'; ignoring {unmapped}' if unmapped else ''))
+
     reader = None
     if os.path.isfile(args.read_weights):
         reader = YOLO(args.read_weights)
@@ -146,7 +166,21 @@ def main() -> int:
             cl = boxes.cls.cpu().numpy().astype(int)
             cf = boxes.conf.cpu().numpy()
             order = np.argsort(-cf)
-            preds = [(DETECT_CLASSES[cl[i]], *xy[i]) for i in order]
+            for i in order:
+                # Map by NAME, never by index. For the new detector the model's
+                # names ARE DETECT_CLASSES and this is the identity; for the
+                # OLD 17-class elevator_buttons.pt it puts that model's
+                # predictions through exactly the same taxonomy as the ground
+                # truth, which is what makes a before/after comparison honest
+                # rather than a comparison of two different questions.
+                #
+                # Mapping by index instead would silently score the old model
+                # against a class list it was never trained on -- failure #11,
+                # and it would read as the old model being catastrophically
+                # bad rather than as a bug here.
+                kind = det_name_map.get(int(cl[i]))
+                if kind is not None:
+                    preds.append((kind, *xy[i]))
 
         # --- match, greedily, highest confidence first --------------------
         for kind, x1, y1, x2, y2 in preds:
@@ -228,6 +262,35 @@ def main() -> int:
             print('\n  Raise reader_min_confidence to trade these for '
                   'declines. A decline is a retry; one of these is a trip to '
                   'the wrong floor.')
+
+    if args.json:
+        import json
+        out = {
+            'label': args.label or os.path.basename(args.detect_weights),
+            'weights': args.detect_weights,
+            'reader': args.read_weights if reader is not None else None,
+            'src': src, 'split': args.split, 'images': len(files),
+            'conf': args.conf, 'iou': args.iou,
+            'classes': {}, 'legend': None,
+        }
+        for c in DETECT_CLASSES:
+            n_gt = tp[c] + fn[c]
+            out['classes'][c] = {
+                'n': n_gt, 'tp': tp[c], 'fp': fp[c], 'fn': fn[c],
+                'precision': (tp[c] / (tp[c] + fp[c])) if (tp[c] + fp[c]) else None,
+                'recall': (tp[c] / n_gt) if n_gt else None,
+            }
+        if reader is not None and (legend_right + legend_wrong + legend_declined):
+            out['legend'] = {
+                'right': legend_right, 'wrong': legend_wrong,
+                'declined': legend_declined,
+                'confusions': [[t, g, c] for (t, g), c in
+                               confusions.most_common(20)],
+            }
+        os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
+        with open(args.json, 'w') as f:
+            json.dump(out, f, indent=2)
+        print(f'\nwrote {args.json}')
     return 0
 
 

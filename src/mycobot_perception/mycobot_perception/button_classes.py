@@ -145,6 +145,23 @@ _PREFIX = re.compile(r'^(button[-_ ]?|floor[-_ ]?|btn[-_ ]?)', re.I)
 # a floor, and `B` is a basement and never anything else.
 _FLOOR_LEGEND = re.compile(r'^-?\d+[a-z]?$|^[a-z]{1,3}-?\d{0,2}$', re.I)
 
+# Storeys that different datasets spell out instead of abbreviating. Without
+# these, ENTC's `floor-ground` (112 instances) is dropped as unrecognised --
+# and worse, if it were merely passed through it would become a legend called
+# `GROUND`, a SECOND class meaning the same button as `G`. That splits the
+# training examples for one storey across two labels and guarantees the reader
+# is unsure between them, which is exactly the confident-wrong-floor failure
+# the reject threshold exists to prevent.
+#
+# So these canonicalise onto the abbreviation the majority of the data uses.
+_FLOOR_SYNONYMS = {
+    'ground': 'G', 'gf': 'G', 'g/f': 'G',
+    'lobby': 'L', 'lobb': 'L',
+    'basement': 'B',
+    'mezzanine': 'M', 'mezz': 'M',
+    'parking': 'P', 'park': 'P',
+}
+
 
 def normalise(name: str) -> str:
     """Source class name -> a comparable key."""
@@ -158,7 +175,7 @@ def to_detect_class(name: str) -> str | None:
         return _DETECT_ALIASES[n]
     if _NOT_A_BUTTON.match(n):
         return None
-    if _FLOOR_LEGEND.match(n):
+    if n in _FLOOR_SYNONYMS or _FLOOR_LEGEND.match(n):
         return 'floor'
     return None
 
@@ -192,4 +209,5 @@ def to_reader_label(name: str) -> str | None:
     """
     if to_detect_class(name) != 'floor':
         return None
-    return normalise(name).upper()
+    n = normalise(name)
+    return _FLOOR_SYNONYMS.get(n, n.upper())

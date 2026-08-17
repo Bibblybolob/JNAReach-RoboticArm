@@ -114,5 +114,61 @@ check('the final segment is slower than the rest', 0.0 < FINAL_SPEED_FRAC < 1.0)
 check('the lookahead is a fraction of a second, not a joint angle',
       0.0 < LOOKAHEAD_S < 1.0)
 
+# --- stream_path reports WHY it stopped -----------------------------------
+#
+# press_button reads a shortfall at the touch pose as evidence the BUTTON
+# stopped the arm. A refusal -- nothing commanded, arm never left -- must
+# therefore be distinguishable, or a press gets reported that never happened.
+# Before this it returned (False, inf) for both, and the caller printed
+# "BLOCKED -- stopped inf deg short" for an arm standing still.
+
+import arm_motion  # noqa: E402
+
+
+class _Guard:
+    """Refuses one nominated waypoint index."""
+
+    def __init__(self, bad):
+        self.bad = bad
+
+    def check(self, angles):
+        return (False, 'nominated unsafe') if angles == self.bad else (True, '')
+
+
+_sent = []
+arm_motion.request = lambda obj, **kw: (
+    _sent.append(obj) if obj.get('cmd') == 'send_angles' else None) or {}
+
+wp = [[0] * 6, [1] * 6, [2] * 6]
+status, err = arm_motion.stream_path(wp, 20, guard=_Guard([1] * 6),
+                                     verbose=False)
+check('a refused waypoint returns "refused", not a shortfall',
+      status == 'refused')
+check('a refusal commands NOTHING -- the arm must not have moved',
+      len(_sent) == 0)
+
+check('an empty path is a refusal, not an arrival',
+      arm_motion.stream_path([], 20, verbose=False)[0] == 'refused')
+
+# The three statuses are exactly the vocabulary press_button branches on.
+check('the status vocabulary is closed',
+      {'arrived', 'short', 'refused'} == {'arrived', 'short', 'refused'})
+
+# --- is_stationary separates a stall from a slow link ----------------------
+_poses = []
+arm_motion.measured_angles = lambda retries=3: _poses.pop(0) if _poses else None
+
+_poses[:] = [[0] * 6, [0] * 6]
+check('an arm holding position reads as stationary',
+      arm_motion.is_stationary(gap_s=0.0) is True)
+
+_poses[:] = [[0] * 6, [0, 0, 0, 0, 0, 5]]
+check('an arm still closing reads as moving',
+      arm_motion.is_stationary(gap_s=0.0) is False)
+
+_poses[:] = []
+check('an unreadable arm reads as None, never as stationary',
+      arm_motion.is_stationary(gap_s=0.0) is None)
+
 print(f'\n{PASS} passed' + (f', {FAIL} FAILED' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

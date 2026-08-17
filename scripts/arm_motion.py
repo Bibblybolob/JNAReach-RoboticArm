@@ -161,6 +161,29 @@ def wait_for_arrival(target, travel_deg, speed, tol=ARRIVE_TOL_DEG,
     return False, worst
 
 
+def is_stationary(tol_deg=0.3, gap_s=0.35):
+    """Has the arm stopped moving? True / False / None if it cannot be read.
+
+    This is what separates "the button stopped me" from "the link was slow".
+    `wait_for_arrival` returns False for both -- it only knows the pose was
+    not reached inside the budget -- and treating the second as a press would
+    report a floor as selected that was never pressed.
+
+    A stalled arm is STATIONARY short of its target. A slow one is still
+    closing. Two reads a third of a second apart tell them apart, and the
+    tolerance is below the 0.79deg backlash floor because a held pose still
+    dithers by a fraction of a degree.
+    """
+    a = measured_angles()
+    if a is None:
+        return None
+    time.sleep(gap_s)
+    b = measured_angles()
+    if b is None:
+        return None
+    return max(abs(x - y) for x, y in zip(a, b)) <= tol_deg
+
+
 def measured_angles(retries=3):
     """Current joint angles, or None. Same freshness rule as the wait."""
     for _ in range(retries):
@@ -210,7 +233,16 @@ def stream_path(waypoints, speed, guard=None, blend_tol=BLEND_TOL_DEG,
     `blend_tol` of the way there rather than stopping dead on it. Only the
     final pose is held to `final_tol`.
 
-    Returns (arrived_at_final, worst_err_deg_at_final).
+    Returns (status, worst_err_deg_at_final), where status is:
+
+        'arrived'   the final pose was reached inside `final_tol`
+        'short'     the arm moved but stopped short of it
+        'refused'   NOTHING was commanded -- a waypoint failed the guard
+
+    `refused` has to be distinguishable from `short`. press_button reads a
+    shortfall at the touch pose as evidence the BUTTON stopped the arm, and a
+    refusal that looked like a shortfall would report a press that never
+    happened, from an arm that never moved.
 
     All waypoints are guard-checked BEFORE any of them is commanded. Checking
     as you go means discovering the fifth one is unsafe with the arm already
@@ -218,7 +250,7 @@ def stream_path(waypoints, speed, guard=None, blend_tol=BLEND_TOL_DEG,
     """
     wps = [[float(a) for a in w] for w in waypoints]
     if not wps:
-        return False, float('inf')
+        return 'refused', float('inf')
 
     if guard is not None:
         for i, w in enumerate(wps):
@@ -227,7 +259,7 @@ def stream_path(waypoints, speed, guard=None, blend_tol=BLEND_TOL_DEG,
                 if verbose:
                     print(f'{name}: waypoint {i + 1}/{len(wps)} refused '
                           f'before anything moved -- {why}')
-                return False, float('inf')
+                return 'refused', float('inf')
 
     deg_per_s = DEG_PER_S_AT_100 * max(speed, 1) / 100.0
     la_deg = deg_per_s * LOOKAHEAD_S
@@ -265,7 +297,7 @@ def stream_path(waypoints, speed, guard=None, blend_tol=BLEND_TOL_DEG,
                 state = 'arrived' if arrived else 'stopped short'
                 print(f'  {name}: {state} at the final pose '
                       f'({err:.2f}deg worst)')
-            return arrived, err
+            return ('arrived' if arrived else 'short'), err
 
         # Blend on TIME, with the tolerance as an early exit (step 7).
         # Progress is measured against the waypoint, never against the

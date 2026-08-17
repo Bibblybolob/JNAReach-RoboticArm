@@ -164,18 +164,16 @@ def find_with_model(img, args):
     found, unread = {}, 0
     for i, (x1, y1, x2, y2) in enumerate(xy):
         kind = DETECT_CLASSES[cls[i]]
-        if kind in FORBIDDEN and kind != 'other':
-            # A keyhole or an emergency stop is real and worth knowing about,
-            # but it must never become a press target, so it is not given a
-            # label anyone can ask for.
+        if kind in FORBIDDEN:
+            # keyhole, stop and other. All real, all worth knowing about, and
+            # none of them may become a press target -- so none is given a
+            # label anyone can ask for. Withheld, not merely deprioritised.
             continue
         if kind == 'floor':
             lab = legend.get(i)
             if lab is None:
                 unread += 1
                 lab = 'floor?' if unread == 1 else f'floor?{unread}'
-        elif kind == 'other':
-            continue
         else:
             lab = kind
         # Two of a kind on one panel (two `help` buttons, say) must not
@@ -468,8 +466,20 @@ def main() -> int:
 
     # The approach itself: standoff -> button as ONE streamed straight line.
     path = plan.get('path_deg') or [plan['standoff_deg'], plan['touch_deg']]
-    touched, err = arm_motion.stream_path(
+    status, err = arm_motion.stream_path(
         path[1:], args.speed, guard=guard, name='approach')
+
+    # A REFUSAL is not a press, and it is not a blockage either -- nothing was
+    # commanded and the arm has not left the standoff. Say so and stop, rather
+    # than falling through to contact reporting (which read `inf` degrees of
+    # shortfall as "something stopped the arm") and then retracting along a
+    # path whose waypoints were just rejected.
+    if status == 'refused':
+        print('  the approach was refused before any motion; the arm is still '
+              'at the standoff pose')
+        arm_motion.move_to(PARK, args.speed, name='park', tol=3.0)
+        return 1
+
     report('touch')
 
     # CONTACT, inferred from the arm failing to finish the last millimetres.
@@ -485,18 +495,31 @@ def main() -> int:
     # The window matters. Below ARRIVE_TOL_DEG is ordinary arrival. Far
     # outside it is the arm being blocked by something that is not a button,
     # or not moving at all, and that must not be read as a successful press.
-    if touched:
+    if status == 'arrived':
         print(f'  contact: NONE detected -- the tool reached the touch pose '
               f'exactly ({err:.2f}deg), so it met no resistance. Either the '
               'button is further away than the depth reading, or the tool is '
               'shorter than --tool-mm says.')
-    elif err <= CONTACT_MAX_DEG:
-        print(f'  contact: pressed -- stalled {err:.2f}deg short of the touch '
-              'pose, which is the button resisting')
     else:
-        print(f'  contact: BLOCKED -- stopped {err:.2f}deg short, far outside '
-              'the press window. Something other than the button stopped the '
-              'arm; check the panel clearance figures above.')
+        # Short of the target is necessary but NOT sufficient. The wait also
+        # returns short when the budget simply expired on a slow link, and
+        # calling that a press would report a floor as selected that was never
+        # pressed. A stalled arm is STATIONARY; a slow one is still closing.
+        still = arm_motion.is_stationary()
+        if still is False:
+            print(f'  contact: NOT pressed -- {err:.2f}deg short but the arm '
+                  'is STILL MOVING, so the wait expired rather than the button '
+                  'stopping it. Raise the speed or the budget.')
+        elif still is None:
+            print(f'  contact: UNKNOWN -- {err:.2f}deg short, and the arm '
+                  'could not be read to tell a stall from a slow move')
+        elif err <= CONTACT_MAX_DEG:
+            print(f'  contact: pressed -- stopped {err:.2f}deg short of the '
+                  'touch pose and held there, which is the button resisting')
+        else:
+            print(f'  contact: BLOCKED -- stopped {err:.2f}deg short, far '
+                  'outside the press window. Something other than the button '
+                  'stopped the arm; check the panel clearance above.')
 
     time.sleep(0.4)
 

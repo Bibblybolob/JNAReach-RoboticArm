@@ -133,8 +133,8 @@ buttons are r≈12px and rows drop out: **10/12 frames against 2/6.**
 ### Two limits, both printed rather than hidden
 
 - **`--tool-mm` defaults to 0**, so the *flange origin* is driven onto the
-  button and anything protruding past it contacts off by that much — measured
-  ~13mm on the first presses. Pass the real number once measured.
+  button and anything protruding past it contacts off by that much. The fitted
+  presser is **27.7mm** — pass it every time; see step 1 below.
 - **The tool cannot generally be held square to the panel.** Exact aim costs
   ~25mm of position at most placements, with no joint at a limit — it is
   dexterity, not limits. The planner aims as squarely as the arm allows while
@@ -184,15 +184,26 @@ Root-sum-square is about **5–6mm**. Against a 20mm button that works; against
 a 10mm button it is marginal. **Do not spend time on the IK** — at 0.03mm it
 is four orders of magnitude below the term that matters.
 
-### 1. Measure the tool
+### 1. Measure the tool — currently **27.7mm**
+
+The fitted presser is a cone on a mounting plate, **27.7mm** from the flange
+face, and that is the number to pass until the tool is refitted.
 
 ```bash
-./scripts/measure_tool.py
+./scripts/measure_tool.py        # confirms it AS MOUNTED
 ```
 
 `--tool-mm` defaults to **0**, which drives the *flange origin* onto the
 button, so anything protruding contacts short by its own length. Every command
 below needs this number.
+
+**A CAD length and a mounted length are not the same measurement.** 27.7mm is
+the designed protrusion; what the arm actually has depends on how deep the
+tool seats, whether the plate stands proud, and whether it sits on the tool
+axis. Run the script once to confirm — it also reports the OFF-AXIS spread,
+which catches a presser mounted slightly off-centre. That fault otherwise
+appears much later as a constant sideways miss that reads like a calibration
+error.
 
 The script **refuses** rather than printing a number when the poses disagree
 by more than 8mm — a bare arm gives 146mm of spread, because with nothing

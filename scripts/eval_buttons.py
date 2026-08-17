@@ -67,7 +67,7 @@ def main() -> int:
     ap.add_argument('--read-weights', default=os.path.join(
         REPO, 'runs_buttons', 'read_v1', 'weights', 'best.pt'))
     ap.add_argument('--conf', type=float, default=0.5)
-    ap.add_argument('--read-min', type=float, default=0.75,
+    ap.add_argument('--read-min', type=float, default=0.95,
                     help='must match the node\'s reader_min_confidence')
     ap.add_argument('--crop-pad', type=float, default=0.12,
                     help="must match the builder's --crop-pad")

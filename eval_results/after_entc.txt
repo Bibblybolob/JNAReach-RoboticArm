@@ -1,0 +1,33 @@
+detector: /home/jonathan/mycobot_project/.claude/worktrees/elevator-button-recognition-940e5a/runs_buttons/detect_v1/weights/best.pt
+  9 model classes -> 9 of ours
+
+==========================================================
+DETECTION  (19 images, conf>=0.5, IoU>=0.5)
+==========================================================
+class          n  precision   recall
+------------------------------------
+up            12      1.000    1.000  <--
+down          10      1.000    1.000  <--
+floor         65      0.970    0.985
+open          13      1.000    1.000
+close         12      1.000    1.000
+help          12      0.667    0.667
+stop           0        nan      nan
+keyhole       12      0.800    0.667
+other          0        nan      nan
+
+==========================================================
+END TO END -- reading the floor legend off DETECTED crops
+==========================================================
+  correct       62   96.9%
+  declined       1    1.6%   (publishes as `floor`; costs a retry)
+  WRONG          1    1.6%   (confident and incorrect -- the failure that matters)
+
+  of the ones it committed to: 98.4% right
+
+  worst confusions (truth -> reported):
+       G -> 5     x1
+
+  Raise reader_min_confidence to trade these for declines. A decline is a retry; one of these is a trip to the wrong floor.
+
+wrote eval_results/after_entc.json

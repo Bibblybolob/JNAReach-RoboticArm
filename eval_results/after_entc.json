@@ -1,0 +1,96 @@
+{
+  "label": "AFTER: two-stage yolo11s + reader",
+  "weights": "/home/jonathan/mycobot_project/.claude/worktrees/elevator-button-recognition-940e5a/runs_buttons/detect_v1/weights/best.pt",
+  "reader": "/home/jonathan/mycobot_project/.claude/worktrees/elevator-button-recognition-940e5a/runs_buttons/read_v1/weights/best.pt",
+  "src": "/home/jonathan/datasets/entc",
+  "split": "test",
+  "images": 19,
+  "conf": 0.5,
+  "iou": 0.5,
+  "classes": {
+    "up": {
+      "n": 12,
+      "tp": 12,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "down": {
+      "n": 10,
+      "tp": 10,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "floor": {
+      "n": 65,
+      "tp": 64,
+      "fp": 2,
+      "fn": 1,
+      "precision": 0.9696969696969697,
+      "recall": 0.9846153846153847
+    },
+    "open": {
+      "n": 13,
+      "tp": 13,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "close": {
+      "n": 12,
+      "tp": 12,
+      "fp": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "help": {
+      "n": 12,
+      "tp": 8,
+      "fp": 4,
+      "fn": 4,
+      "precision": 0.6666666666666666,
+      "recall": 0.6666666666666666
+    },
+    "stop": {
+      "n": 0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "precision": null,
+      "recall": null
+    },
+    "keyhole": {
+      "n": 12,
+      "tp": 8,
+      "fp": 2,
+      "fn": 4,
+      "precision": 0.8,
+      "recall": 0.6666666666666666
+    },
+    "other": {
+      "n": 0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "precision": null,
+      "recall": null
+    }
+  },
+  "legend": {
+    "right": 62,
+    "wrong": 1,
+    "declined": 1,
+    "confusions": [
+      [
+        "G",
+        "5",
+        1
+      ]
+    ]
+  }
+}

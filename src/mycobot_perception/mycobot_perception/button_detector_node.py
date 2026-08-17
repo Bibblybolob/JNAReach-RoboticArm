@@ -159,7 +159,36 @@ class ButtonDetectorNode(Node):
         # button costs a retry while a misread one costs a trip to the wrong
         # storey with nothing in the logs to say so. 6/9 is the confusion
         # that actually happens -- they are a 180-degree rotation apart.
-        self.declare_parameter('reader_min_confidence', 0.75)
+        # 0.95, RAISED from 0.75 on 2026-08-17 after measuring it end to end
+        # on 1302 detected floor crops from the Sun Moon test split:
+        #
+        #   thresh   correct   declined   WRONG
+        #     0.50       943        132     227   17.4%
+        #     0.75       909        241     152   11.7%   <- was the default
+        #     0.90       880        315     107    8.2%
+        #     0.95       861        353      88    6.8%   <- now
+        #     0.99       811        437      54    4.1%
+        #
+        # 11.7% confidently-wrong contradicts the principle the whole
+        # two-stage design rests on, so the default moves to where declines
+        # outnumber wrong reads about 4:1. It is a dial, not a discovery:
+        # raise it toward 0.99 for a building where a wrong floor is
+        # expensive, lower it if the arm declines more than you can stand.
+        #
+        # It cannot be driven to zero from here. 104 of those 1302 crops
+        # carry a legend the reader has NO CLASS for -- dropped below
+        # --min-reader-support -- so it cannot be right on them at any
+        # threshold, only silent.
+        #
+        # The raw rate also OVERSTATES the operational risk, because the arm
+        # presses only what matches `target_label`. A 6 misread as G is
+        # invisible when you asked for 7. The dangerous confusions are the
+        # ones that FALSELY MATCH the request, and the measured list is
+        # dominated by a systematic pattern worth fixing at the source:
+        # 17->7, 19->9, 37->27, 39->29 -- the leading digit being lost.
+        # Suspect the 0.12 crop padding clipping wide two-digit legends
+        # before suspecting the classifier.
+        self.declare_parameter('reader_min_confidence', 0.95)
         # Fraction of box size added around each crop before reading, so the
         # reader sees the button rim rather than a tight numeral. MUST match
         # --crop-pad in scripts/build_button_dataset.py (0.12): a classifier

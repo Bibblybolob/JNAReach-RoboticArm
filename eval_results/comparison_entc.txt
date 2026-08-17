@@ -1,0 +1,38 @@
+========================================================================
+BEFORE  BEFORE: elevator_buttons.pt (its OWN training domain)
+AFTER   AFTER: two-stage yolo11s + reader
+on 19 images of entc/test, conf>=0.5, IoU>=0.5
+========================================================================
+
+             n      precision               recall        
+class          before  after   delta before  after   delta
+------------------------------------------------------------------------
+up          12  0.923  1.000  +0.077  1.000  1.000  +0.000  <-- priority 1
+down        10  1.000  1.000  +0.000  0.800  1.000  +0.200  <-- priority 1
+floor       65  0.970  0.970  +0.000  0.985  0.985  +0.000
+help        12  0.750  0.667  -0.083  0.750  0.667  -0.083
+open        13  1.000  1.000  +0.000  1.000  1.000  +0.000
+close       12  1.000  1.000  +0.000  1.000  1.000  +0.000
+stop         0      -      -              -      -        
+keyhole     12  0.889  0.800  -0.089  0.667  0.667  +0.000
+other        0      -      -              -      -        
+
+------------------------------------------------------------------------
+   up: found 12 of 12 (was 12)
+ down: found 10 of 10 (was 8)
+
+========================================================================
+READING THE FLOOR LEGEND
+========================================================================
+  the BEFORE model could not read legends at all: its class list stopped at button-3/floor-3, so every floor above that was unnameable by construction. Treat the before column as absent rather than as zero.
+
+              before     after   after %
+----------------------------------------
+correct            -        62     96.9%
+declined           -         1      1.6%
+WRONG              -         1      1.6%
+
+  of the ones it committed to: 98.4% right
+
+  worst confusions after (truth -> reported):
+       G -> 5    x1

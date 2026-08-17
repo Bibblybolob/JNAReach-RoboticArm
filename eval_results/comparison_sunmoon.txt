@@ -1,0 +1,45 @@
+========================================================================
+BEFORE  BEFORE: elevator_buttons.pt (old 17-class, out of domain)
+AFTER   AFTER: two-stage yolo11s + reader
+on 202 images of sunmoon-buttons/test, conf>=0.5, IoU>=0.5
+========================================================================
+
+             n      precision               recall        
+class          before  after   delta before  after   delta
+------------------------------------------------------------------------
+up          46  0.125  0.886  +0.761  0.065  0.674  +0.609  <-- priority 1
+down        39      -  0.906          0.000  0.744  +0.744  <-- priority 1
+floor     1368  0.308  0.904  +0.596  0.006  0.952  +0.946
+help       112      -  0.923          0.000  0.750  +0.750
+open       116  0.000  0.900  +0.900  0.000  0.776  +0.776
+close      111      -  0.883          0.000  0.748  +0.748
+stop         7      -  1.000          0.000  0.286  +0.286
+keyhole    101      -  0.747          0.000  0.644  +0.644
+other      196      -  0.705          0.000  0.342  +0.342
+
+------------------------------------------------------------------------
+   up: found 31 of 46 (was 3)
+ down: found 29 of 39 (was 0)
+
+========================================================================
+READING THE FLOOR LEGEND
+========================================================================
+  the BEFORE model could not read legends at all: its class list stopped at button-3/floor-3, so every floor above that was unnameable by construction. Treat the before column as absent rather than as zero.
+
+              before     after   after %
+----------------------------------------
+correct            -       909     69.8%
+declined           -       241     18.5%
+WRONG              -       152     11.7%
+
+  of the ones it committed to: 85.7% right
+
+  worst confusions after (truth -> reported):
+       6 -> G    x5
+      UG -> LG   x4
+       R -> B    x3
+      39 -> 29   x3
+      37 -> 27   x3
+      17 -> 7    x2
+      19 -> 9    x2
+       8 -> B    x2

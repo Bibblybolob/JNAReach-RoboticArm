@@ -158,6 +158,154 @@ Needs a verified calibration at `~/hand_eye/eye_to_hand.json`; see
 
 ---
 
+## Making the arm precise and smooth — do these in order
+
+This is the hardware procedure. It is ordered deliberately: each step needs
+the one before it, and step 3 decides which of the later ones are worth doing
+at all. Nothing here can be done from a desk.
+
+**Precision and smoothness are different faults with different fixes.** A
+press that lands 5mm off is precision. A press that lunges and stops in jerks
+is smoothness. Do not tune one expecting the other to improve.
+
+### Where the error actually is
+
+Measured on this arm, not estimated:
+
+| source | contribution at ~300mm reach |
+|---|---|
+| **backlash, 0.79°** | **~4.1mm** — the dominant term |
+| hand-eye calibration | 3.2mm (5.0mm via depth) |
+| depth noise | ~1–2mm |
+| path bow between waypoints | 0.31mm (was 2.88mm) |
+| IK | 0.03mm |
+
+Root-sum-square is about **5–6mm**. Against a 20mm button that works; against
+a 10mm button it is marginal. **Do not spend time on the IK** — at 0.03mm it
+is four orders of magnitude below the term that matters.
+
+### 1. Measure the tool
+
+```bash
+./scripts/measure_tool.py
+```
+
+`--tool-mm` defaults to **0**, which drives the *flange origin* onto the
+button, so anything protruding contacts short by its own length. Every command
+below needs this number.
+
+The script **refuses** rather than printing a number when the poses disagree
+by more than 8mm — a bare arm gives 146mm of spread, because with nothing
+slender fitted the answer is whatever bit of flange body falls near the axis.
+A refusal means no tool is fitted, not that the script failed.
+
+### 2. Park the arm where it can actually aim
+
+Measured for a 27.7mm tool, as `aim off normal / body clearance`:
+
+| base→panel | button 120mm up | 160mm up | 200mm up |
+|---|---|---|---|
+| **120mm** | refused | 18.5° / 78mm | 17.3° / 100mm |
+| **150mm** | refused | 18.6° / 77mm | 20.0° / 102mm |
+| **180mm** | 19.2° / 48mm | 20.5° / 79mm | 24.5° / 128mm |
+| **210mm** | 21.5° / 53mm | 24.5° / 83mm | 37.8° / 128mm |
+
+**Park with the button 120–180mm from the base and 160–200mm up.** Low buttons
+at close range do not plan at all, and the far corner degrades to 37.8°. On a
+wheelchair this is a *mounting-height specification*, not a preference: if the
+chair cannot reliably reach that band, fix the mount before tuning anything.
+
+### 3. Dry run, then one real press
+
+```bash
+./scripts/press_button.py 5 --tool-mm <measured> --dry-run
+./scripts/press_button.py 5 --tool-mm <measured> --speed 20
+```
+
+Three printed lines decide whether the rest is meaningful:
+
+- **`panel normal from N buttons:`** — if absent, it fell back to a
+  radial-from-base approach, which is ~30° off the truth. Everything
+  downstream inherits that error.
+- **`aim: X deg off the panel normal`** — if absent, the full-pose solve
+  failed and the tool arrives pointing an arbitrary way.
+- **`contact: pressed / NONE / BLOCKED`** — `NONE` means the tool reached the
+  touch pose without resistance, so the button was not where depth said it
+  was. `BLOCKED` means something that is not a button stopped the arm.
+
+Keep a hand near the stop. The closed-loop waiting, straight-line approach,
+lookahead, blending and contact detection are verified in simulation and by
+~100 tests, but this is the first time they move a real arm.
+
+### 4. The repeatability test — the one that decides everything after
+
+Press the **same button 10 times from the same parking spot** and record where
+the tip lands.
+
+- **Tight cluster in the wrong place** → systematic error (calibration, tool
+  length). It is *subtractable*: go to step 7.
+- **Scattered cluster** → random error (backlash, depth noise). Not
+  subtractable: go to step 6.
+
+Do not skip this. The two outcomes have opposite remedies, and without it any
+further tuning is guesswork.
+
+### 5. Fit a domed, compliant tip
+
+A flat face at ~20° off normal contacts on one edge and can skid. A
+hemispherical tip contacts identically at any angle — the only effect is a
+lateral shift of `r·sin(20°)`, which for a 2mm tip radius is **0.7mm**.
+
+**Compliance matters as much as the dome.** A rigid tip drives any depth
+over-estimate straight into the panel as load, and load is what makes this
+arm's Atom reboot. A spring-loaded shaft or a soft cap turns a force spike
+into travel, and it sharpens the stall signal the contact detection reads.
+
+### 6. Correct visually at the standoff *(if step 4 said scattered)*
+
+At the 40mm standoff, re-detect the button **and** the tool tip, measure the
+residual offset in the image, and null it before the final leg.
+
+This is the largest single precision win available. It replaces a *predicted*
+3.2mm calibration with a *measured* one, and it cancels mount drift from
+wheelchair vibration and parking variation at the same time — none of those
+survive a measurement taken 40mm from contact.
+
+### 7. Subtract the measured offset *(if step 4 said tight-but-wrong)*
+
+Take the mean miss over the 10 presses and apply it as a constant correction.
+Only works once the error is repeatable, which is what step 5 and the
+no-reversal planning below are for.
+
+### 8. Re-verify after any Atom reflash
+
+Reflashing wipes the servo zeros. Wrong zeros corrupt FK, which corrupts the
+hand-eye calibration underneath it even though nothing touched the camera.
+
+```bash
+./scripts/calibrate_zero.py
+./scripts/verify_calibration.py
+```
+
+### What NOT to do
+
+- **Do not lower `max_jog_accel_deg_s2`.** It is the intuitive fix for jerk
+  and it is wrong here. Measured: 1200 acquires in 0.36s, 600 in 2.02s, 300
+  often fails to converge — and steadiness once locked is **3px in all
+  three**. A gentler ramp costs only the getting there. The jerk is
+  stop-start *between* waypoints, which the lookahead already fixes.
+- **Do not tighten the arrival tolerance below 1.0°.** That is the 0.79°
+  backlash floor. The arm settles there at 4.5s and is flat out to 21s;
+  waiting longer buys nothing and every move starts reporting a failure to
+  arrive.
+- **Do not touch the IK.** 0.03mm.
+- **Do not let a joint reverse on the final approach.** `plan_press` now
+  measures this (`reversal_deg`) and re-solves to remove it. A reversal
+  re-opens that joint's backlash a few millimetres from the button, turning a
+  repeatable offset into random slop that step 7 cannot subtract.
+
+---
+
 ## Check the link if the arm misbehaves
 
 The protocol has **no checksum** — a flipped bit in a joint angle is not a

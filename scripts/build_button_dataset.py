@@ -127,7 +127,7 @@ def main() -> int:
                     help='copies of each train image containing up/down')
     ap.add_argument('--min-reader-support', type=int, default=25,
                     help='drop reader classes with fewer crops than this.')
-    ap.add_argument('--reader-balance', type=int, default=700,
+    ap.add_argument('--reader-balance', type=int, default=1200,
                     help='hardlink copies of under-represented reader '
                          'classes up to about this many crops (0 = off)')
     ap.add_argument('--max-reader-copies', type=int, default=4,
@@ -343,8 +343,16 @@ def main() -> int:
                 # up/down oversample is 3x and not 8x.
                 if split == 'train' and args.reader_balance > 0:
                     have = read_counts.get(lab, 1)
+                    # ROUND, not floor. Integer division is a step function
+                    # and it steps in the wrong place: with a target of 1200,
+                    # floor 6 (665 crops) got 1200//665 = 1, i.e. nothing,
+                    # because two copies would overshoot -- while floor 7 at
+                    # 593 got two. Floor 6 was the WORST class in the range
+                    # (74.9% top-1, 4.5% wrong), so the crudeness of the
+                    # arithmetic was deciding which weak class got help.
                     reps = min(args.max_reader_copies,
-                               max(1, args.reader_balance // max(1, have)))
+                               max(1, int(round(args.reader_balance
+                                                / max(1, have)))))
                     for r in range(1, reps):
                         link_or_copy(base, os.path.join(
                             d, f'{stem}_{i}__b{r}.jpg'))

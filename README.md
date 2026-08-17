@@ -101,16 +101,47 @@ tidying up: unloading the arm alone took valid replies from 18% to 96% on
 ## Press a button
 
 ```bash
-./scripts/press_button.py --look        # detect only, no motion
-./scripts/press_button.py 5 --dry-run   # plan and print, command nothing
-./scripts/press_button.py 5             # standoff, touch, retract, park
+./scripts/press_button.py --look          # detect only, no motion
+./scripts/press_button.py up --dry-run    # plan and print, command nothing
+./scripts/press_button.py 5 --tool-mm 27.7
+./scripts/press_button.py B1 --tool-mm 27.7
 ```
 
 The whole chain in one command:
 
 ```
-keypad_finder -> depth -> target_in_base -> plan_press -> send_angles
+detector -> depth -> target_in_base -> plan_press -> arm_motion -> send_angles
 ```
+
+**The button is named, not numbered.** `up`, `down`, `help`, `open`, `close`,
+or a floor legend — `5`, `B1`, `G`, `LG`. The hall call is the whole point:
+`up` and `down` are the project's top priority and were not expressible at all
+while this argument took an integer.
+
+### Which detector
+
+`--detector auto` (the default) runs the **trained two-stage model** and falls
+back to the geometric finder. They solve different panels and neither
+supersedes the other:
+
+| | good for | fails on |
+|---|---|---|
+| **model** (stage A + reader) | real lifts, any layout, reads legends | the lab's printed panel |
+| **geometric** (`keypad_finder`) | the lab's printed 12-button panel | anything else — the lattice is hard-coded |
+
+Force one with `--detector model` or `--detector geometric`.
+
+Falling back is safe in the direction that matters: `keypad_finder` refuses a
+frame it cannot fit rather than mislabelling one, so the worst case is a retry.
+
+**A button whose legend was not read confidently is shown as `floor?` and is
+deliberately unaskable.** It is a real button, found and located, and it still
+counts toward the panel plane fit — but `5` will not match it, so the arm
+cannot press it believing it is 5. Raise or lower that line with `--read-min`
+(0.95; at 0.75 the reader was confidently wrong on 11.7% of legends).
+
+Keyholes and emergency stops are detected and then **withheld** — they never
+become press targets at any confidence.
 
 Every stage **refuses rather than guessing**, because each can produce a
 confident wrong answer that ends with the arm driving somewhere real. The
@@ -120,12 +151,16 @@ rejects a depth outside the D405's usable band; `plan_press` rejects a
 standoff/touch pair that changes arm configuration, which would swing the arm
 through the panel on the way. A refusal costs a retry, never a wrong button.
 
-**Detection is geometric — no model.** `elevator_buttons.pt` cannot see this
-panel at all: measured 2026-08-14, zero detections at the 0.5 threshold and
-nothing above 0.12 even at 0.05, and it has no class above `button-3` against
-a 12-floor keypad. YOLO-World zero-shot found nothing either. So
-`keypad_finder.py` uses the geometry instead — equal-sized ellipses on a
+**Why the geometric finder still exists.** The *old* `elevator_buttons.pt`
+could not see the lab's printed panel at all — measured 2026-08-14, zero
+detections at 0.5 and nothing above 0.12 even at 0.05, and no class above
+`button-3` against a 12-floor keypad. YOLO-World zero-shot found nothing
+either. `keypad_finder.py` uses geometry instead — equal-sized ellipses on a
 lattice — and gets all twelve at **10/12 frames, ~400ms, 0.26px jitter**.
+
+The two-stage model replaces it for *real* panels (`floor` recall 0.952,
+`up`/`down` 0.674/0.744 on 202 held-out real lifts, 51.5ms on the GPU), but it
+has not been shown to read the inkjet print, so the fallback stays.
 
 **Resolution is load-bearing.** 1280×720 is the default because at 640×480 the
 buttons are r≈12px and rows drop out: **10/12 frames against 2/6.**

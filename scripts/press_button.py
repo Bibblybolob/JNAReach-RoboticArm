@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Press a numbered button on the panel: see it, place it, plan it, touch it.
+"""Press a NAMED button on the panel: see it, place it, plan it, touch it.
 
-    ./scripts/press_button.py 5              # press button 5
-    ./scripts/press_button.py 5 --dry-run    # plan and print, command nothing
-    ./scripts/press_button.py --look         # just detect, no motion at all
+    ./scripts/press_button.py up --tool-mm 27.7   # the hall call
+    ./scripts/press_button.py 5  --tool-mm 27.7   # a floor, by its legend
+    ./scripts/press_button.py 5  --dry-run        # plan and print, no motion
+    ./scripts/press_button.py --look              # detect only, no motion
+
+The target is NAMED, not numbered: up, down, help, open, close, or a floor
+legend (5, B1, G, LG). `up` and `down` are this project's top priority and
+were not expressible at all while this took an integer.
 
 The whole chain in one command:
 
-    keypad_finder  ->  depth  ->  target_in_base  ->  plan_press  ->  send_angles
+    detector  ->  depth  ->  target_in_base  ->  plan_press  ->  arm_motion
 
 Each stage refuses rather than guessing, because every one of them can produce
 a confident wrong answer that ends with the arm driving somewhere real:
 
-  - the finder REFUSES a frame whose row count does not match the layout,
-    since a missed row shifts every number and presses the wrong floor
+  - the model REFUSES to name a legend it is not sure of, so an unread button
+    shows as `floor?` and cannot be asked for; the geometric finder REFUSES a
+    frame whose row count does not match the layout, since a missed row shifts
+    every number and presses the wrong floor
   - target_in_base REFUSES a depth outside the D405's usable band
   - plan_press REFUSES a standoff/touch pair that changes arm configuration,
     which would swing the arm through the panel on the way
@@ -25,8 +32,8 @@ the buttons are r~12px and rows drop out. Hence the default.
 The two known limits, both stated in the output rather than hidden:
 
   - `--tool-mm` defaults to 0, so the FLANGE ORIGIN is driven onto the button
-    and whatever protrudes past it lands short or long by that much. Measured
-    ~13mm on the first presses. Pass the real number once measured.
+    and whatever protrudes past it lands short or long by that much. The
+    fitted presser is 27.7mm; pass it every time.
   - the tool cannot generally be held square to the panel: exact aim costs
     ~25mm of position at most placements. This aims as squarely as the arm
     allows while still hitting the button, and prints how square that was.
@@ -75,6 +82,143 @@ CALIB = os.path.expanduser('~/hand_eye/eye_to_hand.json')
 PARK = [-60.0, 30.0, -110.0, 15.0, 0.0, 0.0]
 
 
+_MODELS = {}
+
+
+def find_with_model(img, args):
+    """Locate buttons with the trained two-stage models.
+
+    Returns the same {label: (x, y, half_w, half_h)} shape `keypad_finder`
+    produces, so it drops into the rest of the chain unchanged. Labels are
+    what a caller would ask for: a floor legend (`5`, `B1`, `G`), or `up` /
+    `down` / `help` / `open` / `close`.
+
+    This is the difference between the lab and a real elevator.
+    `keypad_finder` solves the printed panel GEOMETRICALLY -- equal ellipses
+    on a lattice -- because no model could see it, and it is hard-coded to a
+    12-button layout that `label()` refuses to fit anything else. That is
+    exactly right for the bench and useless in a lift.
+
+    A button whose legend was not read confidently comes back as `floor?`
+    (numbered if there are several). It still counts for the panel plane fit
+    and still shows in --look, but asking for `5` will not match it, so the
+    arm cannot press it BELIEVING it is 5.
+    """
+    import torch
+    torch.backends.cudnn.enabled = False
+    from ultralytics import YOLO
+    from mycobot_perception.button_classes import (
+        DETECT_CLASSES, FORBIDDEN, UNREADABLE)
+
+    if not _MODELS:
+        for key, path, fallback, task in (
+                ('det', args.detect_weights, 'button_detect.pt', 'detect'),
+                ('rdr', args.read_weights, 'button_read.pt', 'classify')):
+            mdl = None
+            for cand in (path, os.path.join(_ROOT, fallback)):
+                if not cand:
+                    continue
+                try:
+                    mdl = YOLO(cand, task=task)
+                    print(f'  {key}: {os.path.basename(cand)}')
+                    break
+                except Exception as e:  # noqa: BLE001
+                    print(f'  {key}: {cand} would not load ({e})')
+            _MODELS[key] = mdl
+    det, rdr = _MODELS.get('det'), _MODELS.get('rdr')
+    if det is None:
+        raise kf.KeypadError('no button detector available')
+
+    res = det.predict(img, conf=args.conf, device=args.device,
+                      verbose=False)[0]
+    if res.boxes is None or not len(res.boxes):
+        raise kf.KeypadError('the detector found no buttons')
+
+    H, W = img.shape[:2]
+    xy = res.boxes.xyxy.cpu().numpy()
+    cls = res.boxes.cls.cpu().numpy().astype(int)
+
+    # Read the legend off every floor crop, in one batch. A panel has a dozen
+    # of them and per-crop calls would pay the inference overhead a dozen
+    # times for images that are 128px.
+    legend = {}
+    if rdr is not None:
+        crops, idx = [], []
+        for i, (x1, y1, x2, y2) in enumerate(xy):
+            if DETECT_CLASSES[cls[i]] != 'floor':
+                continue
+            pw, ph = (x2 - x1) * args.crop_pad, (y2 - y1) * args.crop_pad
+            cr = img[int(max(0, y1 - ph)):int(min(H, y2 + ph)),
+                     int(max(0, x1 - pw)):int(min(W, x2 + pw))]
+            if cr.size:
+                crops.append(cr)
+                idx.append(i)
+        if crops:
+            for i, r in zip(idx, rdr.predict(crops, device=args.device,
+                                             verbose=False)):
+                conf = float(r.probs.top1conf)
+                nm = rdr.names[int(r.probs.top1)]
+                if conf >= args.read_min and nm != UNREADABLE:
+                    legend[i] = nm
+
+    found, unread = {}, 0
+    for i, (x1, y1, x2, y2) in enumerate(xy):
+        kind = DETECT_CLASSES[cls[i]]
+        if kind in FORBIDDEN and kind != 'other':
+            # A keyhole or an emergency stop is real and worth knowing about,
+            # but it must never become a press target, so it is not given a
+            # label anyone can ask for.
+            continue
+        if kind == 'floor':
+            lab = legend.get(i)
+            if lab is None:
+                unread += 1
+                lab = 'floor?' if unread == 1 else f'floor?{unread}'
+        elif kind == 'other':
+            continue
+        else:
+            lab = kind
+        # Two of a kind on one panel (two `help` buttons, say) must not
+        # overwrite each other -- the plane fit wants both.
+        if lab in found:
+            n = 2
+            while f'{lab}#{n}' in found:
+                n += 1
+            lab = f'{lab}#{n}'
+        found[lab] = (float((x1 + x2) / 2), float((y1 + y2) / 2),
+                      float((x2 - x1) / 2), float((y2 - y1) / 2))
+    if not found:
+        raise kf.KeypadError('buttons detected, but none of a pressable kind')
+    return found
+
+
+def detect(img, dep, args):
+    """Locate the buttons with whichever detector was asked for.
+
+    `auto` runs the MODEL first and falls back to the geometric finder,
+    because the two solve different panels and neither supersedes the other:
+    the model generalises to real lifts, and keypad_finder is the only thing
+    that has ever worked on the lab's printed panel -- measured 2026-08-14,
+    the shipped detector scored zero on it at every scale and threshold, and
+    YOLO-World found nothing across three prompt sets.
+
+    Falling back is safe in the direction that matters. keypad_finder refuses
+    a frame it cannot fit rather than mislabelling one, so the worst case is
+    a retry.
+    """
+    if args.detector in ('model', 'auto'):
+        try:
+            return find_with_model(img, args)
+        except kf.KeypadError:
+            if args.detector == 'model':
+                raise
+    labelled = kf.find_labelled(
+        img, depth_mm=dep, depth_range=(args.near, args.far))
+    # Geometric labels are ints; everything downstream compares strings, so
+    # that `up` and `B1` are askable in exactly the same way as `5`.
+    return {str(k): v for k, v in labelled.items()}
+
+
 def look(args):
     """Grab one frame and locate the buttons. Returns (found, colour, depth)."""
     import pyrealsense2 as rs
@@ -101,8 +245,7 @@ def look(args):
             dep = (np.asanyarray(fr.get_depth_frame().get_data())
                    .astype(float) * scale)
             try:
-                found = kf.find_labelled(
-                    img, depth_mm=dep, depth_range=(args.near, args.far))
+                found = detect(img, dep, args)
                 intr = {'fx': it.fx, 'fy': it.fy, 'cx': it.ppx, 'cy': it.ppy}
                 return found, img, dep, intr
             except kf.KeypadError as e:
@@ -117,8 +260,34 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('button', nargs='?', type=int,
-                    help='which numbered button to press')
+    # A STRING, not an int. The whole point of the model detector is that the
+    # hall call is askable: `up` and `down` are the project's top priority and
+    # were not expressible at all while this took a number. `B1`, `G` and `LG`
+    # come along for free.
+    ap.add_argument('button', nargs='?', type=str,
+                    help="which button: a floor legend (5, B1, G), or "
+                         "up / down / help / open / close")
+    ap.add_argument('--detector', choices=('auto', 'model', 'geometric'),
+                    default='auto',
+                    help='auto (default) tries the trained model and falls '
+                         'back to the geometric finder, which is the only '
+                         "thing that works on the lab's printed panel")
+    ap.add_argument('--detect-weights',
+                    default=os.path.join(_ROOT, 'button_detect.engine'),
+                    help='stage A. TensorRT engine, or a .pt')
+    ap.add_argument('--read-weights',
+                    default=os.path.join(_ROOT, 'button_read.engine'),
+                    help='stage B, the legend reader')
+    ap.add_argument('--conf', type=float, default=0.5,
+                    help='stage A detection threshold')
+    # Must match the node's reader_min_confidence. Measured 2026-08-17 over
+    # 1302 detected crops: 0.75 gave 11.7% confidently WRONG legends, 0.95
+    # gives 6.8%. A decline costs a retry; a wrong read presses another floor.
+    ap.add_argument('--read-min', type=float, default=0.95,
+                    help='below this the legend is not published at all')
+    ap.add_argument('--crop-pad', type=float, default=0.12,
+                    help="must match the builder's --crop-pad")
+    ap.add_argument('--device', default='0')
     ap.add_argument('--look', action='store_true',
                     help='detect and report only; command no motion')
     ap.add_argument('--dry-run', action='store_true',
@@ -164,11 +333,25 @@ def main() -> int:
     if args.look:
         return 0
 
-    if args.button not in found:
-        print(f'button {args.button} is not among the detected ones')
+    # Case-insensitive, so `UP` and `b1` work. Matched against the exact
+    # labels only -- never a prefix or a fuzzy match, because `1` matching
+    # `19` is a wrong floor arrived at by string handling.
+    want = str(args.button).strip().lower()
+    key = next((k for k in found if k.lower() == want), None)
+    if key is None:
+        askable = sorted(k for k in found if not k.startswith('floor?'))
+        unread = sum(1 for k in found if k.startswith('floor?'))
+        print(f'button {args.button!r} is not among the detected ones')
+        print(f'  askable: {askable}')
+        if unread:
+            # Worth separating: these ARE buttons, found and located. The
+            # reader would not commit to their legend, so they are deliberately
+            # unaskable rather than missing.
+            print(f'  plus {unread} button(s) whose legend was not read '
+                  f'confidently (--read-min {args.read_min})')
         return 1
 
-    u, v = found[args.button][0], found[args.button][1]
+    u, v = found[key][0], found[key][1]
     patch = dep[int(v) - 4:int(v) + 5, int(u) - 4:int(u) + 5]
     val = patch[patch > 0]
     if val.size < 5:

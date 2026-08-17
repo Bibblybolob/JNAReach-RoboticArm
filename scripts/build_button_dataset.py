@@ -125,11 +125,14 @@ def main() -> int:
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--oversample', type=int, default=3,
                     help='copies of each train image containing up/down')
-    ap.add_argument('--min-reader-support', type=int, default=40,
-                    help='drop reader classes with fewer crops than this. A '
-                         'legend with six examples is worse than an absent '
-                         'one: the model emits it rarely and wrongly, and '
-                         'here that means pressing the wrong floor.')
+    ap.add_argument('--min-reader-support', type=int, default=25,
+                    help='drop reader classes with fewer crops than this.')
+    ap.add_argument('--reader-balance', type=int, default=700,
+                    help='hardlink copies of under-represented reader '
+                         'classes up to about this many crops (0 = off)')
+    ap.add_argument('--max-reader-copies', type=int, default=4,
+                    help='cap on those copies; past a point it only overfits '
+                         'the same few images harder')
     ap.add_argument('--min-crop-px', type=int, default=12,
                     help='skip crops smaller than this on either side')
     ap.add_argument('--crop-pad', type=float, default=0.12,
@@ -321,8 +324,31 @@ def main() -> int:
                 d = os.path.join(read_root, split, lab)
                 os.makedirs(d, exist_ok=True)
                 stem = os.path.splitext(os.path.basename(img_path))[0]
-                cv2.imwrite(os.path.join(d, f'{stem}_{i}.jpg'), crop)
+                base = os.path.join(d, f'{stem}_{i}.jpg')
+                cv2.imwrite(base, crop)
                 written[lab] += 1
+
+                # BALANCE THE PRIOR, train split only.
+                #
+                # Measured 2026-08-17: every legend confusion in the
+                # end-to-end eval ran from a RARER class to a COMMONER one --
+                # 17(149 crops) -> 7(408), 19(142) -> 9(344), 8(385) -> B(126)
+                # being the exception that proves it. A classifier with no
+                # reweighting learns the prior, and the prior says a numeral
+                # is more likely to be single-digit.
+                #
+                # Copies are hardlinks, so this costs no disk. Capped, because
+                # past a point it stops adding balance and only overfits the
+                # same few crops harder -- the same reason the detector's
+                # up/down oversample is 3x and not 8x.
+                if split == 'train' and args.reader_balance > 0:
+                    have = read_counts.get(lab, 1)
+                    reps = min(args.max_reader_copies,
+                               max(1, args.reader_balance // max(1, have)))
+                    for r in range(1, reps):
+                        link_or_copy(base, os.path.join(
+                            d, f'{stem}_{i}__b{r}.jpg'))
+                        written[lab] += 1
 
     # Ultralytics classification wants train/ and val/ to hold the same class
     # directories. A legend that happens to appear only in train produces a

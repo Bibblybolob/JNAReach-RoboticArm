@@ -68,6 +68,57 @@ ARRIVE_TOL_DEG = 1.0
 # final pose is held to ARRIVE_TOL_DEG.
 BLEND_TOL_DEG = 4.0
 
+# Seconds of travel to command BEYOND each intermediate waypoint.
+#
+# The same trick and the same value as the driver's `jog_lookahead`, for the
+# same reason, in its own words: "send_angles is point-to-point. Handed a
+# fresh target every command interval it sprints the gap, stops, and waits,
+# and at servo rates that stop-start IS the visible jerk."
+#
+# Commanding slightly past a waypoint means the arm is still accelerating
+# through it when the next command lands, so the path is walked instead of
+# hopped. It self-cancels: the last waypoint gets none, and the clamp below
+# means the tool can never be commanded past the button.
+LOOKAHEAD_S = 0.12
+
+# Fraction of the estimated segment time to wait before issuing the next
+# waypoint. Gating on a POSITION READ instead means one slow or garbled reply
+# stalls the whole path -- the link carries ESP32 console output and the
+# Feetech bus, so that is not hypothetical. Time is the primary gate and the
+# tolerance is an early exit, so a fast segment still moves on early.
+BLEND_FRAC = 0.6
+
+# The last segment is commanded at this fraction of the speed. Slower into
+# contact is gentler on the button and on the arm, and it sharpens the stall
+# signal that press_button.py reads as "the button resisted" -- a fast
+# approach overshoots into the panel and blurs that distinction.
+FINAL_SPEED_FRAC = 0.5
+
+
+def lookahead_target(w_cur, w_next, w_final, lookahead_deg):
+    """`w_next`, pushed further along the direction of travel.
+
+    Clamped per joint so it can never pass `w_final`. That clamp is the whole
+    safety argument: the final waypoint is ON the button, and overshooting it
+    is pressing through the panel.
+    """
+    import numpy as np
+
+    c = np.asarray(w_cur, dtype=float)
+    n = np.asarray(w_next, dtype=float)
+    f = np.asarray(w_final, dtype=float)
+    d = n - c
+    L = float(np.linalg.norm(d))
+    if L < 1e-9 or lookahead_deg <= 0.0:
+        return [float(v) for v in n]
+    t = n + d / L * lookahead_deg
+    for j in range(len(t)):
+        if d[j] > 0:
+            t[j] = min(t[j], max(f[j], n[j]))
+        elif d[j] < 0:
+            t[j] = max(t[j], min(f[j], n[j]))
+    return [float(v) for v in t]
+
 
 def travel_budget_s(travel_deg: float, speed: int) -> float:
     """How long a move of this size may take, with headroom.
@@ -151,7 +202,8 @@ def move_to(angles, speed, guard=None, tol=ARRIVE_TOL_DEG, name='move',
 
 
 def stream_path(waypoints, speed, guard=None, blend_tol=BLEND_TOL_DEG,
-                final_tol=ARRIVE_TOL_DEG, name='approach', verbose=True):
+                final_tol=ARRIVE_TOL_DEG, name='approach', verbose=True,
+                blend_frac=BLEND_FRAC, final_speed_frac=FINAL_SPEED_FRAC):
     """Run a sequence of joint waypoints as ONE continuous motion.
 
     Every waypoint but the last is blended: the arm moves on once it is
@@ -177,26 +229,55 @@ def stream_path(waypoints, speed, guard=None, blend_tol=BLEND_TOL_DEG,
                           f'before anything moved -- {why}')
                 return False, float('inf')
 
+    deg_per_s = DEG_PER_S_AT_100 * max(speed, 1) / 100.0
+    la_deg = deg_per_s * LOOKAHEAD_S
+    here = measured_angles()
+    prev = here if here is not None else wps[0]
+
     for i, w in enumerate(wps):
         last = (i == len(wps) - 1)
-        here = measured_angles()
-        travel = 90.0 if here is None else max(
-            abs(a - b) for a, b in zip(here, w))
-        request({'cmd': 'send_angles', 'angles': w, 'speed': speed,
+        travel = max(abs(a - b) for a, b in zip(prev, w))
+
+        # Slow into contact (step 6), and aim past the waypoint on every
+        # segment but the last (step 1).
+        seg_speed = int(round(speed * final_speed_frac)) if last else speed
+        seg_speed = max(1, seg_speed)
+        cmd = list(w) if last else lookahead_target(prev, w, wps[-1], la_deg)
+
+        # The LOOKAHEAD target is what actually gets commanded, so that is
+        # what has to be safe. Guard-checking only the waypoints would clear a
+        # pose the arm is never sent while sending one nobody checked.
+        if guard is not None and not last:
+            ok, why = guard.check(cmd)
+            if not ok:
+                if verbose:
+                    print(f'{name}: lookahead past waypoint {i + 1} is '
+                          f'unsafe ({why}); commanding the waypoint itself')
+                cmd = list(w)
+
+        request({'cmd': 'send_angles', 'angles': cmd, 'speed': seg_speed,
                  'force': True}, timeout=30)
-        arrived, err = wait_for_arrival(
-            w, travel, speed,
-            tol=final_tol if last else blend_tol,
-            confirmations=2 if last else 1)
+
         if last:
+            arrived, err = wait_for_arrival(w, travel, seg_speed,
+                                            tol=final_tol, confirmations=2)
             if verbose:
                 state = 'arrived' if arrived else 'stopped short'
                 print(f'  {name}: {state} at the final pose '
                       f'({err:.2f}deg worst)')
             return arrived, err
-        if not arrived and verbose:
-            # Not fatal on a blended waypoint: the arm may simply be slower
-            # than the budget. Worth saying, because a path that blends every
-            # point by timing out is a path being executed as a slideshow.
-            print(f'  {name}: waypoint {i + 1} timed out at {err:.2f}deg')
+
+        # Blend on TIME, with the tolerance as an early exit (step 7).
+        # Progress is measured against the waypoint, never against the
+        # lookahead target -- the arm is not meant to reach that one.
+        budget = travel_budget_s(travel, seg_speed) * blend_frac
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            st = request({'cmd': 'state'})
+            if st and st.get('angles') and len(st['angles']) == 6 \
+                    and st.get('age_ms', 1e9) < 1500:
+                if max(abs(a - b) for a, b in zip(st['angles'], w)) <= blend_tol:
+                    break
+            time.sleep(0.05)
+        prev = w
     return False, float('inf')

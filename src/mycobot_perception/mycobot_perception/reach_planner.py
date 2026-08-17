@@ -91,6 +91,12 @@ def approach_direction(target_xyz):
 # flat and meeting it on one edge.
 TOOL_AXIS = (-0.157, -0.011, -0.988)
 
+# Backward joint travel small enough to stop caring about, in degrees.
+# A reversal can only re-open backlash up to its own size, and this arm's
+# backlash is 0.79deg (measured 2026-08-13). Anything a third of that is
+# already inside the floor.
+REVERSAL_OK_DEG = 0.25
+
 
 def approach_rotation(approach_dir, seed_R=None, tool_axis=TOOL_AXIS):
     """Flange orientation that points the tool along `approach_dir`.
@@ -179,6 +185,43 @@ def panel_clearance(angles_deg, panel_point, panel_normal, ignore_m=0.09):
         if np.linalg.norm(p - flange) < ignore_m:
             continue
         worst = min(worst, float(-(p - c) @ n))
+    return worst
+
+
+def path_reversal_deg(path_deg, ignore_below=0.05):
+    """How far any joint travels BACKWARDS along a path, in degrees.
+
+    A joint that reverses mid-approach re-opens its backlash at the worst
+    possible moment -- with the tool already inside the standoff distance and
+    a few millimetres from the button. It is also a velocity sign change,
+    which is the jerk you can see.
+
+    Backlash on this arm is 0.79deg (measured 2026-08-13, settled at 4.5s and
+    flat out to 21s). That number is only a REPEATABLE offset if every joint
+    takes it up in the same direction every time; a reversal turns it back
+    into random slop that no calibration can subtract.
+
+    Returns the worst per-joint backward travel. Motion below `ignore_below`
+    is not counted -- at that scale it is solver noise, not a direction.
+    """
+    import numpy as np
+
+    P = np.asarray(path_deg, dtype=float)
+    if P.ndim != 2 or len(P) < 3:
+        return 0.0
+    steps = np.diff(P, axis=0)
+    worst = 0.0
+    for j in range(P.shape[1]):
+        col = steps[:, j]
+        sig = col[np.abs(col) > ignore_below]
+        if len(sig) < 2:
+            continue
+        net = sig.sum()
+        if abs(net) < 1e-9:
+            continue
+        dom = 1.0 if net > 0 else -1.0
+        back = float(np.abs(sig[np.sign(sig) != dom]).sum())
+        worst = max(worst, back)
     return worst
 
 
@@ -328,6 +371,7 @@ def plan_press(target_xyz, tool_length_m=0.0, standoff_m=0.04,
     if orientation is not False:
         want_R = approach_rotation(d)
 
+    seed0 = seed
     out = {}
     used_full = True
 
@@ -369,10 +413,16 @@ def plan_press(target_xyz, tool_length_m=0.0, standoff_m=0.04,
                       flange_pre + d * (standoff_m * i / n_steps)))
     steps.append(('touch', flange_touch))
 
-    for name, xyz in steps:
+    def solve_path(continuity):
+      """Solve every waypoint at this continuity weight. Raises ReachError."""
+      out = {}
+      used_full = True
+      seed = seed0
+      for name, xyz in steps:
         # Aim as squarely as the arm allows without missing the button.
         if want_R is not None:
-            qa, align, perr = _aim(ik_mod, xyz, want_R, seed, panel=panel)
+            qa, align, perr = _aim(ik_mod, xyz, want_R, seed, panel=panel,
+                                   continuity=continuity)
             if qa is not None:
                 out[f'{name}_alignment'] = align
                 out[f'{name}_pos_err_mm'] = perr * 1000.0
@@ -445,6 +495,52 @@ def plan_press(target_xyz, tool_length_m=0.0, standoff_m=0.04,
         # different elbow configuration for two points 40mm apart, and the arm
         # flips between them -- through the panel.
         seed = q
+      out['path_deg'] = [out[f'{nm}_deg'] for nm, _ in steps]
+      return out, used_full
+
+    # NO JOINT MAY TRAVEL BACKWARDS ON THE APPROACH.
+    #
+    # Each waypoint is solved seeded from the last, which keeps the arm in one
+    # configuration but does not stop a joint drifting one way and then back.
+    # Measured 2026-08-16 on an off-axis target: joint5 reversed. It was only
+    # 0.88deg, but a reversal re-opens that joint's backlash a few millimetres
+    # from the button, and it turns the 0.79deg backlash from a repeatable
+    # offset -- which can be calibrated out -- into random slop, which cannot.
+    #
+    # `continuity` is the weight _aim puts on staying near its seed, so raising
+    # it buys smoothness at the cost of squareness. Rather than pick one value,
+    # solve at several and keep the straightest path that still meets position
+    # tolerance. Nothing is given up: a higher weight that produced a worse
+    # path simply loses.
+    # Retrying is EXPENSIVE and usually pointless, so it is conditional.
+    # Measured 2026-08-16: solving all three weights unconditionally took
+    # 18.9s on an off-axis target against 2.5s for one, and the extra two
+    # solves did not win -- the default weight still produced the straightest
+    # path. Planning is already the largest software cost in the press, so
+    # tripling it on spec is the wrong trade.
+    #
+    # REVERSAL_OK_DEG is 0.25 because a reversal can only re-open backlash up
+    # to its own size, and this arm's backlash is 0.79deg. A reversal a third
+    # of that is already lost in the floor, so buying it back with 12 seconds
+    # of planning and a worse aim angle is a bad exchange.
+    best = None
+    first_err = None
+    for cont in (0.3, 1.5, 5.0):
+        try:
+            o, uf = solve_path(cont)
+        except ReachError as e:
+            first_err = first_err or e
+            continue
+        rev = path_reversal_deg(o['path_deg'])
+        if best is None or rev < best[0]:
+            best = (rev, o, uf, cont)
+        if rev <= REVERSAL_OK_DEG:
+            break        # good enough; a stiffer weight can only cost aim
+    if best is None:
+        raise first_err
+    _rev, out, used_full, _cont = best
+    out['reversal_deg'] = float(_rev)
+    out['continuity_used'] = float(_cont)
 
     # Verify that adjacency rather than trusting the seed to have produced it.
     jump = max(abs(a - b) for a, b in
@@ -459,7 +555,6 @@ def plan_press(target_xyz, tool_length_m=0.0, standoff_m=0.04,
     # The whole motion in order, for a caller that streams it. Kept alongside
     # standoff_deg/touch_deg rather than replacing them so existing callers
     # and the adjacency check above are unaffected.
-    out['path_deg'] = [out[f'{nm}_deg'] for nm, _ in steps]
     out['path_names'] = [nm for nm, _ in steps]
     out['approach_dir'] = [float(v) for v in d]
     out['orientation_constrained'] = bool(want_R is not None)

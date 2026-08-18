@@ -124,34 +124,70 @@ except ReachError:
 
 # --- the two poses stay in the same arm configuration -----------------------
 
-plan = plan_press(TARGET, tool_length_m=0.03, standoff_m=0.05)
-check('standoff and touch are adjacent in joint space',
+# Position-only first, which is the path that always exists. TARGET stopped
+# admitting an AIMED plan when TOOL_AXIS's sign was corrected on 2026-08-18 --
+# pointing the tool at a target is a different, harder request than pointing
+# the LED face at it, and it changes which targets are feasible. That is the
+# geometry changing, not the adjacency rule, so the rule is checked on a
+# target that still plans as well as on the position-only path.
+plan = plan_press(TARGET, tool_length_m=0.03, standoff_m=0.05,
+                  orientation=False)
+check('standoff and touch are adjacent, position-only',
       plan['max_joint_step_deg'] < 30.0)
+
+AIM_TARGET = (0.20, 0.05, 0.15)
+aimed = plan_press(AIM_TARGET, tool_length_m=0.03, standoff_m=0.05)
+check('standoff and touch are adjacent, aimed',
+      aimed['max_joint_step_deg'] < 30.0)
 
 # Every plan that comes back must be safe by the guard, at both ends.
 from mycobot_driver.collision_guard import CollisionGuard  # noqa: E402
 g = CollisionGuard(tool_offset_m=0.03)
 check('both returned poses pass the collision guard',
       g.check(plan['standoff_deg'])[0] and g.check(plan['touch_deg'])[0])
+check('both aimed poses pass the collision guard',
+      g.check(aimed['standoff_deg'])[0] and g.check(aimed['touch_deg'])[0])
 
 # --- a spread of reachable targets ------------------------------------------
 
-ok = 0
-tried = 0
-for x in (0.14, 0.18, 0.22):
-    for y in (-0.08, 0.0, 0.08):
-        for z in (0.10, 0.16):
-            tried += 1
-            try:
-                p = plan_press((x, y, z), tool_length_m=0.03, standoff_m=0.04)
-            except ReachError:
-                continue
-            tip = flange_xyz(p['touch_deg']) + np.array(
-                approach_direction((x, y, z))) * 0.03
-            if np.linalg.norm(tip - np.array((x, y, z))) < 2e-3:
-                ok += 1
-print(f'      ({ok} of {tried} sampled targets planned and verified)')
-check('most of a reachable workspace plans correctly', ok >= tried * 0.6)
+# Measured separately for the two paths, because they cover different amounts
+# of the workspace and conflating them hides which one regressed. Correcting
+# TOOL_AXIS's sign on 2026-08-18 cut the AIMED coverage -- pointing the tool
+# at a target is a stricter request than pointing the flange's other face at
+# it -- while position-only was unaffected. Measured that day, tool 30mm,
+# standoff 40mm, over the 18 sampled targets:
+#
+#     aimed          10/18 verified, 8 refused, 0 off by >2mm
+#     position-only  12/18 verified, 6 refused, 0 off by >2mm
+#
+# Note that NOTHING plans inaccurately -- every returned plan puts the tip on
+# the target to under 2mm. The shortfall is refusals, which is the planner
+# declining rather than guessing, so these bars are set just under the
+# measured values to catch a real regression without re-tuning on noise.
+def coverage(orientation):
+    ok = tried = 0
+    for x in (0.14, 0.18, 0.22):
+        for y in (-0.08, 0.0, 0.08):
+            for z in (0.10, 0.16):
+                tried += 1
+                try:
+                    p = plan_press((x, y, z), tool_length_m=0.03,
+                                   standoff_m=0.04, orientation=orientation)
+                except ReachError:
+                    continue
+                tip = flange_xyz(p['touch_deg']) + np.array(
+                    approach_direction((x, y, z))) * 0.03
+                if np.linalg.norm(tip - np.array((x, y, z))) < 2e-3:
+                    ok += 1
+    return ok, tried
+
+ok_pos, tried = coverage(False)
+ok_aim, _ = coverage('auto')
+print(f'      (position-only {ok_pos}/{tried}, aimed {ok_aim}/{tried} '
+      'planned and verified)')
+check('position-only plans most of a reachable workspace',
+      ok_pos >= tried * 0.6)
+check('aiming the tool still plans half of it', ok_aim >= tried * 0.5)
 
 print(f'\n{PASS} passed' + (f', {FAIL} FAILED' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

@@ -166,6 +166,11 @@ def main() -> int:
                          'stopping short. Unconstrained, the wrist falls where '
                          'the body can actually reach and contact happens -- '
                          'off-centre, but it happens.')
+    ap.add_argument('--base-radius-mm', type=float, default=None,
+                    help='shrink the modelled base column from its 60mm '
+                         'radius, letting through poses that pass closer to '
+                         'the base than the guard allows. The arm can hit '
+                         'itself; use only with eyes on it')
     ap.add_argument('--max-aim-deg', type=float, default=20.0,
                     help='refuse to press when the tool is further off the '
                          'panel normal than this. The tip misses by '
@@ -276,7 +281,18 @@ def main() -> int:
         print(f'  panel normal from {len(pts)} buttons: '
               f'({approach[0]:+.2f},{approach[1]:+.2f},{approach[2]:+.2f})')
 
-    guard = CollisionGuard()
+    # The base column the guard models is a cylinder of base_radius, and
+    # shrinking it is the ONLY way to let a plan through that would otherwise
+    # be refused for entering the base. Deliberately explicit and deliberately
+    # not a boolean "off": the message that prompts this reports how far from
+    # the axis the offending point is, so the operator can shrink the model to
+    # just below that and see exactly how much they have given up.
+    guard = (CollisionGuard() if args.base_radius_mm is None
+             else CollisionGuard(base_radius=args.base_radius_mm / 1000.0))
+    if args.base_radius_mm is not None:
+        print(f'  base column modelled at {args.base_radius_mm:.0f}mm radius '
+              f'instead of 60mm -- self-collision is NOT being checked below '
+              f'that')
     try:
         plan = reach_planner.plan_press(
             p, tool_length_m=args.tool_mm / 1000.0,

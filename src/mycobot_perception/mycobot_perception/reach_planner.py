@@ -89,7 +89,26 @@ def approach_direction(target_xyz):
 # It is close to -z but 9deg off it, and that 9deg is worth carrying rather
 # than idealising away: it is the difference between the face meeting a button
 # flat and meeting it on one edge.
-TOOL_AXIS = (-0.157, -0.011, -0.988)
+#
+# SIGN CORRECTED 2026-08-18, and the correction is the whole point. What was
+# measured above is the normal of the MARKER, and the marker is bolted to the
+# face carrying the Atom and its LED. The presser is mounted on the OPPOSITE
+# side, so the tool faces the other way and this vector must be negated. The
+# magnitude and the 9deg tilt are unaffected -- only which end is the tip.
+#
+# Observed, twice, before it was believed: the arm reached the button with the
+# tool pointing back at the camera and the LED at the panel, i.e. 180deg out,
+# while every printed figure read well -- "aim 19.3deg off normal", "tool tip
+# 9.2mm from the button".
+#
+# Those figures could not have caught it, and neither could projecting the
+# computed tip into the photo, which was tried: `plan_press` POSITIONS the
+# flange so that flange + TOOL_AXIS * tool_length lands on the button, so the
+# computed tip is on the button by construction whichever way the real tool
+# points. That projection is circular and proves nothing. What does test it is
+# a photograph of the wrist, or projecting the FLANGE ORIGIN, which is not
+# derived from this vector.
+TOOL_AXIS = (0.157, 0.011, 0.988)
 
 
 def approach_rotation(approach_dir, seed_R=None, tool_axis=TOOL_AXIS):

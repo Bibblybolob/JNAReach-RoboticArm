@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -62,6 +63,16 @@ CALIB = os.path.expanduser('~/hand_eye/eye_to_hand.json')
 # Clear of the camera's view of the panel: keypad 0.1% blocked against 27% at
 # home, measured 2026-08-14 by counting depth pixels nearer than the panel.
 PARK = [-60.0, 30.0, -110.0, 15.0, 0.0, 0.0]
+
+# Which panel is in front of the arm. These are NOT interchangeable: the lab's
+# printed sheet has eight rows (door-open/close and fan/alarm below the
+# numbers) and runs odd-left/even-right throughout, while PANEL_12 has six and
+# reverses the 9/10 row. Picking the wrong one either refuses outright on the
+# row count or, worse, numbers the buttons wrongly -- so it is an explicit
+# choice with no clever auto-detection.
+LAYOUTS = {'real': kf.PANEL_12,
+           'printed': kf.PANEL_12_PRINTED,
+           'printed-numbers': kf.PANEL_12_PRINTED_NUMBERS}
 
 
 def look(args):
@@ -91,13 +102,44 @@ def look(args):
                    .astype(float) * scale)
             try:
                 found = kf.find_labelled(
-                    img, depth_mm=dep, depth_range=(args.near, args.far))
+                    img, layout=LAYOUTS[args.layout],
+                    depth_mm=dep, depth_range=(args.near, args.far),
+                    # This layout covers only the top six rows of an
+                    # eight-row panel, so it must be told to check that the
+                    # rows it found really are the top ones.
+                    top_anchored=args.layout == 'printed-numbers')
                 intr = {'fx': it.fx, 'fy': it.fy, 'cx': it.ppx, 'cy': it.ppy}
                 return found, img, dep, intr
             except kf.KeypadError as e:
                 last = str(e)
         raise SystemExit(f'could not read the keypad in {args.tries} frames: '
                          f'{last}')
+    finally:
+        pipe.stop()
+
+
+def snap(args, path):
+    """One colour frame, saved. Used at the touch pose to SEE the contact."""
+    import pyrealsense2 as rs
+
+    pipe = rs.pipeline()
+    cfg = rs.config()
+    cfg.enable_stream(rs.stream.color, args.width, args.height,
+                      rs.format.bgr8, 30)
+    try:
+        pipe.start(cfg)
+    except Exception as e:                                     # noqa: BLE001
+        print(f'  (no photo: {type(e).__name__}: {str(e)[:60]})')
+        return None
+    try:
+        # Let auto-exposure settle; the arm now fills a chunk of the frame and
+        # the metering shifts when it arrives.
+        for _ in range(20):
+            fr = pipe.wait_for_frames(10000)
+        img = np.asanyarray(fr.get_color_frame().get_data())
+        cv2.imwrite(path, img)
+        print(f'  photo at the touch pose -> {path}')
+        return path
     finally:
         pipe.stop()
 
@@ -124,6 +166,22 @@ def main() -> int:
                          'stopping short. Unconstrained, the wrist falls where '
                          'the body can actually reach and contact happens -- '
                          'off-centre, but it happens.')
+    ap.add_argument('--max-aim-deg', type=float, default=20.0,
+                    help='refuse to press when the tool is further off the '
+                         'panel normal than this. The tip misses by '
+                         'tool_length*sin(angle), so a crooked pose contacts '
+                         'with the wrist instead (default: 20)')
+    ap.add_argument('--photo', default=None, metavar='PNG',
+                    help='where to write the photograph taken AT the touch '
+                         'pose (default ~/hand_eye/press_touch_<button>.png). '
+                         'This is the only unmediated check that the tool '
+                         'reached the button -- every other figure printed '
+                         'here is derived from FK and shares its errors')
+    ap.add_argument('--layout', choices=sorted(LAYOUTS), default='real',
+                    help='which panel is in front of the arm. "printed" is '
+                         'the lab sheet: eight rows, odd-left throughout. '
+                         '"real" is PANEL_12. Wrong choice presses the wrong '
+                         'button, so there is no auto-detect (default: real)')
     ap.add_argument('--standoff-mm', type=float, default=40.0)
     ap.add_argument('--speed', type=int, default=20)
     ap.add_argument('--width', type=int, default=1280)
@@ -140,7 +198,9 @@ def main() -> int:
         ap.error('give a button number, or --look')
 
     found, img, dep, intr = look(args)
-    print(f'detected {len(found)} buttons: {sorted(found)}')
+    # key=str because a layout may carry named buttons (open/close/fan/alarm)
+    # alongside the numbered ones, and int and str do not compare.
+    print(f'detected {len(found)} buttons: {sorted(found, key=str)}')
     if args.save:
         vis = img.copy()
         for n, (x, y, a, b) in found.items():
@@ -242,6 +302,23 @@ def main() -> int:
     if args.tool_mm == 0.0:
         print('  NOTE --tool-mm is 0, so the FLANGE ORIGIN goes on the '
               'button; anything protruding past it contacts off by that much')
+    # A press that is far off the normal does not press. The tip swings
+    # sideways by tool_length*sin(angle), so at 33deg a 27.7mm tool lands 15mm
+    # off a button of ~14mm radius -- it misses, and what reaches the panel
+    # first is the wrist. Photographed 2026-08-18: aim 33.3deg, every printed
+    # figure nominal, and the cone was in mid-air beside the buttons while the
+    # forearm lay across them. So refuse rather than report and continue.
+    if off is not None and not args.no_aim and off > args.max_aim_deg:
+        miss = (args.tool_mm or 1.0) * math.sin(math.radians(off))
+        print(f'\nrefusing: {off:.1f}deg off the panel normal exceeds '
+              f'--max-aim-deg {args.max_aim_deg:.0f}. A {args.tool_mm:.0f}mm '
+              f'tool at that angle puts its tip ~{miss:.0f}mm to the side of '
+              'the button, so the wrist reaches the panel before the tool '
+              'does. Move the panel closer to the base or raise it -- see '
+              'scripts/sweep_press_placement.py -- or pass a larger '
+              '--max-aim-deg if you really mean to.')
+        return 1
+
     if args.dry_run:
         print('\ndry run -- nothing commanded')
         return 0
@@ -263,13 +340,31 @@ def main() -> int:
         st = request({'cmd': 'state'}, timeout=20)
         if st and st.get('angles'):
             T = np.array(flange_transform(list(st['angles'])))
-            print(f'{name}: flange {np.linalg.norm(T[:3, 3] - np.array(p))*1000:.1f}mm '
-                  f'from the button')
+            # Report the TOOL TIP, not the flange origin. The flange distance
+            # flatters a crooked pose: with the tool 33deg off the normal, a
+            # 27.7mm tool puts its tip 27.7*sin(33) = 15mm SIDEWAYS of the
+            # button -- off it entirely, on a ~14mm radius button -- while the
+            # flange figure still reads a tidy "32.3mm", i.e. tool length plus
+            # a few mm. Photographed 2026-08-18 doing exactly that: the cone
+            # hung in mid-air beside the panel and the printout said success.
+            axis = np.array(reach_planner.TOOL_AXIS, dtype=float)
+            axis /= np.linalg.norm(axis)
+            tip = T[:3, 3] + T[:3, :3] @ (axis * (args.tool_mm / 1000.0))
+            print(f'{name}: tool tip {np.linalg.norm(tip - np.array(p))*1000:.1f}mm '
+                  f'from the button (flange origin '
+                  f'{np.linalg.norm(T[:3, 3] - np.array(p))*1000:.1f}mm)')
         return True
 
     if go('standoff', plan['standoff_deg']):
         if go('touch', plan['touch_deg']):
             time.sleep(0.6)
+            # A photograph AT THE TOUCH POSE, which is the only direct
+            # evidence that the tool is on the button. Every other number in
+            # this script is derived: the flange distance comes from FK on the
+            # measured angles, so an FK error, a calibration error or a tool
+            # length error all read as success. The picture does not.
+            snap(args, args.photo or os.path.expanduser(
+                f'~/hand_eye/press_touch_{args.button}.png'))
         go('retract', plan['standoff_deg'])
     print('parking clear of the camera')
     request({'cmd': 'send_angles', 'angles': PARK, 'speed': args.speed,

@@ -44,6 +44,8 @@ count does not match the layout rather than shifting every label by one.
 """
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 
@@ -57,6 +59,46 @@ PANEL_12 = [
     [3, 4],
     [1, 2],
 ]
+
+
+# The LAB's printed test panel, which is NOT the same layout as PANEL_12 and
+# must not be conflated with it. Read off the panel 2026-08-17:
+#
+#   - it has EIGHT rows of two, not six. Below the numbers sit door-open /
+#     door-close, then a fan and an alarm bell. `_rows_of`'s note about the
+#     symbol row being excluded because it has THREE buttons on its own
+#     spacing does not hold here -- these are two-wide on the same spacing as
+#     the numbers, so they come through as rows 7 and 8 and a six-row layout
+#     refuses the whole panel.
+#   - every row runs odd-left, even-right, INCLUDING 9/10. PANEL_12 reverses
+#     that row. Both cannot describe the same panel; PANEL_12 is kept as-is
+#     for the real lift, and this describes the print on the board.
+#
+# Getting these two the wrong way round presses the wrong floor, which is the
+# specific error `label()` refuses on, so they are separate constants rather
+# than one with a flag.
+PANEL_12_PRINTED = [
+    [11, 12],
+    [9, 10],
+    [7, 8],
+    [5, 6],
+    [3, 4],
+    [1, 2],
+    ['open', 'close'],
+    ['fan', 'alarm'],
+]
+
+
+# The numbered block of the printed panel ALONE, for when the symbol rows run
+# off the bottom of the frame -- which is the normal case once the panel is
+# close enough to press, since it then fills the view.
+#
+# This is the RISKY layout of the three and is offered rather than defaulted:
+# with six rows expected and eight present, a row block that is not
+# top-anchored labels every button one row out. Nothing here can detect that,
+# so confirm against `--save` before commanding a press. Prefer
+# PANEL_12_PRINTED whenever all eight rows are actually in view.
+PANEL_12_PRINTED_NUMBERS = PANEL_12_PRINTED[:6]
 
 
 # The separate call panel: up above down, one column. Names not numbers,
@@ -219,6 +261,42 @@ def _groups(bgr, link=6.0, depth_mm=None, depth_range=None):
     return [K[c] for c in comps], rad
 
 
+def _rows_along(K, rad, n_cols, down, across, align_tol):
+    """_rows_of's body, measured along a given pair of axes."""
+    u = K[:, :2] @ across          # across a row: separates COLUMNS
+    t = K[:, :2] @ down            # down a column: separates ROWS
+
+    colg = _cluster(u, rad * 1.3)
+    colg.sort(key=len, reverse=True)
+    colg = colg[:n_cols]
+    if len(colg) < n_cols:
+        return []
+    centres = sorted(float(np.mean(u[gr])) for gr in colg)
+    keep = sorted(i for gr in colg for i in gr)
+    Kk, uk, tk = K[keep], u[keep], t[keep]
+
+    rowg = _cluster(tk, rad * 1.3)
+    # Cluster along the lattice axis, but ORDER by image y. The projection's
+    # sign comes from an eigenvector, and an eigenvector's direction is
+    # arbitrary -- `_lattice_axes` pins it, but only for the assignment it
+    # returns, and `_rows_of` also tries the SWAPPED one. Ordering by `t`
+    # therefore inverts whenever the swapped axes win, which is a silent
+    # top-to-bottom flip of the whole layout: photographed 2026-08-18 with
+    # the fan and alarm symbols labelled 11 and 12, and a requested button 1
+    # aimed at the button printed 7. Image y has no such ambiguity.
+    rowg.sort(key=lambda gr: float(np.mean(K[keep][gr, 1])))
+    rows = []
+    for gr in rowg:
+        idx = sorted(gr, key=lambda i: uk[i])
+        if len(idx) != n_cols:
+            continue
+        if any(abs(uk[i] - c) > rad * align_tol
+               for i, c in zip(idx, centres)):
+            continue
+        rows.append([tuple(float(v) for v in Kk[i]) for i in idx])
+    return rows
+
+
 def _rows_of(K, rad, n_cols, align_tol=0.7):
     """Arrange one group's buttons into rows, filtered to n_cols columns.
 
@@ -228,28 +306,40 @@ def _rows_of(K, rad, n_cols, align_tol=0.7):
     so once the arm stopped occluding it, it appeared as a seventh row and the
     layout check refused everything. Alignment is the real distinction between
     "part of this grid" and "some other buttons that happen to be nearby".
-    """
-    xs = K[:, 0]
-    colg = _cluster(xs, rad * 1.3)
-    colg.sort(key=len, reverse=True)
-    colg = colg[:n_cols]
-    centres = sorted(float(np.mean(xs[gr])) for gr in colg)
-    keep = sorted(i for gr in colg for i in gr)
-    K = K[keep]
 
-    ys = K[:, 1]
-    rowg = _cluster(ys, rad * 1.3)
-    rowg.sort(key=lambda gr: ys[gr].mean())
-    rows = []
-    for gr in rowg:
-        r = sorted((K[i] for i in gr), key=lambda p: p[0])
-        if len(r) != n_cols:
-            continue
-        if any(abs(p[0] - c) > rad * align_tol
-               for p, c in zip(r, centres)):
-            continue
-        rows.append([tuple(float(v) for v in p) for p in r])
-    return rows
+    Measured along the LATTICE's axes, not the image's. Clustering raw x to
+    find columns assumes the panel is square-on, and a rotated one then fails
+    completely rather than gracefully: measured 2026-08-17 at 19.9deg of
+    rotation, each column's x drifted 127px top to bottom while adjacent
+    buttons differed by only ~30px, so `_cluster` -- which is single-linkage --
+    chained straight down the panel and returned ONE cluster of 14 spanning
+    256px instead of two columns of six. Every row then failed the alignment
+    check and a fully visible panel yielded nothing at all, 0/30 frames.
+
+    The angle is FOUND BY SWEEP rather than estimated, and that matters. The
+    first version took the principal axis of the button centres, which is only
+    as good as the points fed to it: on 2026-08-18 three stray candidates off
+    the panel -- chained into the group by the link distance -- pulled the
+    estimate to 34deg where the true column tilt was 17deg, and the panel then
+    yielded 0 rows with 19 candidates sitting plainly on it.
+
+    A sweep has no such failure. A wrong angle simply produces no rows, and an
+    outlier that belongs to no row cannot drag the answer, so the score is
+    robust to exactly the contamination that breaks a least-squares fit. It
+    costs ~90 clusterings of a few dozen points, which is nothing next to
+    finding the candidates in the first place.
+    """
+    best = []
+    for deg in range(-90, 90, 2):
+        th = math.radians(deg)
+        # across[0] >= 0 over this range and down[1] > 0, so "left to right"
+        # and "top to bottom" keep their ordinary meanings.
+        across = np.array([math.cos(th), math.sin(th)])
+        down = np.array([-math.sin(th), math.cos(th)])
+        rows = _rows_along(K, rad, n_cols, down, across, align_tol)
+        if len(rows) > len(best):
+            best = rows
+    return best
 
 
 def find_grid(bgr, n_cols=2, depth_mm=None, depth_range=None):
@@ -309,6 +399,20 @@ def complete_lattice(bgr, rows, rad, n_rows, min_score=0.12):
     template = np.mean(ref, axis=0)
 
     ys = [np.mean([c[1] for c in r]) for r in rows]
+
+    # The pitch below assumes the rows found are CONSECUTIVE. When they are
+    # not, (last-first)/(n-1) is a blend of the real pitch and whatever gap
+    # was skipped, and every predicted row lands somewhere arbitrary.
+    # Measured 2026-08-17: rows at y=337,388,435,687 -- a 252px hole, five
+    # pitches wide -- gave dy=117 against a true pitch of ~49, and completion
+    # duly invented two rows at y=104 and y=221, ABOVE THE PANEL, then
+    # labelled all twelve buttons with confidence. That is the wrong-floor
+    # failure this module exists to refuse, so refuse it: uneven spacing means
+    # the row set is not a contiguous run and cannot be extrapolated from.
+    gaps = np.diff(ys)
+    if len(gaps) and float(np.max(gaps)) > 1.5 * float(np.min(gaps)):
+        return rows
+
     dy = (ys[-1] - ys[0]) / (len(ys) - 1)
     # Column x per row drifts if the panel is tilted; take the per-column
     # slope from the rows we have rather than assuming vertical columns.
@@ -325,6 +429,7 @@ def complete_lattice(bgr, rows, rad, n_rows, min_score=0.12):
     ranked = []
     for off in range(n_rows - len(rows) + 1):
         filled, scores = [], []
+        unverified = False
         for ri in range(n_rows):
             if off <= ri < off + len(rows):
                 filled.append(rows[ri - off])
@@ -336,14 +441,33 @@ def complete_lattice(bgr, rows, rad, n_rows, min_score=0.12):
                 p = patch(x, y)
                 # Both patches are zero-mean unit-variance, so the mean of
                 # their product is the normalised correlation.
-                scores.append(-1.0 if p is None
-                              else float(np.mean(p * template)))
+                if p is None:
+                    # OFF THE IMAGE. Not evidence of absence -- there is
+                    # simply nothing to look at, and scoring it -1 makes it
+                    # evidence AGAINST, which inverts the answer whenever the
+                    # panel runs to the frame edge. Measured 2026-08-17: the
+                    # bottom symbol row sat past y=720, so the correct
+                    # alignment (both missing rows at the bottom) scored -1
+                    # and LOST to one that invented a row above the panel --
+                    # shifting every label by a row, so a commanded press of
+                    # 5 went to the button printed 7. Flag it and refuse.
+                    unverified = True
+                else:
+                    scores.append(float(np.mean(p * template)))
                 cells.append((float(x), float(y), rad, rad))
             filled.append(cells)
-        ranked.append((np.mean(scores) if scores else -1.0, off, filled))
+        ranked.append((np.mean(scores) if scores else -1.0, off, filled,
+                       unverified))
 
     ranked.sort(key=lambda t: -t[0])
-    best_score, _, best = ranked[0]
+    best_score, _, best, best_unverified = ranked[0]
+
+    # An alignment that puts a predicted row off the edge of the image cannot
+    # be confirmed OR denied, so completing on it is a guess -- and a guess
+    # here renumbers the whole panel. Refuse and let `label()` say what to do
+    # about it, which is to re-frame so every row is in view.
+    if best_unverified:
+        return rows
 
     # A RELATIVE test, not an absolute one. Measured on this panel 2026-08-14:
     # buttons the detector DID find self-correlate at 0.43-0.62, while the
@@ -361,6 +485,62 @@ def complete_lattice(bgr, rows, rad, n_rows, min_score=0.12):
         if second > 0 and best_score < 1.5 * second:
             return rows
     return best
+
+
+def _row_above(bgr, rows, rad, min_score=0.12):
+    """Is there another button row ABOVE the ones found? Score, or None.
+
+    The check a short layout cannot do for itself. `PANEL_12_PRINTED_NUMBERS`
+    describes six rows of a panel that physically has eight, so it is correct
+    only if the six found are the TOP six -- and nothing about six rows in
+    isolation says whether the block starts at the top or one row down.
+
+    Measured 2026-08-18: the faint 11/12 row went undetected, the six rows
+    found were rows 2-7, and every button was labelled one row out -- a
+    requested 12 aimed at the printed 10 and a requested 1 at the door-open
+    symbol. Looking one pitch above the top row costs one correlation and
+    catches exactly that.
+    """
+    if len(rows) < 2:
+        return None
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    h, w = gray.shape
+    half = int(round(rad))
+
+    def patch(x, y):
+        xi, yi = int(round(x)), int(round(y))
+        if xi - half < 0 or yi - half < 0 or xi + half >= w or yi + half >= h:
+            return None
+        p = gray[yi - half:yi + half + 1, xi - half:xi + half + 1]
+        s = p.std()
+        return (p - p.mean()) / s if s > 1e-6 else None
+
+    ref = [patch(c[0], c[1]) for r in rows for c in r]
+    ref = [p for p in ref if p is not None]
+    if not ref:
+        return None
+    template = np.mean(ref, axis=0)
+
+    # Step each COLUMN back by its own spacing vector, rather than predicting
+    # one y for the whole row. On a rotated panel a row's buttons differ in y
+    # -- 14px apart at 10deg here -- so a single row y puts each patch off its
+    # button by half that, and the correlation collapses to noise. The step
+    # vector carries the rotation for free and is exact on a uniform lattice.
+    scores = []
+    for ci in range(len(rows[0])):
+        col = [r[ci] for r in rows if len(r) > ci]
+        if len(col) < 2:
+            continue
+        first = np.array(col[0][:2], dtype=float)
+        step = (np.array(col[-1][:2], dtype=float) - first) / (len(col) - 1)
+        above = first - step
+        p = patch(above[0], above[1])
+        if p is not None:
+            scores.append(float(np.mean(p * template)))
+    if not scores:
+        return None
+    score = float(np.mean(scores))
+    return score if score >= min_score else None
 
 
 def label(rows, layout=PANEL_12):
@@ -387,12 +567,36 @@ def label(rows, layout=PANEL_12):
 
 
 def find_labelled(bgr, layout=PANEL_12, complete=True, depth_mm=None,
-                  depth_range=None):
-    """image -> {number: (x, y, semi_major, semi_minor)}."""
+                  depth_range=None, top_anchored=False):
+    """image -> {number: (x, y, semi_major, semi_minor)}.
+
+    `top_anchored` is for layouts that describe only the TOP of a longer
+    panel, such as PANEL_12_PRINTED_NUMBERS against the eight-row print. Such
+    a layout is right only if the rows found start at the panel's top row, and
+    the row count cannot tell you that. With it set, a row detected above the
+    block is a refusal rather than a silent renumbering.
+    """
     rows, rad = find_grid(bgr, n_cols=len(layout[0]), depth_mm=depth_mm,
                           depth_range=depth_range)
     if complete:
         rows = complete_lattice(bgr, rows, rad, len(layout))
+    if top_anchored:
+        score = _row_above(bgr, rows, rad)
+        if score is not None:
+            raise KeypadError(
+                f'there is another button row above the ones found '
+                f'(correlation {score:.2f}), so these are not the top rows of '
+                'the panel and this layout would number every button one row '
+                'out. Re-frame so the whole panel is visible and use the full '
+                'layout.')
+        # Extra rows BELOW are fine once the top is pinned. How many of the
+        # symbol rows fall inside the frame changes with every nudge of the
+        # panel -- 8 rows, then 6, then 7 across three placements on
+        # 2026-08-18 -- and an exact-count match refuses all but one of those
+        # for no good reason. The numbered block is at the top, so with
+        # nothing above it the first len(layout) rows ARE the layout.
+        if len(rows) > len(layout):
+            rows = rows[:len(layout)]
     return label(rows, layout)
 
 
